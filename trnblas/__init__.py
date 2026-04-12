@@ -3,7 +3,7 @@ trnblas — BLAS operations for AWS Trainium via NKI.
 
 Provides Level 1 (vector), Level 2 (matrix-vector), and Level 3 (matrix-matrix)
 BLAS operations with NKI kernel acceleration on Trainium hardware.
-Part of the trn-* scientific computing suite by Playground Logic.
+Part of the trnsci scientific computing suite.
 
 Target workloads: DF-MP2 tensor contractions, Fock matrix builds,
 Cholesky-based density fitting, and general scientific linear algebra.
