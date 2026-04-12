@@ -50,6 +50,19 @@ The script will:
 
 It exits non-zero if any test fails.
 
+## Running the DF-MP2 bench
+
+Same instance, same SSM mechanism, runs `examples/df_mp2.py --bench` to
+capture per-step timing across small / medium / large synthetic shapes:
+
+```bash
+AWS_PROFILE=aws ./scripts/run_df_mp2_bench.sh                 # all 3 shapes
+AWS_PROFILE=aws ./scripts/run_df_mp2_bench.sh --shape medium  # one shape
+```
+
+Each shape runs cold then warm in the same Python process, so NEFF cache
+effects are visible in the reported numbers.
+
 ## Cost
 
 Stopped = EBS only (~$10/mo for 100 GB gp3). Running:
