@@ -40,3 +40,13 @@ def spd_matrix(rng):
         A = torch.randn(n, n, generator=rng, dtype=dtype)
         return A @ A.T + n * torch.eye(n, dtype=dtype)
     return _make
+
+
+@pytest.fixture
+def nki_backend():
+    """Force the NKI backend for the duration of a test."""
+    from trnblas import set_backend, get_backend
+    old = get_backend()
+    set_backend("nki")
+    yield
+    set_backend(old)
