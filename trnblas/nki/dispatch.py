@@ -71,6 +71,81 @@ def nki_batched_gemm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     return torch.stack([_nki_gemm_impl(A[i], B[i]) for i in range(A.shape[0])])
 
 
+def _torch_mp2_energy(
+    T_flat: torch.Tensor,
+    eps_occ_chunk: torch.Tensor,
+    eps_occ_full: torch.Tensor,
+    eps_vir: torch.Tensor,
+) -> torch.Tensor:
+    """Torch reference for the fused MP2 energy reduction.
+
+    T_flat: (ic*nvir, nocc*nvir). eps_occ_chunk: (ic,). eps_occ_full:
+    (nocc,). eps_vir: (nvir,). Returns a 0-d tensor — sum of
+    T*(2T - T.T)/denom over the chunk. Mirrors the expression in
+    examples/df_mp2.py so the NKI path can be swapped in transparently.
+    """
+    ic = eps_occ_chunk.shape[0]
+    nocc = eps_occ_full.shape[0]
+    nvir = eps_vir.shape[0]
+    T = T_flat.reshape(ic, nvir, nocc, nvir).permute(0, 2, 1, 3)
+    denom = (
+        eps_occ_chunk.view(ic, 1, 1, 1)
+        + eps_occ_full.view(1, nocc, 1, 1)
+        - eps_vir.view(1, 1, nvir, 1)
+        - eps_vir.view(1, 1, 1, nvir)
+    )
+    return (T * (2.0 * T - T.transpose(-2, -1)) / denom).sum()
+
+
+def nki_mp2_energy(
+    T_flat: torch.Tensor,
+    eps_occ_chunk: torch.Tensor,
+    eps_occ_full: torch.Tensor,
+    eps_vir: torch.Tensor,
+) -> torch.Tensor:
+    """Fused MP2 energy reduction — NKI-dispatched (#15).
+
+    On NKI backend: a single kernel streams T_flat tiles on-chip and
+    computes T*(2T - T.T)/denom + sum in one pass, avoiding the four
+    HBM round-trips of the torch expression.
+
+    On PyTorch backend (or when the kernel can't handle the shape
+    yet): falls back to the torch reference.
+    """
+    if not _use_nki():
+        return _torch_mp2_energy(T_flat, eps_occ_chunk, eps_occ_full, eps_vir)
+    nvir = eps_vir.shape[0]
+    # First-cut kernel covers single-strip (nvir ≤ 128). Larger nvir
+    # needs sub-tiling over the partition dim — follow-up.
+    if nvir > 128:
+        return _torch_mp2_energy(T_flat, eps_occ_chunk, eps_occ_full, eps_vir)
+    try:
+        return _nki_mp2_energy_impl(T_flat, eps_occ_chunk, eps_occ_full, eps_vir)
+    except Exception:
+        if _REQUIRE_NKI:
+            raise
+        return _torch_mp2_energy(T_flat, eps_occ_chunk, eps_occ_full, eps_vir)
+
+
+def _nki_mp2_energy_impl(
+    T_flat: torch.Tensor,
+    eps_occ_chunk: torch.Tensor,
+    eps_occ_full: torch.Tensor,
+    eps_vir: torch.Tensor,
+) -> torch.Tensor:
+    if not HAS_NKI:
+        raise RuntimeError("NKI not available")
+    (t, eo_c, eo_f, ev), orig_device = _to_xla(
+        T_flat.contiguous(),
+        eps_occ_chunk.contiguous(),
+        eps_occ_full.contiguous(),
+        eps_vir.contiguous(),
+    )
+    partial = _mp2_energy_kernel(t, eo_c, eo_f, ev)
+    # Kernel returns (ic, nocc) of per-(i,j) scalar contributions; reduce host-side.
+    return partial.to(orig_device).sum()
+
+
 def nki_gemm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     """GEMM with NKI dispatch.
 
@@ -195,3 +270,69 @@ if HAS_NKI:
                 )
 
         return c
+
+    @nki.jit
+    def _mp2_energy_kernel(T_flat, eps_occ_chunk, eps_occ_full, eps_vir):
+        """Fused MP2 energy reduction (#15) — single-strip variant.
+
+        Computes Σ_{i<ic, j<nocc, a,b<nvir} T[i,j,a,b] *
+        (2 T[i,j,a,b] - T[i,j,b,a]) / denom[i,j,a,b] where
+        T[i,j,a,b] = T_flat[i*nvir + a, j*nvir + b].
+
+        Caller guarantees nvir ≤ 128 (single partition strip). Larger
+        nvir requires sub-tiling; the dispatch wrapper falls back to
+        torch for that case.
+
+        For each (i, j) block, loads the (nvir, nvir) tile and its
+        within-block transpose (via load_transpose2d on the same
+        block), builds denom on-chip from eps_occ/eps_vir, does the
+        elementwise fused expression, and reduces into a per-(i,j)
+        scalar. The (IC, NOCC) partial matrix is stored to HBM;
+        final scalar reduce is host-side (one small tensor).
+        """
+        M, N = T_flat.shape
+        NVIR = eps_vir.shape[0]
+        IC = eps_occ_chunk.shape[0]
+        NOCC = eps_occ_full.shape[0]
+
+        e_partial = nl.ndarray((IC, NOCC), dtype=nl.float32, buffer=nl.shared_hbm)
+
+        # Broadcast eps_vir once: -eps_vir along both axes of the
+        # (nvir, nvir) denom tile.
+        ev_part = nl.load(eps_vir.reshape((NVIR,)))  # partition=NVIR, free=1
+
+        for i in nl.affine_range(IC):
+            for j in nl.affine_range(NOCC):
+                # t[a, b] = T[i, j, a, b]
+                t = nl.load(
+                    T_flat[i * NVIR:(i + 1) * NVIR, j * NVIR:(j + 1) * NVIR]
+                )
+                # t_T[a, b] = T[i, j, b, a] — load same block with axes swapped.
+                t_T = nl.load_transpose2d(
+                    T_flat[i * NVIR:(i + 1) * NVIR, j * NVIR:(j + 1) * NVIR]
+                )
+
+                eo_i = nl.load(eps_occ_chunk[i:i + 1])
+                eo_j = nl.load(eps_occ_full[j:j + 1])
+
+                # denom[a, b] = eo_i + eo_j - eps_vir[a] - eps_vir[b]
+                # Build as: (eo_i + eo_j) - eps_vir[a] → (NVIR, 1)
+                #                          then       - eps_vir[b] → (NVIR, NVIR)
+                eo_sum = nl.add(eo_i, eo_j)  # scalar
+                # (NVIR, 1) = eo_sum - ev_part
+                denom_col = nl.subtract(eo_sum, ev_part)
+                # Broadcast-subtract eps_vir along the free dim.
+                # nl.subtract broadcasts (NVIR, 1) - (1, NVIR) → (NVIR, NVIR)
+                ev_free = ev_part.reshape((1, NVIR))
+                denom = nl.subtract(denom_col, ev_free)
+
+                # Fused expression: t * (2*t - t_T) / denom
+                two_t = nl.multiply(t, 2.0)
+                diff = nl.subtract(two_t, t_T)
+                num = nl.multiply(t, diff)
+                term = nl.divide(num, denom)
+                s = nl.sum(term, axis=(0, 1))  # scalar (1,)
+
+                nl.store(e_partial[i:i + 1, j:j + 1], value=s)
+
+        return e_partial

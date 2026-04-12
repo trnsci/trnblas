@@ -21,8 +21,8 @@ Trainium, PyTorch fallback everywhere else.
 
 ## Primary use case
 
-DF-MP2 quantum chemistry (Janesko group, TCU). Molecules with >3000 basis
-functions require sustained GEMM throughput for tensor contractions. See the
+DF-MP2 quantum chemistry on large molecules (>3000 basis functions), where
+sustained GEMM throughput for tensor contractions dominates wall-time. See the
 [Architecture](architecture.md) page for the algorithm-to-BLAS mapping.
 
 ## Related projects

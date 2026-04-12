@@ -60,7 +60,7 @@ n = trnblas.nrm2(x)
 ## DF-MP2 Example
 
 ```bash
-# Run the density-fitted MP2 example (Janesko/TCU use case)
+# Run the density-fitted MP2 example
 python examples/df_mp2.py --demo
 python examples/df_mp2.py --nbasis 100 --nocc 20
 ```
@@ -92,7 +92,7 @@ The example demonstrates all core BLAS operations in a realistic quantum chemist
 
 - [x] Level 1-3 BLAS with PyTorch backend
 - [x] GEMM with NKI dispatch stub
-- [x] DF-MP2 example (Janesko/TCU use case)
+- [x] DF-MP2 example
 - [ ] NKI GEMM kernel validation on trn1/trn2
 - [ ] NKI GEMM with stationary tile reuse
 - [ ] Batched GEMM NKI kernel
@@ -103,7 +103,7 @@ The example demonstrates all core BLAS operations in a realistic quantum chemist
 
 | Project | What |
 |---------|------|
-| [trnfft](https://github.com/scttfrdmn/trnfft) | FFT + complex ops for Trainium (Williamson/OSU use case) |
+| [trnfft](https://github.com/scttfrdmn/trnfft) | FFT + complex ops for Trainium |
 | [trnrand](https://github.com/trnsci/trnrand) | Random number generation (Philox/Sobol) for Trainium |
 | trnsolver *(planned)* | Linear solvers and eigendecomposition |
 

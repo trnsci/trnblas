@@ -9,11 +9,12 @@ A cuBLAS-equivalent for Trainium. Provides Level 1 (vector), Level 2
 (matrix-vector), and Level 3 (matrix-matrix) BLAS operations with NKI
 kernel acceleration on the Tensor Engine.
 
-**Primary use case:** DF-MP2 quantum chemistry with Prof. Ben Janesko at TCU.
-Molecules with >3000 basis functions require sustained GEMM throughput for
-tensor contractions. On 192 Zen4 cores (c8a.48xlarge), a single calculation
-takes ~24 hours at ~$200. trnblas on Trainium targets 3-4x cost reduction
-by exploiting the systolic array for the GEMM-dominated hot path.
+**Primary use case:** DF-MP2 quantum chemistry on large molecules
+(>3000 basis functions), where sustained GEMM throughput for tensor
+contractions dominates wall-time. On 192 Zen4 cores (c8a.48xlarge), a
+single calculation takes ~24 hours at ~$200. trnblas on Trainium
+targets 3-4x cost reduction by exploiting the systolic array for the
+GEMM-dominated hot path.
 
 ## Architecture
 
@@ -33,7 +34,7 @@ trnblas/
 │   ├── test_level2.py       # Matrix-vector tests
 │   └── test_level3.py       # Matrix-matrix tests (GEMM, TRSM, SYRK, etc.)
 ├── examples/
-│   └── df_mp2.py            # DF-MP2 energy using trnblas (Janesko use case)
+│   └── df_mp2.py            # DF-MP2 energy using trnblas
 ├── pyproject.toml
 ├── README.md
 ├── LICENSE                  # Apache 2.0

@@ -17,6 +17,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `trnblas.nki.nki_mp2_energy` — fused MP2 energy-reduction kernel
+  (#15). Streams T_flat tiles on-chip, computes
+  `T * (2T - T.T) / denom` and reduces in one pass, avoiding the
+  four HBM round-trips of the torch expression. First-cut kernel
+  covers `nvir ≤ 128`; larger `nvir` falls back to the torch
+  reference pending sub-tiling work. `examples/df_mp2.py` wired to
+  dispatch through this call.
+
 - `examples/df_mp2.py` refactored to use `trnblas.batched_gemm` for all
   per-occupied-orbital loops (steps 2b, 3, and 4-per-i). Energy
   reduction in step 4 fully vectorised over (j, a, b), eliminating the
@@ -142,8 +150,9 @@ shape per cache lifetime.
 - NKI dispatch layer with `auto`, `pytorch`, and `nki` backend selection.
 - NKI GEMM kernel stub with stationary tile reuse strategy (scaffolded for
   on-hardware validation on trn1/trn2).
-- DF-MP2 example (`examples/df_mp2.py`) demonstrating the Janesko/TCU use case
-  with half-transform GEMMs, Cholesky, triangular solve, and energy evaluation.
+- DF-MP2 example (`examples/df_mp2.py`) demonstrating the quantum-chemistry
+  use case with half-transform GEMMs, Cholesky, triangular solve, and energy
+  evaluation.
 - Test suite covering Level 1/2/3 BLAS correctness against PyTorch/NumPy
   references, with SPD matrix fixtures for symmetric/triangular routines.
 
