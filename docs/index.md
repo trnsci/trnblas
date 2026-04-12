@@ -28,5 +28,5 @@ functions require sustained GEMM throughput for tensor contractions. See the
 ## Related projects
 
 - [trnfft](https://github.com/scttfrdmn/trnfft) — FFT + complex ops for Trainium.
-- [trnrand](https://github.com/scttfrdmn/trnrand) — Random number generation (Philox/Sobol) for Trainium.
+- [trnrand](https://github.com/trnsci/trnrand) — Random number generation (Philox/Sobol) for Trainium.
 - `trnsolver` *(planned)* — Linear solvers and eigendecomposition.

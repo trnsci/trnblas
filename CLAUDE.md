@@ -116,6 +116,6 @@ Sibling repos in the trn-* suite:
 - `trnfft` — FFT + complex ops (https://github.com/scttfrdmn/trnfft)
 - `trnblas` — BLAS operations (this repo)
 - `trnsolver` — Linear solvers, eigendecomposition (planned)
-- `trnrand` — Random number generation (https://github.com/scttfrdmn/trnrand)
+- `trnrand` — Random number generation (https://github.com/trnsci/trnrand)
 
 All repos: Python/NKI, Apache 2.0, Playground Logic.
