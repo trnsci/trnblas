@@ -104,6 +104,7 @@ The example demonstrates all core BLAS operations in a realistic quantum chemist
 | Project | What |
 |---------|------|
 | [trnfft](https://github.com/scttfrdmn/trnfft) | FFT + complex ops for Trainium (Williamson/OSU use case) |
+| [trnrand](https://github.com/scttfrdmn/trnrand) | Random number generation (Philox/Sobol) for Trainium |
 | trnsolver *(planned)* | Linear solvers and eigendecomposition |
 
 ## License
