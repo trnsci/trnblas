@@ -1,0 +1,32 @@
+site_name: trnblas
+site_description: BLAS operations for AWS Trainium via NKI
+site_url: https://scttfrdmn.github.io/trnblas/
+repo_url: https://github.com/scttfrdmn/trnblas
+repo_name: scttfrdmn/trnblas
+
+theme:
+  name: material
+  palette:
+    scheme: default
+    primary: indigo
+  features:
+    - content.code.copy
+    - navigation.sections
+
+nav:
+  - Home: index.md
+  - Installation: installation.md
+  - Quickstart: quickstart.md
+  - API Reference:
+      - Level 1 (Vector): api/level1.md
+      - Level 2 (Matrix-Vector): api/level2.md
+      - Level 3 (Matrix-Matrix): api/level3.md
+      - NKI Backend: api/nki.md
+  - Architecture: architecture.md
+
+markdown_extensions:
+  - pymdownx.highlight
+  - pymdownx.superfences
+  - admonition
+  - toc:
+      permalink: true
