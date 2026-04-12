@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "trnblas"
-version = "0.3.0"
+version = "0.3.1"
 description = "BLAS operations for AWS Trainium via NKI"
 readme = "README.md"
 license = "Apache-2.0"
@@ -26,8 +26,10 @@ dependencies = [
 
 [project.optional-dependencies]
 neuron = [
-    "neuronxcc>=2.15",
-    "torch-neuronx>=2.1",
+    # Pinned >=2.24 for NKI 2.24+ nc_matmul calling convention (unified
+    # across the trnsci suite).
+    "neuronxcc>=2.24",
+    "torch-neuronx>=2.9",
 ]
 dev = [
     "pytest>=7.0",
@@ -36,9 +38,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/scttfrdmn/trnblas"
-Repository = "https://github.com/scttfrdmn/trnblas"
-Issues = "https://github.com/scttfrdmn/trnblas/issues"
+Homepage = "https://github.com/trnsci/trnblas"
+Repository = "https://github.com/trnsci/trnblas"
+Issues = "https://github.com/trnsci/trnblas/issues"
 
 [tool.setuptools.packages.find]
 include = ["trnblas*"]

@@ -1,8 +1,8 @@
 site_name: trnblas
 site_description: BLAS operations for AWS Trainium via NKI
-site_url: https://scttfrdmn.github.io/trnblas/
-repo_url: https://github.com/scttfrdmn/trnblas
-repo_name: scttfrdmn/trnblas
+site_url: https://trnsci.github.io/trnblas/
+repo_url: https://github.com/trnsci/trnblas
+repo_name: trnsci/trnblas
 
 theme:
   name: material

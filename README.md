@@ -1,10 +1,10 @@
 # trnblas
 
-[![CI](https://github.com/scttfrdmn/trnblas/actions/workflows/ci.yml/badge.svg)](https://github.com/scttfrdmn/trnblas/actions/workflows/ci.yml)
+[![CI](https://github.com/trnsci/trnblas/actions/workflows/ci.yml/badge.svg)](https://github.com/trnsci/trnblas/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/trnblas)](https://pypi.org/project/trnblas/)
 [![Python](https://img.shields.io/pypi/pyversions/trnblas)](https://pypi.org/project/trnblas/)
-[![License](https://img.shields.io/github/license/scttfrdmn/trnblas)](LICENSE)
-[![Docs](https://img.shields.io/badge/docs-mkdocs-blue)](https://scttfrdmn.github.io/trnblas/)
+[![License](https://img.shields.io/github/license/trnsci/trnblas)](LICENSE)
+[![Docs](https://img.shields.io/badge/docs-mkdocs-blue)](https://trnsci.github.io/trnblas/)
 
 BLAS operations for AWS Trainium via NKI (Neuron Kernel Interface).
 

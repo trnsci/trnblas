@@ -19,7 +19,7 @@ Trainium/Inferentia instances. On CPU or GPU, trnblas falls back to
 ## From source
 
 ```bash
-git clone https://github.com/scttfrdmn/trnblas
+git clone https://github.com/trnsci/trnblas
 cd trnblas
 pip install -e ".[dev]"
 pytest tests/ -v

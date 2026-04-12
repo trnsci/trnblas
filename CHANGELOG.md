@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] — 2026-04-12
+
+### Changed
+
+- Bumped `neuronxcc` floor from `>=2.15` to `>=2.24` to unify with the
+  rest of the trnsci suite (matches trnfft / trnrand). `torch-neuronx`
+  floor bumped to `>=2.9` to match.
+
 ## [Unreleased]
 
 ### Added
@@ -139,7 +147,7 @@ shape per cache lifetime.
 - Test suite covering Level 1/2/3 BLAS correctness against PyTorch/NumPy
   references, with SPD matrix fixtures for symmetric/triangular routines.
 
-[Unreleased]: https://github.com/scttfrdmn/trnblas/compare/v0.3.0...HEAD
-[0.3.0]: https://github.com/scttfrdmn/trnblas/releases/tag/v0.3.0
-[0.2.0]: https://github.com/scttfrdmn/trnblas/releases/tag/v0.2.0
-[0.1.0]: https://github.com/scttfrdmn/trnblas/commits/main
+[Unreleased]: https://github.com/trnsci/trnblas/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/trnsci/trnblas/releases/tag/v0.3.0
+[0.2.0]: https://github.com/trnsci/trnblas/releases/tag/v0.2.0
+[0.1.0]: https://github.com/trnsci/trnblas/commits/main
