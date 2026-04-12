@@ -100,18 +100,20 @@ CMD_ID=$(aws ssm send-command \
   --output text --query 'Command.CommandId')
 
 echo "Command ID: $CMD_ID"
-echo "Waiting for command to complete (this may take several minutes)..."
+echo "Waiting for command to complete (poll every 30s, up to 60min)..."
 
-aws ssm wait command-executed \
-  --command-id "$CMD_ID" \
-  --instance-id "$INSTANCE_ID" \
-  --region "$REGION" || true
-
-STATUS=$(aws ssm get-command-invocation \
-  --command-id "$CMD_ID" \
-  --instance-id "$INSTANCE_ID" \
-  --region "$REGION" \
-  --query 'Status' --output text)
+# `aws ssm wait command-executed` caps at ~8min; the NEFF compile for
+# the larger shapes can exceed that on first encounter. Poll manually.
+STATUS=InProgress
+for _ in $(seq 1 120); do
+  STATUS=$(aws ssm get-command-invocation \
+    --command-id "$CMD_ID" \
+    --instance-id "$INSTANCE_ID" \
+    --region "$REGION" \
+    --query 'Status' --output text 2>/dev/null || echo "InProgress")
+  [[ "$STATUS" != "InProgress" && "$STATUS" != "Pending" ]] && break
+  sleep 30
+done
 
 echo ""
 echo "=== STDOUT ==="
