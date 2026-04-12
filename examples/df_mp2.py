@@ -33,6 +33,41 @@ def _bcast(M: torch.Tensor, batch: int) -> torch.Tensor:
     return M.unsqueeze(0).expand(batch, *M.shape).contiguous()
 
 
+def _energy_reduction(
+    B: torch.Tensor,
+    eps_occ: torch.Tensor,
+    eps_vir: torch.Tensor,
+    *,
+    mem_budget_bytes: int = 6_000_000_000,
+) -> float:
+    """MP2 energy from the metric-contracted three-index tensor B.
+
+    Computes E = Σ_{ijab} T_ijab (2 T_ijab - T_ijba) / Δ_ijab where
+    T_ijab = Σ_P B[i,a,P] B[j,b,P], via one GEMM per i-chunk:
+        T_chunk = B[i_chunk_flat] @ B_flat.T
+    chunked along i so that T_chunk + intermediates stay under
+    `mem_budget_bytes`. At medium shape this resolves to a single chunk.
+    """
+    nocc, nvir, naux = B.shape
+    bytes_per_i = 4 * nvir * nocc * nvir       # one row-block of T_full (fp32)
+    i_block = max(1, min(nocc, int(mem_budget_bytes // bytes_per_i)))
+
+    B_flat = B.reshape(nocc * nvir, naux).contiguous()
+    eps_o_pair = eps_occ.view(nocc, 1, 1, 1) + eps_occ.view(1, nocc, 1, 1)
+    eps_v_pair = eps_vir.view(1, 1, nvir, 1) + eps_vir.view(1, 1, 1, nvir)
+
+    e_mp2 = torch.zeros((), dtype=B.dtype)
+    for i_start in range(0, nocc, i_block):
+        i_end = min(i_start + i_block, nocc)
+        ic = i_end - i_start
+        B_chunk = B_flat[i_start * nvir : i_end * nvir]          # (ic·nvir, naux)
+        T_flat = trnblas.gemm(1.0, B_chunk, B_flat, transB=True) # (ic·nvir, nocc·nvir)
+        T = T_flat.reshape(ic, nvir, nocc, nvir).permute(0, 2, 1, 3)
+        denom = eps_o_pair[i_start:i_end] - eps_v_pair
+        e_mp2 = e_mp2 + (T * (2.0 * T - T.transpose(-2, -1)) / denom).sum()
+    return float(e_mp2)
+
+
 def df_mp2_energy(
     C_occ: torch.Tensor,     # (nbasis, nocc) — occupied MO coefficients
     C_vir: torch.Tensor,     # (nbasis, nvir) — virtual MO coefficients
@@ -76,21 +111,14 @@ def df_mp2_energy(
     B = trnblas.batched_gemm(1.0, ia_P, J_b)                # (nocc, nvir, naux)
     t_metric = time.perf_counter() - t0
 
-    # Step 4: Energy
-    #   E_MP2 = Σ_ij Σ_ab T_ab(2T_ab - T_ba) / Δ_ijab
-    #   T(i,j)_ab = Σ_P B[i]_aP B[j]_bP = B[i] @ B[j]^T
-    # For fixed i: nocc independent GEMMs (one per j) → one batched_gemm.
-    # Energy reduction is fully vectorised across (j, a, b) per i.
+    # Step 4: Energy via one GEMM (chunked over i if memory-tight).
+    #   T(i,j)_{ab} = Σ_P B[i,a,P] B[j,b,P]
+    # Reshape B → X of shape (nocc·nvir, naux); then T_full = X @ X.T is
+    # one GEMM, and T_full[i·nvir+a, j·nvir+b] = T(i,j)_{ab}. No batching
+    # over (i,j) needed — that was the wrong shape for this contraction.
+    # For shapes where the full T_full doesn't fit HBM, chunk over i.
     t0 = time.perf_counter()
-    e_mp2 = torch.zeros((), dtype=B.dtype)
-    eps_vir_a = eps_vir.unsqueeze(1)  # (nvir, 1)
-    eps_vir_b = eps_vir.unsqueeze(0)  # (1, nvir)
-    for i in range(nocc):
-        Bi_b = _bcast(B[i], nocc)                           # (nocc, nvir, naux)
-        T = trnblas.batched_gemm(1.0, Bi_b, B, transB=True) # (nocc, nvir, nvir)
-        # Δ_ijab over (j, a, b): shape (nocc, nvir, nvir)
-        denom = (eps_occ[i] + eps_occ).view(nocc, 1, 1) - eps_vir_a - eps_vir_b
-        e_mp2 = e_mp2 + (T * (2.0 * T - T.transpose(-2, -1)) / denom).sum()
+    e_mp2 = _energy_reduction(B, eps_occ, eps_vir)
     t_energy = time.perf_counter() - t0
 
     if timings is not None:
