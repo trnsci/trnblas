@@ -96,9 +96,16 @@ class TestNkiKernel:
         ref = _reference(T_flat, eo_c, eo_f, ev)
         torch.testing.assert_close(got, ref, atol=1e-3, rtol=1e-3)
 
-    def test_large_nvir_falls_back(self, nki_backend):
-        """nvir > 128 currently falls back to torch — must still be correct."""
+    def test_subtiled_multiple_of_128(self, nki_backend):
+        """nvir=256 exercises NSTRIP=2 (P_TILE=128)."""
         T_flat, eo_c, eo_f, ev = _make_inputs(nocc=2, nvir=256, naux=8)
         got = nki_mp2_energy(T_flat, eo_c, eo_f, ev)
         ref = _reference(T_flat, eo_c, eo_f, ev)
         torch.testing.assert_close(got, ref, atol=1e-3, rtol=1e-3)
+
+    def test_subtiled_bench_shape(self, nki_backend):
+        """nvir=448 (medium bench): P_TILE=112, NSTRIP=4."""
+        T_flat, eo_c, eo_f, ev = _make_inputs(nocc=2, nvir=448, naux=8)
+        got = nki_mp2_energy(T_flat, eo_c, eo_f, ev)
+        ref = _reference(T_flat, eo_c, eo_f, ev)
+        torch.testing.assert_close(got, ref, atol=1e-2, rtol=1e-3)

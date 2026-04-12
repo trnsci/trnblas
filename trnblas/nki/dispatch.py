@@ -114,11 +114,6 @@ def nki_mp2_energy(
     """
     if not _use_nki():
         return _torch_mp2_energy(T_flat, eps_occ_chunk, eps_occ_full, eps_vir)
-    nvir = eps_vir.shape[0]
-    # First-cut kernel covers single-strip (nvir ≤ 128). Larger nvir
-    # needs sub-tiling over the partition dim — follow-up.
-    if nvir > 128:
-        return _torch_mp2_energy(T_flat, eps_occ_chunk, eps_occ_full, eps_vir)
     try:
         return _nki_mp2_energy_impl(T_flat, eps_occ_chunk, eps_occ_full, eps_vir)
     except Exception:
@@ -142,7 +137,7 @@ def _nki_mp2_energy_impl(
         eps_vir.contiguous(),
     )
     partial = _mp2_energy_kernel(t, eo_c, eo_f, ev)
-    # Kernel returns (ic, nocc) of per-(i,j) scalar contributions; reduce host-side.
+    # Kernel returns (ic, nocc, nstrip); reduce host-side.
     return partial.to(orig_device).sum()
 
 
@@ -273,66 +268,77 @@ if HAS_NKI:
 
     @nki.jit
     def _mp2_energy_kernel(T_flat, eps_occ_chunk, eps_occ_full, eps_vir):
-        """Fused MP2 energy reduction (#15) — single-strip variant.
+        """Fused MP2 energy reduction (#15) with partition-dim sub-tiling.
 
         Computes Σ_{i<ic, j<nocc, a,b<nvir} T[i,j,a,b] *
         (2 T[i,j,a,b] - T[i,j,b,a]) / denom[i,j,a,b] where
         T[i,j,a,b] = T_flat[i*nvir + a, j*nvir + b].
 
-        Caller guarantees nvir ≤ 128 (single partition strip). Larger
-        nvir requires sub-tiling; the dispatch wrapper falls back to
-        torch for that case.
+        Sub-tiles the nvir partition dim into strips of P_TILE = 128.
+        Caller guarantees nvir is a multiple of P_TILE (or nvir ≤ 128).
+        Returns (IC, NOCC, NSTRIP) fp32 partials; host reduces.
 
-        For each (i, j) block, loads the (nvir, nvir) tile and its
-        within-block transpose (via load_transpose2d on the same
-        block), builds denom on-chip from eps_occ/eps_vir, does the
-        elementwise fused expression, and reduces into a per-(i,j)
-        scalar. The (IC, NOCC) partial matrix is stored to HBM;
-        final scalar reduce is host-side (one small tensor).
+        For each (i, j, strip), loads a (P_TILE, NVIR) row-strip of
+        the (nvir, nvir) block and the corresponding column-strip
+        (via load_transpose2d) to get T[i,j,b,a_strip] in the same
+        layout. Builds denom on-chip from eps_occ/eps_vir, does the
+        fused expression, reduces to a scalar per strip.
         """
-        M, N = T_flat.shape
         NVIR = eps_vir.shape[0]
         IC = eps_occ_chunk.shape[0]
         NOCC = eps_occ_full.shape[0]
 
-        e_partial = nl.ndarray((IC, NOCC), dtype=nl.float32, buffer=nl.shared_hbm)
+        # Pick the largest divisor of NVIR that is ≤ 128 for the partition
+        # dim (NKI limit). NVIR is known at trace time so this is a
+        # compile-time constant. Covers all bench shapes (112 / 448 / 672
+        # all share P_TILE = 112).
+        P_TILE = min(NVIR, 128)
+        while NVIR % P_TILE != 0:
+            P_TILE -= 1
+        NSTRIP = NVIR // P_TILE
 
-        # Broadcast eps_vir once: -eps_vir along both axes of the
-        # (nvir, nvir) denom tile.
-        ev_part = nl.load(eps_vir.reshape((NVIR,)))  # partition=NVIR, free=1
+        e_partial = nl.ndarray(
+            (IC, NOCC, NSTRIP), dtype=nl.float32, buffer=nl.shared_hbm
+        )
 
         for i in nl.affine_range(IC):
+            eo_i = nl.load(eps_occ_chunk[i:i + 1])
             for j in nl.affine_range(NOCC):
-                # t[a, b] = T[i, j, a, b]
-                t = nl.load(
-                    T_flat[i * NVIR:(i + 1) * NVIR, j * NVIR:(j + 1) * NVIR]
-                )
-                # t_T[a, b] = T[i, j, b, a] — load same block with axes swapped.
-                t_T = nl.load_transpose2d(
-                    T_flat[i * NVIR:(i + 1) * NVIR, j * NVIR:(j + 1) * NVIR]
-                )
-
-                eo_i = nl.load(eps_occ_chunk[i:i + 1])
                 eo_j = nl.load(eps_occ_full[j:j + 1])
+                eo_sum = nl.add(eo_i, eo_j)
 
-                # denom[a, b] = eo_i + eo_j - eps_vir[a] - eps_vir[b]
-                # Build as: (eo_i + eo_j) - eps_vir[a] → (NVIR, 1)
-                #                          then       - eps_vir[b] → (NVIR, NVIR)
-                eo_sum = nl.add(eo_i, eo_j)  # scalar
-                # (NVIR, 1) = eo_sum - ev_part
-                denom_col = nl.subtract(eo_sum, ev_part)
-                # Broadcast-subtract eps_vir along the free dim.
-                # nl.subtract broadcasts (NVIR, 1) - (1, NVIR) → (NVIR, NVIR)
-                ev_free = ev_part.reshape((1, NVIR))
-                denom = nl.subtract(denom_col, ev_free)
+                for s in nl.affine_range(NSTRIP):
+                    a_off = s * P_TILE
+                    # t[p, b] = T[i, j, a_off+p, b]
+                    t = nl.load(
+                        T_flat[i * NVIR + a_off : i * NVIR + a_off + P_TILE,
+                               j * NVIR : (j + 1) * NVIR]
+                    )
+                    # t_T[p, b] = T[i, j, b, a_off+p]
+                    # source slice is (NVIR, P_TILE); load_transpose2d
+                    # puts axis-1 (P_TILE) on partition.
+                    t_T = nl.load_transpose2d(
+                        T_flat[i * NVIR : (i + 1) * NVIR,
+                               j * NVIR + a_off : j * NVIR + a_off + P_TILE]
+                    )
 
-                # Fused expression: t * (2*t - t_T) / denom
-                two_t = nl.multiply(t, 2.0)
-                diff = nl.subtract(two_t, t_T)
-                num = nl.multiply(t, diff)
-                term = nl.divide(num, denom)
-                s = nl.sum(term, axis=(0, 1))  # scalar (1,)
+                    # denom[p, b] = eo_sum - eps_vir[a_off+p] - eps_vir[b]
+                    ev_part_strip = nl.load(
+                        eps_vir[a_off : a_off + P_TILE]
+                    )  # (P_TILE,), partition=P_TILE
+                    ev_free = nl.load(eps_vir[0:NVIR])  # (NVIR,), will broadcast on free dim
+                    denom_col = nl.subtract(eo_sum, ev_part_strip)
+                    denom = nl.subtract(
+                        denom_col.reshape((P_TILE, 1)),
+                        ev_free.reshape((1, NVIR)),
+                    )
 
-                nl.store(e_partial[i:i + 1, j:j + 1], value=s)
+                    two_t = nl.multiply(t, 2.0)
+                    diff = nl.subtract(two_t, t_T)
+                    num = nl.multiply(t, diff)
+                    term = nl.divide(num, denom)
+                    ss = nl.sum(term, axis=(0, 1))
+
+                    nl.store(e_partial[i:i + 1, j:j + 1, s:s + 1], value=ss)
 
         return e_partial
