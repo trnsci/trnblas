@@ -61,8 +61,20 @@ fi
 echo "Waiting for instance-running..."
 aws ec2 wait instance-running --instance-ids "$INSTANCE_ID" --region "$REGION"
 echo "Waiting for SSM agent..."
-aws ssm wait instance-information \
-  --filters "Key=InstanceIds,Values=$INSTANCE_ID" --region "$REGION"
+# `aws ssm wait instance-information` isn't available in all CLI versions —
+# poll describe-instance-information instead.
+for _ in $(seq 1 60); do
+  PING=$(aws ssm describe-instance-information \
+    --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
+    --region "$REGION" \
+    --query 'InstanceInformationList[0].PingStatus' --output text 2>/dev/null || true)
+  [[ "$PING" == "Online" ]] && break
+  sleep 5
+done
+if [[ "$PING" != "Online" ]]; then
+  echo "ERROR: SSM agent not Online after 5 minutes (last PingStatus=$PING)" >&2
+  exit 1
+fi
 
 echo "Sending test command (SHA=$SHA)..."
 CMD_ID=$(aws ssm send-command \
@@ -70,13 +82,7 @@ CMD_ID=$(aws ssm send-command \
   --document-name "AWS-RunShellScript" \
   --comment "trnblas neuron tests @ $SHA" \
   --parameters "commands=[
-    \"set -euo pipefail\",
-    \"cd /home/ubuntu/trnblas\",
-    \"git fetch --all\",
-    \"git checkout $SHA\",
-    \"NEURON_VENV=\$(ls -d /opt/aws_neuronx_venv_pytorch_* | head -1)\",
-    \"sudo -u ubuntu \$NEURON_VENV/bin/pip install -e '/home/ubuntu/trnblas[dev]' --quiet\",
-    \"sudo -u ubuntu \$NEURON_VENV/bin/pytest /home/ubuntu/trnblas/tests/ -v -m neuron --tb=short\"
+    \"bash -c 'set -euo pipefail; cd /home/ubuntu/trnblas && sudo -u ubuntu git fetch --all && sudo -u ubuntu git checkout $SHA && NEURON_VENV=\$(ls -d /opt/aws_neuronx_venv_pytorch_* | head -1) && sudo -u ubuntu \$NEURON_VENV/bin/pip install -e /home/ubuntu/trnblas[dev] --quiet && sudo -u ubuntu \$NEURON_VENV/bin/pytest /home/ubuntu/trnblas/tests/ -v -m neuron --tb=short'\"
   ]" \
   --region "$REGION" \
   --output text --query 'Command.CommandId')
