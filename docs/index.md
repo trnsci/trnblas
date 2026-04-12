@@ -6,8 +6,7 @@ Trainium ships no BLAS library. `trnblas` provides Level 1–3 BLAS operations
 with NKI kernel acceleration on the Tensor Engine, targeting scientific
 computing workloads that are GEMM-dominated.
 
-Part of the **trn-\*** scientific computing suite by
-[Playground Logic](https://playgroundlogic.co).
+Part of the trnsci scientific computing suite ([github.com/trnsci](https://github.com/trnsci)).
 
 ## Why
 
@@ -27,6 +26,6 @@ sustained GEMM throughput for tensor contractions dominates wall-time. See the
 
 ## Related projects
 
-- [trnfft](https://github.com/scttfrdmn/trnfft) — FFT + complex ops for Trainium.
+- [trnfft](https://github.com/trnsci/trnfft) — FFT + complex ops for Trainium.
 - [trnrand](https://github.com/trnsci/trnrand) — Random number generation (Philox/Sobol) for Trainium.
 - `trnsolver` *(planned)* — Linear solvers and eigendecomposition.

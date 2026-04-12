@@ -1,7 +1,7 @@
 # trnblas
 
 BLAS operations for AWS Trainium via NKI.
-Part of the trn-* scientific computing suite by Playground Logic.
+Part of the trnsci scientific computing suite.
 
 ## What This Is
 
@@ -114,9 +114,9 @@ troubleshooting.
 ## Naming Convention
 
 Sibling repos in the trn-* suite:
-- `trnfft` — FFT + complex ops (https://github.com/scttfrdmn/trnfft)
+- `trnfft` — FFT + complex ops (https://github.com/trnsci/trnfft)
 - `trnblas` — BLAS operations (this repo)
 - `trnsolver` — Linear solvers, eigendecomposition (planned)
 - `trnrand` — Random number generation (https://github.com/trnsci/trnrand)
 
-All repos: Python/NKI, Apache 2.0, Playground Logic.
+All repos: Python/NKI, Apache 2.0.
