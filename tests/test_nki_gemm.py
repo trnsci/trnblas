@@ -14,8 +14,9 @@ exercise edge-tile handling.
 import pytest
 import torch
 
-from trnblas import gemm
-from trnblas.nki import nki_gemm
+import trnblas
+from trnblas import gemm, batched_gemm
+from trnblas.nki import nki_gemm, nki_batched_gemm
 
 
 pytestmark = pytest.mark.neuron
@@ -113,6 +114,31 @@ class TestGemmDispatch:
                                    atol=ATOL, rtol=RTOL)
 
 
+class TestNkiBatchedGemm:
+    """`batched_gemm` dispatches per-slice through the cached 2D kernel."""
+
+    @pytest.mark.parametrize("batch", [4, 16, 32])
+    def test_vs_torch(self, nki_backend, batch, rng):
+        A = torch.randn(batch, 256, 128, generator=rng)
+        B = torch.randn(batch, 128, 256, generator=rng)
+        out = batched_gemm(1.0, A, B)
+        torch.testing.assert_close(out, torch.bmm(A, B), atol=ATOL, rtol=RTOL)
+
+    def test_edge_shapes(self, nki_backend, rng):
+        A = torch.randn(8, 200, 137, generator=rng)
+        B = torch.randn(8, 137, 400, generator=rng)
+        out = batched_gemm(1.0, A, B)
+        torch.testing.assert_close(out, torch.bmm(A, B), atol=ATOL, rtol=RTOL)
+
+    def test_alpha_beta(self, nki_backend, rng):
+        A = torch.randn(4, 256, 128, generator=rng)
+        B = torch.randn(4, 128, 256, generator=rng)
+        C0 = torch.randn(4, 256, 256, generator=rng)
+        out = batched_gemm(2.0, A, B, beta=0.5, C=C0.clone())
+        ref = 2.0 * torch.bmm(A, B) + 0.5 * C0
+        torch.testing.assert_close(out, ref, atol=ATOL, rtol=RTOL)
+
+
 class TestPerformance:
     """Cold-cache (compile) vs warm-cache (NEFF reuse) timing.
 
@@ -150,6 +176,29 @@ class TestPerformance:
                 f"warm_min={warm_min*1000:7.1f}ms  "
                 f"warm_avg={warm_avg*1000:7.1f}ms  "
                 f"speedup={cold/warm_min:5.1f}x"
+            )
+
+    @pytest.mark.parametrize("BMKN", [(32, 256, 128, 256)])
+    def test_batched_compile_vs_cache(self, nki_backend, BMKN, capsys):
+        import time
+        B, M, K, N = BMKN
+        A = torch.randn(B, M, K)
+        Bm = torch.randn(B, K, N)
+        t0 = time.perf_counter()
+        batched_gemm(1.0, A, Bm)
+        cold = time.perf_counter() - t0
+        warm_times = []
+        for _ in range(3):
+            t = time.perf_counter()
+            batched_gemm(1.0, A, Bm)
+            warm_times.append(time.perf_counter() - t)
+        warm_min = min(warm_times)
+        with capsys.disabled():
+            print(
+                f"\n[perf batch={B} {M}x{K}x{N}] "
+                f"cold={cold*1000:7.1f}ms  "
+                f"warm_min={warm_min*1000:7.1f}ms  "
+                f"per_slice={warm_min*1000/B:6.2f}ms"
             )
 
 

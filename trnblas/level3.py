@@ -72,9 +72,11 @@ def batched_gemm(
     Critical for DF-MP2 energy evaluation where contractions are
     independent across auxiliary basis indices.
     """
+    from .nki.dispatch import nki_batched_gemm
+
     a = A.transpose(-2, -1) if transA else A
     b = B.transpose(-2, -1) if transB else B
-    result = alpha * torch.bmm(a, b)
+    result = alpha * nki_batched_gemm(a, b)
     if C is not None and beta != 0.0:
         result = result + beta * C
     return result

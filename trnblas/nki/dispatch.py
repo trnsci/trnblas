@@ -53,6 +53,24 @@ def _use_nki() -> bool:
     return HAS_NKI
 
 
+def nki_batched_gemm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    """Batched GEMM. A: (batch, M, K), B: (batch, K, N) → C: (batch, M, N).
+
+    Loops over the batch dim, dispatching the 2D `_nki_gemm_impl` per
+    slice. Every slice after the first hits the NEFF cache (identical
+    kernel signature), so per-slice cost is HBM transfer + Tensor Engine
+    dispatch only. A true 3D-batched NKI kernel is a future optimisation
+    if benchmarks justify it.
+
+    For DF-MP2 tensor contractions over auxiliary basis indices, the
+    natural use case is one batched_gemm with batch=N_aux per orbital
+    pair — exactly this loop's sweet spot.
+    """
+    if not _use_nki():
+        return torch.bmm(A, B)
+    return torch.stack([_nki_gemm_impl(A[i], B[i]) for i in range(A.shape[0])])
+
+
 def nki_gemm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     """GEMM with NKI dispatch.
 
