@@ -7,7 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.3.0] - 2026-04-12
+### Added
+
+- `examples/df_mp2.py` refactored to use `trnblas.batched_gemm` for all
+  per-occupied-orbital loops (steps 2b, 3, and 4-per-i). Energy
+  reduction in step 4 fully vectorised over (j, a, b), eliminating the
+  per-pair `.item()` round-trip.
+- `--bench` mode in the example: runs cold + warm passes for three
+  synthetic shapes (small/medium/large), reports per-step timings and
+  effective TFLOPS.
+- `scripts/run_df_mp2_bench.sh` — SSM-driven runner for the bench,
+  parallel to `run_neuron_tests.sh`.
+
+### Performance — first end-to-end DF-MP2 on trn1.2xlarge
+
+| Shape (nbasis, nocc, naux) | Flops | Cold | Warm | TFLOPS |
+|----------------------------|------:|-----:|-----:|-------:|
+| small (128, 16, 384)       | 3.4 G | 3.50s | 0.34s | 0.01 |
+| medium (512, 64, 1536)     | 2757 G | 24.27s | 21.08s | 0.13 |
+
+Energy reproducible (medium: E = -2.487221 every run, matches CPU
+fallback). The cold/warm gap on small (10×) confirms NEFF cache reuse
+across `batched_gemm` slices. Medium's energy step (4096 nested batched
+matmuls via Python loop) is the obvious next optimisation — collapsing
+the (i, j) dim into one batched dispatch will eliminate ~64× of the
+per-call overhead. Large (768, 96, 2304) skipped for now; its nocc²
+factor pushes step 4 to ~5× medium.
 
 ### Added
 
