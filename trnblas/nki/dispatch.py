@@ -72,8 +72,8 @@ def nki_gemm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     return torch.matmul(A, B)
 
 
-def _aligned(M: int, K: int, N: int) -> bool:
-    return (M % _TILE_M == 0) and (K % _TILE_K == 0) and (N % _TILE_N == 0)
+def _round_up(n: int, multiple: int) -> int:
+    return ((n + multiple - 1) // multiple) * multiple
 
 
 def _to_xla(*tensors):
@@ -87,28 +87,37 @@ def _to_xla(*tensors):
 def _nki_gemm_impl(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     """NKI GEMM implementation.
 
-    Aligned shapes (M%128 == K%128 == 0, N%512 == 0) dispatch to the
-    `_gemm_kernel` on the Tensor Engine. Other shapes fall back to
-    `torch.matmul` until edge-tile handling lands.
+    Pads M/K up to TILE_M/TILE_K and N up to TILE_N (only when N > TILE_N
+    and not already a multiple) before dispatching the aligned kernel.
+    The result is sliced back to the original (M, N).
 
     Set `TRNBLAS_REQUIRE_NKI=1` to re-raise on kernel errors instead of
-    falling back — used by the validation loop to surface silent breakage.
+    falling back to `torch.matmul`; useful in the validation loop to
+    surface silent kernel breakage.
     """
     if not HAS_NKI:
         raise RuntimeError("NKI not available")
     M, K = A.shape
     _, N = B.shape
-    if not _aligned(M, K, N):
-        if _REQUIRE_NKI:
-            raise RuntimeError(
-                f"TRNBLAS_REQUIRE_NKI set but shape {(M, K, N)} is not "
-                f"aligned to (TILE_M={_TILE_M}, TILE_K={_TILE_K}, TILE_N={_TILE_N})"
-            )
-        return torch.matmul(A, B)
+    M_pad = _round_up(M, _TILE_M)
+    K_pad = _round_up(K, _TILE_K)
+    # When N <= TILE_N, the kernel uses TILE_N = N (single N-tile, no remainder).
+    # Otherwise we need N to be a clean multiple of TILE_N.
+    N_pad = N if N <= _TILE_N else _round_up(N, _TILE_N)
+    needs_pad = (M_pad != M) or (K_pad != K) or (N_pad != N)
+
     try:
-        (a, b), orig_device = _to_xla(A.contiguous(), B.contiguous())
+        if needs_pad:
+            A_p = torch.zeros(M_pad, K_pad, dtype=A.dtype, device=A.device)
+            A_p[:M, :K] = A
+            B_p = torch.zeros(K_pad, N_pad, dtype=B.dtype, device=B.device)
+            B_p[:K, :N] = B
+            (a, b), orig_device = _to_xla(A_p.contiguous(), B_p.contiguous())
+        else:
+            (a, b), orig_device = _to_xla(A.contiguous(), B.contiguous())
         c = _gemm_kernel(a, b)
-        return c.to(orig_device)
+        result = c.to(orig_device)
+        return result[:M, :N] if needs_pad else result
     except Exception:
         if _REQUIRE_NKI:
             raise
@@ -121,8 +130,9 @@ if HAS_NKI:
     def _gemm_kernel(a, b):
         """Real GEMM: C = A @ B with stationary tile reuse.
 
-        Aligned shapes only — caller guarantees M%128 == K%128 == 0,
-        N%512 == 0. PSUM accumulates over K-tiles before the single store
+        Caller guarantees M, K are multiples of 128 and N is either ≤ 512
+        or a multiple of 512 (handled by the dispatch wrapper's HBM
+        padding). PSUM accumulates over K-tiles before the single store
         per (m, n) tile pair.
 
         NKI 2.24 calling convention (`nisa.nc_matmul`):
@@ -133,32 +143,36 @@ if HAS_NKI:
         M, K = a.shape
         _, N = b.shape
 
+        TILE_M = _TILE_M
+        TILE_K = _TILE_K
+        TILE_N = N if N <= _TILE_N else _TILE_N
+
         c = nl.ndarray((M, N), dtype=a.dtype, buffer=nl.shared_hbm)
 
-        for m in nl.affine_range(M // _TILE_M):
-            for n in nl.affine_range(N // _TILE_N):
-                m_off = m * _TILE_M
-                n_off = n * _TILE_N
+        for m in nl.affine_range(M // TILE_M):
+            for n in nl.affine_range(N // TILE_N):
+                m_off = m * TILE_M
+                n_off = n * TILE_N
 
-                psum = nl.zeros((_TILE_M, _TILE_N), dtype=nl.float32, buffer=nl.psum)
+                psum = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
 
-                for k in nl.affine_range(K // _TILE_K):
-                    k_off = k * _TILE_K
+                for k in nl.affine_range(K // TILE_K):
+                    k_off = k * TILE_K
 
                     # Load A row-tile transposed so partition dim = K.
                     a_t = nl.load_transpose2d(
-                        a[m_off:m_off + _TILE_M, k_off:k_off + _TILE_K]
+                        a[m_off:m_off + TILE_M, k_off:k_off + TILE_K]
                     )
                     # B is already K-major.
                     b_tile = nl.load(
-                        b[k_off:k_off + _TILE_K, n_off:n_off + _TILE_N]
+                        b[k_off:k_off + TILE_K, n_off:n_off + TILE_N]
                     )
 
                     psum[...] += nisa.nc_matmul(a_t, b_tile)
 
                 c_sbuf = nl.copy(psum, dtype=a.dtype)
                 nl.store(
-                    c[m_off:m_off + _TILE_M, n_off:n_off + _TILE_N],
+                    c[m_off:m_off + TILE_M, n_off:n_off + TILE_N],
                     value=c_sbuf,
                 )
 

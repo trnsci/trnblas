@@ -113,6 +113,46 @@ class TestGemmDispatch:
                                    atol=ATOL, rtol=RTOL)
 
 
+class TestPerformance:
+    """Cold-cache (compile) vs warm-cache (NEFF reuse) timing.
+
+    Run with `pytest -v -s` so the perf prints surface. The instance-wide
+    NEFF cache at /var/tmp/neuron-compile-cache/ persists across pytest
+    processes, so the second invocation of the script (via --warm) sees
+    even the first call hit the cache.
+    """
+
+    @pytest.mark.parametrize("MKN", [(512, 512, 512), (1024, 1024, 1024)])
+    def test_compile_vs_cache_timing(self, nki_backend, MKN, capsys):
+        import time
+        M, K, N = MKN
+        A = torch.randn(M, K)
+        B = torch.randn(K, N)
+
+        # First call: may compile (cold cache).
+        t0 = time.perf_counter()
+        nki_gemm(A, B)
+        cold = time.perf_counter() - t0
+
+        # Subsequent calls: should hit cached NEFF + warm XLA graph.
+        warm_times = []
+        for _ in range(5):
+            t = time.perf_counter()
+            nki_gemm(A, B)
+            warm_times.append(time.perf_counter() - t)
+        warm_min = min(warm_times)
+        warm_avg = sum(warm_times) / len(warm_times)
+
+        with capsys.disabled():
+            print(
+                f"\n[perf {M}x{K}x{N}] "
+                f"cold={cold*1000:7.1f}ms  "
+                f"warm_min={warm_min*1000:7.1f}ms  "
+                f"warm_avg={warm_avg*1000:7.1f}ms  "
+                f"speedup={cold/warm_min:5.1f}x"
+            )
+
+
 class TestStationaryTileReuse:
     """The kernel's value prop: A loaded once, reused across many B tiles.
 

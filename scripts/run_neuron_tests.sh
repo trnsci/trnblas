@@ -18,6 +18,12 @@
 
 set -euo pipefail
 
+WARM=0
+if [[ "${1:-}" == "--warm" ]]; then
+  WARM=1
+  shift
+fi
+
 INSTANCE_TYPE="${1:-trn1}"
 TAG="trnblas-ci-${INSTANCE_TYPE}"
 REGION="${AWS_REGION:-us-east-1}"
@@ -76,13 +82,22 @@ if [[ "$PING" != "Online" ]]; then
   exit 1
 fi
 
-echo "Sending test command (SHA=$SHA)..."
+# --warm: run the suite twice to expose the NEFF cache delta — the second
+# pass gets warm /var/tmp/neuron-compile-cache/. -s surfaces the perf
+# prints from TestPerformance.
+if [[ "$WARM" == "1" ]]; then
+  PYTEST_INVOCATION="\$NEURON_VENV/bin/pytest /home/ubuntu/trnblas/tests/ -v -s -m neuron --tb=short && echo === WARM PASS === && \$NEURON_VENV/bin/pytest /home/ubuntu/trnblas/tests/ -v -s -m neuron --tb=short"
+else
+  PYTEST_INVOCATION="\$NEURON_VENV/bin/pytest /home/ubuntu/trnblas/tests/ -v -m neuron --tb=short"
+fi
+
+echo "Sending test command (SHA=$SHA, warm=$WARM)..."
 CMD_ID=$(aws ssm send-command \
   --instance-ids "$INSTANCE_ID" \
   --document-name "AWS-RunShellScript" \
   --comment "trnblas neuron tests @ $SHA" \
   --parameters "commands=[
-    \"bash -c 'set -euo pipefail; cd /home/ubuntu/trnblas && sudo -u ubuntu git fetch --all && sudo -u ubuntu git checkout $SHA && NEURON_VENV=\$(ls -d /opt/aws_neuronx_venv_pytorch_* | head -1) && sudo -u ubuntu \$NEURON_VENV/bin/pip install -e /home/ubuntu/trnblas[dev] --quiet && sudo -u ubuntu \$NEURON_VENV/bin/pytest /home/ubuntu/trnblas/tests/ -v -m neuron --tb=short'\"
+    \"bash -c 'set -euo pipefail; cd /home/ubuntu/trnblas && sudo -u ubuntu git fetch --all && sudo -u ubuntu git checkout $SHA && NEURON_VENV=\$(ls -d /opt/aws_neuronx_venv_pytorch_* | head -1) && sudo -u ubuntu \$NEURON_VENV/bin/pip install -e /home/ubuntu/trnblas[dev] --quiet && sudo -u ubuntu $PYTEST_INVOCATION'\"
   ]" \
   --region "$REGION" \
   --output text --query 'Command.CommandId')
