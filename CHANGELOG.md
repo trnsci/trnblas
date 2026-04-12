@@ -19,20 +19,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `scripts/run_df_mp2_bench.sh` — SSM-driven runner for the bench,
   parallel to `run_neuron_tests.sh`.
 
-### Performance — first end-to-end DF-MP2 on trn1.2xlarge
+### Performance — DF-MP2 on trn1.2xlarge
 
-| Shape (nbasis, nocc, naux) | Flops | Cold | Warm | TFLOPS |
-|----------------------------|------:|-----:|-----:|-------:|
-| small (128, 16, 384)       | 3.4 G | 3.50s | 0.34s | 0.01 |
-| medium (512, 64, 1536)     | 2757 G | 24.27s | 21.08s | 0.13 |
+After collapsing the energy step (was 4096 sequential batched dispatches
+via a Python loop; now one chunked GEMM via the algebraic identity
+`T_full = X @ X.T` where `X = B.reshape(nocc·nvir, naux)`), see #14:
 
-Energy reproducible (medium: E = -2.487221 every run, matches CPU
-fallback). The cold/warm gap on small (10×) confirms NEFF cache reuse
-across `batched_gemm` slices. Medium's energy step (4096 nested batched
-matmuls via Python loop) is the obvious next optimisation — collapsing
-the (i, j) dim into one batched dispatch will eliminate ~64× of the
-per-call overhead. Large (768, 96, 2304) skipped for now; its nocc²
-factor pushes step 4 to ~5× medium.
+| Shape | Flops | Cold | Warm | TFLOPS | Speedup vs prior |
+|-------|------:|-----:|-----:|-------:|-----------------:|
+| small (128/16/384)    | 3.4 G    | 0.025s | 0.008s  | 0.43 | — |
+| medium (512/64/1536)  | 2757 G   | 12.92s | 9.77s   | 0.28 | 2.2× |
+| large (768/96/2304)   | 20352 G  | 65.88s | 62.84s  | 0.32 | (newly feasible) |
+
+Energy reproducible bit-for-bit across runs:
+- small: -1.619250e-04
+- medium: -2.487221
+- large: -4.351183e+01
+
+The energy step still dominates large's wall (57s of 63s = 92%) — it's
+memory-bandwidth bound on the huge T tensor + intermediates. Fusing it
+into a custom NKI kernel would be the next optimisation; tracked as a
+future v0.4 follow-up to #14.
 
 ### Added
 
