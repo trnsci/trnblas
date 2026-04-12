@@ -28,12 +28,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - NKI GEMM kernel (`trnblas/nki/dispatch.py:_gemm_kernel`) wired to actual
   `nisa.nc_matmul` calls with PSUM accumulation across K-tiles and
   stationary A-tile reuse — supersedes the previous stub that overwrote
-  per K-tile. Aligned shapes only (M%128 == K%128 == 0, N%512 == 0);
-  other shapes fall through to `torch.matmul`. Edge-tile support
-  tracked in a follow-up to #8.
-- `TRNBLAS_REQUIRE_NKI=1` env-var added — re-raises kernel failures
-  instead of falling back, so the validation suite can't accidentally
-  green over silent kernel breakage.
+  per K-tile.
+- Dispatch wrapper now handles arbitrary shapes via HBM padding: M/K
+  rounded to 128, N rounded to 512 (when N > 512); kernel uses
+  `TILE_N = min(N, 512)` for single-tile small-N. Result is sliced back
+  to the original (M, N). Removes the alignment-rejection fallback path.
+- `TRNBLAS_REQUIRE_NKI=1` env-var added — re-raises on kernel exceptions
+  instead of silently falling back to `torch.matmul`. Lets the
+  validation suite surface kernel breakage.
+
+### Performance (validated on trn1.2xlarge, neuronxcc 2.24.5133)
+
+11/11 `pytest -m neuron` tests pass. Cached-NEFF speedup measured by
+running the suite twice on the same instance:
+
+| Pass | Wall time |
+|------|----------:|
+| Cold (first run after instance start) | 6.71s |
+| Warm (NEFF cache hit + warm XLA graph) | 2.24s (3.0× faster) |
+
+Per-call kernel timing (warm cache, mean of 5):
+
+| Shape (M×K×N) | Per-call |
+|---------------|---------:|
+| 512×512×512    | 1.8 ms |
+| 1024×1024×1024 | 4.7 ms |
+
+NEFF cache at `/var/tmp/neuron-compile-cache/` persists across instance
+stop/start (EBS-backed), so kernel compile cost is paid exactly once per
+shape per cache lifetime.
 
 ## [0.2.0] - 2026-04-11
 
