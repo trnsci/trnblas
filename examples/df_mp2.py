@@ -38,15 +38,18 @@ def _energy_reduction(
     eps_occ: torch.Tensor,
     eps_vir: torch.Tensor,
     *,
-    mem_budget_bytes: int = 6_000_000_000,
+    mem_budget_bytes: int = 1_500_000_000,
 ) -> float:
     """MP2 energy from the metric-contracted three-index tensor B.
 
     Computes E = Σ_{ijab} T_ijab (2 T_ijab - T_ijba) / Δ_ijab where
     T_ijab = Σ_P B[i,a,P] B[j,b,P], via one GEMM per i-chunk:
         T_chunk = B[i_chunk_flat] @ B_flat.T
-    chunked along i so that T_chunk + intermediates stay under
-    `mem_budget_bytes`. At medium shape this resolves to a single chunk.
+    chunked along i so each T_chunk stays under `mem_budget_bytes`.
+    The energy reduction (T * (2T - T.T) / denom).sum() materialises 3
+    additional tensors of T_chunk's shape, so the actual peak is ~4×.
+    Default budget targets ~6 GB peak, fits trn1.2xlarge HBM with room
+    for ERI + Python + system. At medium this resolves to one chunk.
     """
     nocc, nvir, naux = B.shape
     bytes_per_i = 4 * nvir * nocc * nvir       # one row-block of T_full (fp32)
