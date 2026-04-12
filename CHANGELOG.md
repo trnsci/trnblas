@@ -23,6 +23,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   trnfft pattern, GitHub Actions does not touch AWS — all Neuron testing
   is human-initiated locally with `AWS_PROFILE=aws`.
 
+### Changed
+
+- NKI GEMM kernel (`trnblas/nki/dispatch.py:_gemm_kernel`) wired to actual
+  `nisa.nc_matmul` calls with PSUM accumulation across K-tiles and
+  stationary A-tile reuse — supersedes the previous stub that overwrote
+  per K-tile. Aligned shapes only (M%128 == K%128 == 0, N%512 == 0);
+  other shapes fall through to `torch.matmul`. Edge-tile support
+  tracked in a follow-up to #8.
+- `TRNBLAS_REQUIRE_NKI=1` env-var added — re-raises kernel failures
+  instead of falling back, so the validation suite can't accidentally
+  green over silent kernel breakage.
+
 ## [0.2.0] - 2026-04-11
 
 ### Added

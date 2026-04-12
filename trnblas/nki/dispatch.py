@@ -8,6 +8,8 @@ tile reuse on the Tensor Engine for 2x fewer SBUF loads vs naive.
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 try:
@@ -17,6 +19,16 @@ try:
     HAS_NKI = True
 except ImportError:
     HAS_NKI = False
+
+# When set, kernel-path failures re-raise instead of falling back to PyTorch.
+# Used by the validation suite to catch silent kernel breakage during iteration.
+_REQUIRE_NKI = os.environ.get("TRNBLAS_REQUIRE_NKI", "").lower() in ("1", "true", "yes")
+
+# Tile shapes for the systolic array (NKI 2.24 limits):
+# stationary partition ≤ 128 (= K), free ≤ 128 (= M); moving free ≤ 512 (= N).
+_TILE_M = 128
+_TILE_K = 128
+_TILE_N = 512
 
 _backend = "auto"
 
@@ -60,62 +72,94 @@ def nki_gemm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     return torch.matmul(A, B)
 
 
+def _aligned(M: int, K: int, N: int) -> bool:
+    return (M % _TILE_M == 0) and (K % _TILE_K == 0) and (N % _TILE_N == 0)
+
+
+def _to_xla(*tensors):
+    """Move tensors to the XLA device for NKI kernel dispatch."""
+    import torch_xla.core.xla_model as xm
+    device = xm.xla_device()
+    orig = tensors[0].device
+    return [t.to(device) for t in tensors], orig
+
+
 def _nki_gemm_impl(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     """NKI GEMM implementation.
 
-    TODO: Wire to actual NKI kernel with tiling once validated on trn1/trn2.
-    The kernel should:
-    - Tile A into 128×128 blocks (SBUF capacity)
-    - For each A tile, stream all corresponding B tiles through the systolic array
-    - Accumulate partial products in PSUM
-    - Handle edge tiles for non-128-aligned dimensions
+    Aligned shapes (M%128 == K%128 == 0, N%512 == 0) dispatch to the
+    `_gemm_kernel` on the Tensor Engine. Other shapes fall back to
+    `torch.matmul` until edge-tile handling lands.
 
-    See neuron-complex-ops kernels_optimized.py for the complex variant
-    of this pattern — real GEMM is simpler (no real/imag split needed).
+    Set `TRNBLAS_REQUIRE_NKI=1` to re-raise on kernel errors instead of
+    falling back — used by the validation loop to surface silent breakage.
     """
     if not HAS_NKI:
         raise RuntimeError("NKI not available")
-    # Fallback until kernel is validated on hardware
-    return torch.matmul(A, B)
+    M, K = A.shape
+    _, N = B.shape
+    if not _aligned(M, K, N):
+        if _REQUIRE_NKI:
+            raise RuntimeError(
+                f"TRNBLAS_REQUIRE_NKI set but shape {(M, K, N)} is not "
+                f"aligned to (TILE_M={_TILE_M}, TILE_K={_TILE_K}, TILE_N={_TILE_N})"
+            )
+        return torch.matmul(A, B)
+    try:
+        (a, b), orig_device = _to_xla(A.contiguous(), B.contiguous())
+        c = _gemm_kernel(a, b)
+        return c.to(orig_device)
+    except Exception:
+        if _REQUIRE_NKI:
+            raise
+        return torch.matmul(A, B)
 
 
 if HAS_NKI:
 
     @nki.jit
-    def gemm_kernel(A_ref, B_ref, C_ref, M: int, N: int, K: int):
-        """Tiled GEMM kernel for Trainium NeuronCore.
+    def _gemm_kernel(a, b):
+        """Real GEMM: C = A @ B with stationary tile reuse.
 
-        C[M,N] = A[M,K] @ B[K,N]
+        Aligned shapes only — caller guarantees M%128 == K%128 == 0,
+        N%512 == 0. PSUM accumulates over K-tiles before the single store
+        per (m, n) tile pair.
 
-        Tiling: 128×128 tiles for SBUF, accumulate in PSUM.
-        A tiles are stationary (loaded once, reused across N tiles).
-        B tiles are streamed (moving operand in systolic array).
-
-        STUB: Scaffolded for on-hardware validation.
+        NKI 2.24 calling convention (`nisa.nc_matmul`):
+            stationary: (TILE_K, TILE_M)  partition=K ≤ 128, free ≤ 128
+            moving:     (TILE_K, TILE_N)  partition=K, free ≤ 512
+            psum:       (TILE_M, TILE_N)  fp32, in nl.psum
         """
-        TILE = 128
+        M, K = a.shape
+        _, N = b.shape
 
-        for m_tile in nl.affine_range(M // TILE):
-            for k_tile in nl.affine_range(K // TILE):
-                # Load A tile — stationary in systolic array
-                a_tile = nl.load(
-                    A_ref[m_tile * TILE:(m_tile + 1) * TILE,
-                          k_tile * TILE:(k_tile + 1) * TILE]
+        c = nl.ndarray((M, N), dtype=a.dtype, buffer=nl.shared_hbm)
+
+        for m in nl.affine_range(M // _TILE_M):
+            for n in nl.affine_range(N // _TILE_N):
+                m_off = m * _TILE_M
+                n_off = n * _TILE_N
+
+                psum = nl.zeros((_TILE_M, _TILE_N), dtype=nl.float32, buffer=nl.psum)
+
+                for k in nl.affine_range(K // _TILE_K):
+                    k_off = k * _TILE_K
+
+                    # Load A row-tile transposed so partition dim = K.
+                    a_t = nl.load_transpose2d(
+                        a[m_off:m_off + _TILE_M, k_off:k_off + _TILE_K]
+                    )
+                    # B is already K-major.
+                    b_tile = nl.load(
+                        b[k_off:k_off + _TILE_K, n_off:n_off + _TILE_N]
+                    )
+
+                    psum[...] += nisa.nc_matmul(a_t, b_tile)
+
+                c_sbuf = nl.copy(psum, dtype=a.dtype)
+                nl.store(
+                    c[m_off:m_off + _TILE_M, n_off:n_off + _TILE_N],
+                    value=c_sbuf,
                 )
 
-                for n_tile in nl.affine_range(N // TILE):
-                    # Stream B tile — moving operand
-                    b_tile = nl.load(
-                        B_ref[k_tile * TILE:(k_tile + 1) * TILE,
-                              n_tile * TILE:(n_tile + 1) * TILE]
-                    )
-
-                    # Matmul → accumulate in PSUM
-                    c_partial = nisa.nc_matmul(a_tile, b_tile)
-
-                    # Store (would accumulate across k_tiles in practice)
-                    nl.store(
-                        C_ref[m_tile * TILE:(m_tile + 1) * TILE,
-                              n_tile * TILE:(n_tile + 1) * TILE],
-                        c_partial
-                    )
+        return c
