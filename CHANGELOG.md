@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-04-12
+
 ### Added
 
 - Terraform module (`infra/terraform/`) provisioning a Trainium CI instance
@@ -37,22 +39,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of silently falling back to `torch.matmul`. Lets the
   validation suite surface kernel breakage.
 
+- `trnblas.batched_gemm` dispatches per-slice through the cached 2D
+  `_gemm_kernel` via new `nki_batched_gemm` wrapper. Every slice after
+  the first hits the NEFF cache (identical signature), so per-slice cost
+  is HBM transfer + Tensor Engine dispatch only. The natural batched
+  dispatch shape for DF-MP2 contractions over auxiliary basis indices.
+
 ### Performance (validated on trn1.2xlarge, neuronxcc 2.24.5133)
 
-11/11 `pytest -m neuron` tests pass. Cached-NEFF speedup measured by
+17/17 `pytest -m neuron` tests pass. Cached-NEFF speedup measured by
 running the suite twice on the same instance:
 
 | Pass | Wall time |
 |------|----------:|
-| Cold (first run after instance start) | 6.71s |
-| Warm (NEFF cache hit + warm XLA graph) | 2.24s (3.0× faster) |
+| Cold (first run after instance start) | 7.01s |
+| Warm (NEFF cache hit + warm XLA graph) | 2.52s (2.8× faster) |
 
 Per-call kernel timing (warm cache, mean of 5):
 
 | Shape (M×K×N) | Per-call |
 |---------------|---------:|
-| 512×512×512    | 1.8 ms |
-| 1024×1024×1024 | 4.7 ms |
+| 512×512×512    | 1.6 ms |
+| 1024×1024×1024 | 4.5 ms |
+
+Batched dispatch (warm, batch=32 of 256×128×256):
+
+| Metric | Value |
+|--------|------:|
+| Total | 39.3 ms |
+| Per-slice | 1.23 ms |
 
 NEFF cache at `/var/tmp/neuron-compile-cache/` persists across instance
 stop/start (EBS-backed), so kernel compile cost is paid exactly once per
@@ -92,6 +107,7 @@ shape per cache lifetime.
 - Test suite covering Level 1/2/3 BLAS correctness against PyTorch/NumPy
   references, with SPD matrix fixtures for symmetric/triangular routines.
 
-[Unreleased]: https://github.com/scttfrdmn/trnblas/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/scttfrdmn/trnblas/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/scttfrdmn/trnblas/releases/tag/v0.3.0
 [0.2.0]: https://github.com/scttfrdmn/trnblas/releases/tag/v0.2.0
 [0.1.0]: https://github.com/scttfrdmn/trnblas/commits/main
