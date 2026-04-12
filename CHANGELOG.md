@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Terraform module (`infra/terraform/`) provisioning a Trainium CI instance
+  with SSM access; instance kept stopped between runs (~$10/mo EBS-only).
+- `scripts/run_neuron_tests.sh` — local SSM-driven runner for
+  `pytest -m neuron`; starts the instance, runs tests, **always stops it
+  via trap**.
+- AWS setup docs (`docs/aws_setup.md`) covering provisioning, running
+  tests, cost, and troubleshooting.
+
+### Removed
+
+- `.github/workflows/neuron.yml` workflow_dispatch scaffold. Per the
+  trnfft pattern, GitHub Actions does not touch AWS — all Neuron testing
+  is human-initiated locally with `AWS_PROFILE=aws`.
+
 ## [0.2.0] - 2026-04-11
 
 ### Added

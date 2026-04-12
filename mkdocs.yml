@@ -23,6 +23,7 @@ nav:
       - Level 3 (Matrix-Matrix): api/level3.md
       - NKI Backend: api/nki.md
   - Architecture: architecture.md
+  - AWS Setup: aws_setup.md
 
 markdown_extensions:
   - pymdownx.highlight

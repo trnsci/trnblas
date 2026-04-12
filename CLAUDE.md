@@ -94,6 +94,22 @@ pytest tests/ -v               # CPU fallback mode
 python examples/df_mp2.py --demo   # Quick DF-MP2 demo
 ```
 
+## Neuron testing
+
+`pytest -m neuron` runs against real Trainium hardware. The flow is
+human-initiated and local — **GitHub Actions does not touch AWS**.
+
+```bash
+AWS_PROFILE=aws ./scripts/run_neuron_tests.sh        # trn1 (default)
+AWS_PROFILE=aws ./scripts/run_neuron_tests.sh trn2   # or inf2
+```
+
+The script starts a tagged Trainium instance (`trnblas-ci-trn1` by
+default), runs pytest via SSM, and **always stops the instance** via a
+trap. Provisioning is one-time via `infra/terraform/`. See
+[`docs/aws_setup.md`](docs/aws_setup.md) for setup, cost, and
+troubleshooting.
+
 ## Naming Convention
 
 Sibling repos in the trn-* suite:
