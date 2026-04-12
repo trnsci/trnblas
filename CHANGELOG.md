@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-04-11
+
+### Added
+
+- MkDocs Material documentation site at
+  [scttfrdmn.github.io/trnblas](https://scttfrdmn.github.io/trnblas/) with
+  Installation, Quickstart, API reference (Level 1/2/3, NKI backend), and
+  Architecture pages.
+- GitHub Actions CI matrix (Python 3.10, 3.11, 3.12).
+- Neuron hardware CI workflow scaffold (`workflow_dispatch`) — SSM wiring
+  deferred until a persistent CI Trainium instance is available.
+- PyPI publishing workflow (OIDC trusted publishers, sdist + wheel on
+  release) — matches trnfft pattern.
+- Benchmark suite scaffold (`benchmarks/bench_blas.py`, pytest-benchmark).
+- Issue and PR templates under `.github/`.
+- README badges — CI status, PyPI version, Python versions, License, Docs.
+- Cross-link to trnblas in trnfft's Related Projects table
+  (`scttfrdmn/trnfft@7330b3f`).
+
 ## [0.1.0] - 2026-04-11
 
 ### Added
@@ -22,5 +41,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Test suite covering Level 1/2/3 BLAS correctness against PyTorch/NumPy
   references, with SPD matrix fixtures for symmetric/triangular routines.
 
-[Unreleased]: https://github.com/scttfrdmn/trnblas/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/scttfrdmn/trnblas/releases/tag/v0.1.0
+[Unreleased]: https://github.com/scttfrdmn/trnblas/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/scttfrdmn/trnblas/releases/tag/v0.2.0
+[0.1.0]: https://github.com/scttfrdmn/trnblas/commits/main
