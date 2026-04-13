@@ -73,24 +73,9 @@ class TestTorchFallback:
 
 
 class TestNkiKernel:
-    """On-hardware validation of the fused NKI kernel.
+    """On-hardware validation of the fused NKI kernel."""
 
-    Still skipped after commit 34a13e5 (partition-limit bug fixed).
-    Next blocker surfaced by real NKI dispatch: the (P_TILE, NVIR)
-    tile reduction uses `nl.sum(term, axis=(0, 1))` which tries to
-    reduce along both partition and free dims. NKI only allows
-    free-dim reduction; partition-dim reduction needs a different
-    primitive (e.g., `nisa.reduce` across partitions) or a redesign
-    that keeps per-partition partials and does the final cross-
-    partition sum host-side.
-
-    That's part of the #15 architectural redesign — kernel rewrite to
-    fuse GEMM+elementwise+reduce exploiting TE+VE+Scalar engines
-    concurrently. Not in the production DF-MP2 path.
-    """
-
-    pytestmark = [pytest.mark.neuron,
-                  pytest.mark.skip(reason="partition-axis reduce — #15 redesign")]
+    pytestmark = pytest.mark.neuron
 
     def test_small(self, nki_backend):
         T_flat, eo_c, eo_f, ev = _make_inputs(nocc=4, nvir=8, naux=16)

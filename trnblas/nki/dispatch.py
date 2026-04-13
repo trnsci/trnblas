@@ -494,7 +494,14 @@ if HAS_NKI:
         partition=1, free=N (a 1D load is treated as partition=len,
         which would exceed the 128-partition limit for NVIR > 128).
 
-        Returns (IC, NOCC) fp32; host reduces to scalar.
+        NKI only supports reduction along the free dim. A full
+        `(P_TILE, NVIR) → scalar` reduce would need a partition-axis
+        reduce which NKI rejects. Instead: reduce free-only to get
+        per-partition partials `(P_TILE, 1)`, accumulate across
+        strips in an SBUF row-accumulator, emit
+        `(IC, NOCC, P_TILE)` to HBM — caller `.sum()` handles the
+        final partition-axis reduction host-side (partial is small;
+        ≤ 258 KB at large bench shape).
         """
         NVIR = eps_vir.shape[1]
         IC = eps_occ_chunk.shape[1]
@@ -505,8 +512,9 @@ if HAS_NKI:
             P_TILE -= 1
         NSTRIP = NVIR // P_TILE
 
-        e_partial = nl.ndarray((IC, NOCC), dtype=nl.float32, buffer=nl.shared_hbm)
-        # (1, NVIR) load: partition=1, free=NVIR — partition-safe for any NVIR.
+        e_partial = nl.ndarray(
+            (IC, NOCC, P_TILE), dtype=nl.float32, buffer=nl.shared_hbm
+        )
         ev_free = nl.load(eps_vir[0:1, 0:NVIR])
 
         for i in nl.affine_range(IC):
@@ -515,7 +523,11 @@ if HAS_NKI:
                 eo_j = nl.load(eps_occ_full[0:1, j:j + 1])
                 eo_sum = nl.add(eo_i, eo_j)
 
-                acc = nl.zeros((1, 1), dtype=nl.float32, buffer=nl.sbuf)
+                # Per-partition SBUF row accumulator: one value per
+                # partition, summed across NSTRIP strips.
+                acc_row = nl.zeros(
+                    (P_TILE, 1), dtype=nl.float32, buffer=nl.sbuf
+                )
 
                 for s in nl.affine_range(NSTRIP):
                     a_off = s * P_TILE
@@ -527,8 +539,6 @@ if HAS_NKI:
                         T_flat[i * NVIR : (i + 1) * NVIR,
                                j * NVIR + a_off : j * NVIR + a_off + P_TILE]
                     )
-                    # (P_TILE,) slice of eps_vir via a (1, P_TILE) load,
-                    # then reshape to (P_TILE, 1) for broadcast.
                     ev_part = nl.load(eps_vir[0:1, a_off : a_off + P_TILE])
                     denom_col = nl.subtract(eo_sum, ev_part)
                     denom = nl.subtract(
@@ -542,9 +552,17 @@ if HAS_NKI:
                         ),
                         denom,
                     )
-                    acc[...] = nl.add(acc, nl.sum(term, axis=(0, 1)))
+                    # Free-dim reduce: (P_TILE, NVIR) → (P_TILE, 1).
+                    strip_partial = nl.sum(term, axis=1, keepdims=True)
+                    acc_row[...] = nl.add(acc_row, strip_partial)
 
-                nl.store(e_partial[i:i + 1, j:j + 1], value=acc)
+                # Store (P_TILE,) per-partition partials for this (i, j).
+                # Reshape the SBUF (P_TILE, 1) to a (1, P_TILE) free-dim
+                # view to match the HBM slice's final axis.
+                nl.store(
+                    e_partial[i:i + 1, j:j + 1, 0:P_TILE],
+                    value=acc_row.reshape((1, 1, P_TILE)),
+                )
 
         return e_partial
 
