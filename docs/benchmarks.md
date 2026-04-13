@@ -1,17 +1,44 @@
 # Benchmarks
 
+!!! warning "v0.4.x trn1 numbers were CPU torch.matmul, not NKI (fixed in v0.4.3)"
+
+    Releases v0.4.0 / v0.4.1 / v0.4.2 published "trn1 NKI" tables in this
+    page and in [CHANGELOG](https://github.com/trnsci/trnblas/blob/main/CHANGELOG.md).
+    A PJRT-plugin path resolution bug (our SSM runners didn't put the
+    Neuron venv's `bin/` on `$PATH`) caused every NKI dispatch to fail
+    with `FileNotFoundError: 'libneuronpjrt-path'`; the
+    `_nki_*_impl.try/except` wrappers silently fell back to
+    `torch.matmul` for every one of those runs. As a result, each "trn1
+    NKI" warm number on this page through v0.4.2 reflects **trn1's
+    8-vCPU Xeon**, not the Trainium Tensor Engine.
+
+    Fix landed in v0.4.3 (commit `d1b481f`): PATH prepend in SSM
+    runners + `NkiFallbackWarning` + `test_nki_really_runs.py` that
+    forces `TRNBLAS_REQUIRE_NKI=1`. The tables below are re-measured
+    from the same commit under real NKI dispatch (NEFF compile visible
+    on cold, 10-15000× cold/warm ratios confirm the kernel actually
+    runs).
+
+    The MP2 energy kernel (`trnblas.nki.nki_mp2_energy`) turned out to
+    have a partition-limit bug that was masked by the silent fallback;
+    its tests are skipped pending rewrite (tracked in
+    [#15](https://github.com/trnsci/trnblas/issues/15)). Not in the
+    production DF-MP2 path.
+
 All numbers on `trn1.2xlarge`, `neuronxcc 2.24.5133`, warm NEFF cache
-unless noted. Source: the `examples/df_mp2.py --bench` runs captured in
-the v0.4.0 [CHANGELOG](https://github.com/trnsci/trnblas/blob/main/CHANGELOG.md#040--2026-04-12).
+unless noted.
 
 ## NKI GEMM — per-call kernel timing
 
-Warm cache, mean of 5 calls. Aligned shapes (multiples of 128).
+Warm cache, mean of 5 calls. Aligned shapes (multiples of 128). Real
+NKI dispatch verified — `test_compile_vs_cache_timing[1024³]` reports
+`cold=26.7ms warm=2.3ms speedup=11.8×`, which is a NEFF-compile
+signature not reproducible on CPU.
 
-| Shape (M×K×N)  | Per-call |
-|----------------|---------:|
-| 512 × 512 × 512   | 1.6 ms |
-| 1024 × 1024 × 1024 | 4.5 ms |
+| Shape (M×K×N)      | Warm     |
+|--------------------|---------:|
+| 512 × 512 × 512    | 1.3 ms   |
+| 1024 × 1024 × 1024 | 2.3 ms   |
 
 ## NKI TRSM — per-call timing (#19)
 
@@ -23,14 +50,17 @@ Phase 3 work (#26). Correctness: 7/7 `@pytest.mark.neuron` tests pass
 on trn1 across `{lower, upper} × {trans, not}` + unit-diag.
 
 Warm-cache per-call timings (mean of 5, using the DF-MP2 call pattern
-`uplo="lower", trans=True`):
+`uplo="lower", trans=True`; real NKI + trailing GEMM, v0.4.3-measured):
 
-| Shape (M × N) | trn1 warm | trn1 TFLOPS | A10G warm | A10G TFLOPS | A10G vs trn1 |
-|---------------|----------:|------------:|----------:|------------:|-------------:|
-| 512 × 512     | 6.05 ms   | 0.02        | 0.21 ms   | 0.65        | 29×          |
-| 1024 × 512    | 11.78 ms  | 0.05        | 0.36 ms   | 1.50        | 33×          |
-| 1024 × 1024   | 15.47 ms  | 0.07        | 0.47 ms   | 2.29        | 33×          |
-| 2048 × 512    | 27.75 ms  | 0.08        | 0.81 ms   | 2.67        | 34×          |
+| Shape (M × N) | trn1 NKI warm | trn1 TFLOPS | A10G warm | A10G TFLOPS | A10G vs trn1 |
+|---------------|--------------:|------------:|----------:|------------:|-------------:|
+| 512 × 512     | 5.59 ms       | 0.02        | 0.21 ms   | 0.65        | 27×          |
+| 1024 × 512    | 13.27 ms      | 0.04        | 0.36 ms   | 1.50        | 37×          |
+| 1024 × 1024   | 18.72 ms      | 0.06        | 0.47 ms   | 2.29        | 40×          |
+| 2048 × 512    | 35.82 ms      | 0.06        | 0.81 ms   | 2.67        | 44×          |
+
+Cold (first call, includes NEFF compile of each trailing-GEMM tile
+signature): 5.8–12.8 s.
 
 Lower TFLOPS than GEMM/SYRK is inherent to TRSM — the sequential
 panel solve limits parallelism. On trn1 the blocked structure adds
@@ -45,14 +75,17 @@ HBM load via two `load_transpose2d` calls) rather than
 `gemm(A, A.T)`. Correctness: 7/7 `@pytest.mark.neuron` tests pass on
 trn1; outputs match `torch.matmul(A, A.T)` to `atol=1e-3, rtol=1e-4`.
 
-Warm-cache per-call timings and effective TFLOPS (mean of 5 runs):
+Warm-cache per-call timings and effective TFLOPS (mean of 5 runs on
+real NKI, v0.4.3-measured):
 
-| Shape (M×K) | trn1 warm | trn1 TFLOPS | A10G warm | A10G TFLOPS | A10G vs trn1 |
-|-------------|----------:|------------:|----------:|------------:|-------------:|
-| 512×512     | 2.45 ms   | 0.11        | 0.11 ms   | 2.39        | 22×          |
-| 1024×512    | 6.15 ms   | 0.17        | 0.16 ms   | 6.90        | 38×          |
-| 1024×1024   | 7.91 ms   | 0.27        | 0.21 ms   | 10.07       | 38×          |
-| 2048×512    | 21.93 ms  | 0.20        | 0.53 ms   | 8.11        | 41×          |
+| Shape (M×K) | trn1 NKI warm | trn1 TFLOPS | A10G warm | A10G TFLOPS | A10G vs trn1 |
+|-------------|--------------:|------------:|----------:|------------:|-------------:|
+| 512×512     | 2.14 ms       | 0.13        | 0.11 ms   | 2.39        | 19×          |
+| 1024×512    | 6.21 ms       | 0.17        | 0.16 ms   | 6.90        | 39×          |
+| 1024×1024   | 5.71 ms       | 0.38        | 0.21 ms   | 10.07       | 27×          |
+| 2048×512    | 23.89 ms      | 0.18        | 0.53 ms   | 8.11        | 45×          |
+
+Cold (first call, includes NEFF compile): 1.6–11.4 s depending on shape.
 
 Same pattern as the DF-MP2 end-to-end: the NKI kernel is correct and
 well-tiled, but A10G's cuBLAS remains ~30× faster per-call on
@@ -84,39 +117,38 @@ Energy matches bit-for-bit within fp32 reduction-order noise.
 (GA102 Ampere) launched Apr 2021 — closest single-GPU match on AWS.
 A10G via `g5.xlarge` (~$1/hr), trn1 via `trn1.2xlarge` (~$1.34/hr).
 
-| Shape                | Flops   | trn1 warm | A10G warm | trn1 TFLOPS | A10G TFLOPS | A10G vs trn1 |
-|----------------------|--------:|----------:|----------:|------------:|------------:|-------------:|
-| small (128/16/384)   | 3.4 G   | 0.008s    | 0.001s    | 0.43        | 2.25        | 8×           |
-| medium (512/64/1536) | 2 757 G | 9.77s     | 0.266s    | 0.28        | 10.36       | **37×**      |
-| large (768/96/2304)  | 20 352 G | 62.84s   | 2.018s    | 0.32        | 10.09       | **31×**      |
+| Shape                | Flops   | trn1 NKI warm | A10G warm | A10G vs trn1 |
+|----------------------|--------:|--------------:|----------:|-------------:|
+| small (128/16/384)   | 3.4 G   | 0.091 s       | 0.001 s   | 91×          |
+| medium (512/64/1536) | 2 757 G | 9.910 s       | 0.266 s   | **37×**      |
+| large (768/96/2304)  | 20 352 G | (not re-run) | 2.018 s   | —            |
 
-**Energy bit-exact across platforms:**
-
-| Shape  | trn1 E_MP2 | A10G E_MP2 |
-|--------|------------|------------|
-| small  | -1.619250e-04 | -1.619250e-04 |
-| medium | -2.487221     | -2.487220 |
-| large  | -4.351183e+01 | -4.351184e+01 |
-
-(Medium/large differ by 1 ULP in the last significant figure — expected
-fp32 reduction-order variance between platforms, not a correctness
-gap.)
+**Energy bit-exact across platforms:** E_MP2 matches to fp32 noise for
+small (-1.619250e-04) and medium (-2.487220) under real NKI dispatch.
 
 ### Reading this table
 
-At medium/large, **cuBLAS on A10G is ~30× faster than the current
-trnblas torch-matmul path on trn1**. This is the target to close with
-NKI kernels. The trn1 numbers above use the v0.4.0 NKI GEMM (validated
-but not yet a perf win over torch.matmul fallback in this pipeline); the
-fused `nki_mp2_energy` kernel also matches torch rather than beating it
-at this scale. Narrowing the gap is the v0.5.0+ kernel work, tracked
-under [#15](https://github.com/trnsci/trnblas/issues/15),
-[#18](https://github.com/trnsci/trnblas/issues/18) (syrk), and
-[#19](https://github.com/trnsci/trnblas/issues/19) (trsm).
+At medium, **cuBLAS on A10G is ~37× faster than trnblas NKI GEMM on
+trn1** — the Ampere GPU is built for matmul-dominant workloads, while
+trn1's Tensor Engine has a higher per-call dispatch overhead. At small,
+the gap balloons to 91× because NKI dispatch overhead dominates the
+actual ~3 Gflops of compute.
 
-At large the energy step is 100% of A10G wall-time (2.016s of 2.018s)
-— memory-bandwidth bound on the `T` tensor + intermediates. Same shape
-on trn1 is 92%, so the bottleneck is architectural, not platform-specific.
+**Uncomfortable honest comparison:** trn1's **host Xeon** (8 vCPU)
+running `torch.matmul` (the silent-fallback path that v0.4.x
+accidentally measured) produces roughly the same warm DF-MP2 numbers as
+real NKI dispatch on this workload — the CPU is competitive at
+512–1024 scale because NKI kernel launch is ~1-3 ms per call and
+trn1.2xlarge's Xeon is fast enough to do 512³ GEMM in the same time.
+Trainium's advantage here is a cost story
+(trn1.2xlarge at $1.34/hr vs g5.xlarge at $1.006/hr, with the difference
+being the 32 GB HBM and 2 NeuronCores that matter more at larger,
+memory-bandwidth-bound workloads than these benches touch).
+
+Closing the A10G gap on medium/large is the ongoing Phase 3 work
+(tile autotuner [#26](https://github.com/trnsci/trnblas/issues/26),
+energy kernel rewrite [#15](https://github.com/trnsci/trnblas/issues/15),
+and batching techniques that amortize per-call dispatch).
 
 ## NEFF cache warmup
 

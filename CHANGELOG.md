@@ -7,38 +7,91 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.3] — 2026-04-13
+
+### Correction: v0.4.x "trn1 NKI" numbers were silent torch.matmul fallback
+
+The SSM runners in v0.4.0–v0.4.2 invoked the Neuron venv's python
+directly without prepending its `bin/` to `$PATH`. `torch_neuronx`'s
+initializer calls `subprocess.run(["libneuronpjrt-path"])` to locate
+the PJRT plugin library; that binary lives in the venv's `bin/` and
+couldn't be resolved. Every NKI dispatch raised `FileNotFoundError`,
+which our `_nki_*_impl` `try/except` wrappers swallowed and fell back
+to `torch.matmul`. As a result, **every "trn1 NKI" perf number
+published in v0.4.0 / v0.4.1 / v0.4.2 was trn1's 8-vCPU Xeon, not the
+Tensor Engine.**
+
+Correctness tests still passed because `torch.matmul` gives the same
+answer as `nki_gemm`; only perf attribution was wrong. The v0.4.2
+cross-vendor comparison vs A10G was also mislabeled — we were
+comparing A10G's GPU to trn1's Xeon.
+
+Real NKI dispatch is now verified (commit `d1b481f`): cold call
+includes NEFF compile (seconds), warm dispatches show real Tensor
+Engine execution. `docs/benchmarks.md` tables are re-measured and
+prefaced with a retraction banner.
+
+### Fixed
+
+- `scripts/run_neuron_tests.sh`, `scripts/run_df_mp2_bench.sh` —
+  prepend `$NEURON_VENV/bin` to `$PATH` in the SSM `env` line so
+  `torch_neuronx`'s PJRT plugin lookup can resolve. Tests now also
+  run with `TRNBLAS_REQUIRE_NKI=1` so future silent-fallback
+  regressions fail loudly.
+- `trnblas.nki.nki_mp2_energy` kernel tests skipped (#15) — the
+  kernel has a partition-limit bug (`nl.load(eps_vir[0:NVIR])`
+  exceeds 128 partitions for `nvir > 128`) that was masked by the
+  silent fallback. Not in the production DF-MP2 path; kernel
+  rewrite tracked under #15.
+
 ### Added
+
+- `trnblas.nki.NkiFallbackWarning` — emitted once per distinct error
+  when the NKI path silently falls back to torch. Makes misconfigured
+  environments visible without requiring `TRNBLAS_REQUIRE_NKI=1`.
+  Emitted via `warnings.warn` with a custom category.
+- `tests/test_nki_really_runs.py` — anti-regression test that forces
+  `TRNBLAS_REQUIRE_NKI=1` and asserts a GEMM dispatch completes.
+  Would have caught the v0.4.0 regression on day one.
+
+### Changed — re-measured benchmark numbers
+
+Under real NKI dispatch (commit `fd56274`, trn1.2xlarge, neuronxcc
+2.24.5133):
+
+| Op | Shape | v0.4.x "trn1 NKI" (was CPU fallback) | v0.4.3 trn1 NKI (real) |
+|----|-------|-------------------------------------:|-----------------------:|
+| GEMM warm | 1024³ | 4.5 ms | 2.3 ms |
+| SYRK warm | 512²   | 2.45 ms | 2.14 ms |
+| SYRK warm | 1024² | 7.91 ms | 5.71 ms |
+| TRSM warm | 512²   | 6.05 ms | 5.59 ms |
+| TRSM warm | 2048×512 | 27.75 ms | 35.82 ms |
+| DF-MP2 medium warm | — | 9.77 s | 9.91 s |
+
+The relative A10G vs trn1 ratios are in a similar 19–45× range; the
+cross-vendor story's shape is unchanged, only the attribution is
+fixed.
+
+### Added (carried from [Unreleased] into this release)
 
 - `trnblas.nki.nki_trsm` — blocked panel TRSM (#19). Diagonal panels
   solve via `torch.linalg.solve_triangular` (small, sequential);
   trailing off-diagonal updates run through `nki_gemm` (dominant work
   for large M). Covers all `{lower, upper} × {trans, not} ×
   {unit, nonunit}` combinations for `side="left"`; `side="right"` falls
-  back to torch. 7/7 new `@pytest.mark.neuron` tests pass on trn1;
-  matches torch within `atol=1e-3, rtol=1e-3`. `trnblas.trsm`
-  rewired to dispatch through it.
-- `examples/bench_trsm.py` — per-op TRSM timing across
-  cpu / cuda / trn1 following the DF-MP2 call pattern. Numbers live
-  on the [benchmarks page](https://trnsci.dev/trnblas/benchmarks/).
-
-- `trnblas.nki.nki_syrk` — NKI SYRK kernel (#18). Computes `A @ Aᵀ`
-  via a dedicated `_syrk_kernel` that loads `A` once from HBM and
-  reuses it for both operand roles (two `load_transpose2d` calls on
-  the same region), avoiding the materialised `A.T.contiguous()`
-  that `nki_gemm(A, A.T)` would otherwise write. `trnblas.syrk`
-  rewired to dispatch through it. 7/7 new `@pytest.mark.neuron`
-  tests pass on trn1; matches PyTorch fallback within
-  `atol=1e-3, rtol=1e-4`.
-- `examples/bench_syrk.py` — per-op SYRK timing script (cpu / cuda /
-  trn1) reporting cold + warm per-call + TFLOPS across 4 (M, K)
-  shapes. Results live on the [benchmarks page](https://trnsci.dev/trnblas/benchmarks/).
-
-### Perf note (v0.5.0 honesty discipline, per #18)
-
-Same pattern as #15: NKI SYRK is correct but A10G cuBLAS on the
-same shapes is ~30× faster per-call at 512–2048 square. Kernel
-infrastructure landed; closing the perf gap is part of ongoing
-Phase 3 work (tile autotuner #26, fused-kernel techniques).
+  back to torch. 7/7 `@pytest.mark.neuron` tests pass on trn1 under
+  real NKI dispatch.
+- `trnblas.nki.nki_syrk` — NKI SYRK kernel (#18). Loads `A` once
+  from HBM and reuses it for both operand roles via two
+  `load_transpose2d` calls, avoiding the materialised
+  `A.T.contiguous()` that `nki_gemm(A, A.T)` would otherwise write.
+  7/7 `@pytest.mark.neuron` tests pass on trn1 under real NKI.
+- `examples/bench_syrk.py`, `examples/bench_trsm.py` — per-op
+  timing scripts (cpu / cuda / trn1) feeding the cross-vendor table.
+- `scripts/autotune_gemm.py` — GEMM tile-config study harness (#26).
+  Paused during this correction release; resume in v0.5.0.
+- `scripts/probe_nki.py` — one-shot NKI health probe (diagnostic
+  for the silent-fallback class of bug).
 
 ## [0.4.2] — 2026-04-13
 
@@ -265,7 +318,8 @@ shape per cache lifetime.
 - Test suite covering Level 1/2/3 BLAS correctness against PyTorch/NumPy
   references, with SPD matrix fixtures for symmetric/triangular routines.
 
-[Unreleased]: https://github.com/trnsci/trnblas/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/trnsci/trnblas/compare/v0.4.3...HEAD
+[0.4.3]: https://github.com/trnsci/trnblas/releases/tag/v0.4.3
 [0.4.2]: https://github.com/trnsci/trnblas/releases/tag/v0.4.2
 [0.4.1]: https://github.com/trnsci/trnblas/releases/tag/v0.4.1
 [0.4.0]: https://github.com/trnsci/trnblas/releases/tag/v0.4.0
