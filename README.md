@@ -12,6 +12,18 @@ Trainium ships no BLAS library. `trnblas` provides Level 1-3 BLAS operations wit
 
 Part of the trnsci scientific computing suite ([github.com/trnsci](https://github.com/trnsci)).
 
+## Current phase
+
+trnblas follows the [trnsci 5-phase roadmap](https://trnsci.dev/roadmap/). Active work is tracked in phase-labeled GitHub issues:
+
+- **[Phase 1 — correctness](https://github.com/trnsci/trnblas/issues/21)**: **complete as of v0.4.0** (GEMM, SYRK, MP2 energy reduction kernels hardware-validated on trn1; end-to-end DF-MP2 validated against PySCF at nanohartree tolerance).
+- **[Phase 2 — precision](https://github.com/trnsci/trnblas/issues/22)** (next): double-double FP64 GEMM for chemistry workloads. Unblocks [trnsolver#27](https://github.com/trnsci/trnsolver/issues/27) and [trntensor#28](https://github.com/trnsci/trntensor/issues/28).
+- **[Phase 3 — perf](https://github.com/trnsci/trnblas/issues/23)**: tile sweeps, fused DF-MP2 kernels, true 3D batched GEMM, NEFF cache reuse.
+- **[Phase 4 — multi-chip](https://github.com/trnsci/trnblas/issues/24)**: tensor-parallel GEMM across NeuronCores.
+- **[Phase 5 — generation](https://github.com/trnsci/trnblas/issues/25)**: trn2 FP16-accumulate GEMM path.
+
+Suite-wide tracker: [trnsci/trnsci#1](https://github.com/trnsci/trnsci/issues/1).
+
 ## Why
 
 NVIDIA has cuBLAS with 152 optimized routines. Trainium has `torch.matmul`. That's fine for ML training but insufficient for scientific computing codes that need TRSM, SYRK, SYMM, and batched GEMM with specific transpose/scaling semantics.
