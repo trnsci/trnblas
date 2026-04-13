@@ -9,6 +9,7 @@ tile reuse on the Tensor Engine for 2x fewer SBUF loads vs naive.
 from __future__ import annotations
 
 import os
+import warnings
 
 import torch
 
@@ -23,6 +24,32 @@ except ImportError:
 # When set, kernel-path failures re-raise instead of falling back to PyTorch.
 # Used by the validation suite to catch silent kernel breakage during iteration.
 _REQUIRE_NKI = os.environ.get("TRNBLAS_REQUIRE_NKI", "").lower() in ("1", "true", "yes")
+
+
+class NkiFallbackWarning(UserWarning):
+    """Emitted once per distinct error when the NKI path silently falls
+    back to torch.matmul. Prevents the class of bug where PATH / plugin
+    misconfiguration causes every NKI call to hit torch without any
+    user-visible signal — the v0.4.x-era 'libneuronpjrt-path' silent
+    fallback is the motivating example.
+    """
+
+
+_fallback_warned: set[str] = set()
+
+
+def _warn_fallback(exc: BaseException) -> None:
+    """Emit NkiFallbackWarning once per unique error signature."""
+    key = f"{type(exc).__name__}: {str(exc).splitlines()[0][:200]}"
+    if key in _fallback_warned:
+        return
+    _fallback_warned.add(key)
+    warnings.warn(
+        f"NKI kernel dispatch failed — falling back to torch.matmul "
+        f"(set TRNBLAS_REQUIRE_NKI=1 to re-raise). First error: {key}",
+        NkiFallbackWarning,
+        stacklevel=3,
+    )
 
 # Tile shapes for the systolic array (NKI 2.24 limits):
 # stationary partition ≤ 128 (= K), free ≤ 128 (= M); moving free ≤ 512 (= N).
@@ -116,9 +143,10 @@ def nki_mp2_energy(
         return _torch_mp2_energy(T_flat, eps_occ_chunk, eps_occ_full, eps_vir)
     try:
         return _nki_mp2_energy_impl(T_flat, eps_occ_chunk, eps_occ_full, eps_vir)
-    except Exception:
+    except Exception as exc:
         if _REQUIRE_NKI:
             raise
+        _warn_fallback(exc)
         return _torch_mp2_energy(T_flat, eps_occ_chunk, eps_occ_full, eps_vir)
 
 
@@ -199,9 +227,10 @@ def nki_trsm(
         return _trsm_torch(alpha, A, B, side, uplo, trans, diag)
     try:
         return _nki_trsm_left(A, B, uplo, trans, diag, alpha)
-    except Exception:
+    except Exception as exc:
         if _REQUIRE_NKI:
             raise
+        _warn_fallback(exc)
         return _trsm_torch(alpha, A, B, side, uplo, trans, diag)
 
 
@@ -348,9 +377,10 @@ def _nki_gemm_impl(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
         c = _gemm_kernel(a, b)
         result = c.to(orig_device)
         return result[:M, :N] if needs_pad else result
-    except Exception:
+    except Exception as exc:
         if _REQUIRE_NKI:
             raise
+        _warn_fallback(exc)
         return torch.matmul(A, B)
 
 
@@ -383,9 +413,10 @@ def _nki_syrk_impl(A: torch.Tensor) -> torch.Tensor:
         c = _syrk_kernel(a)
         result = c.to(orig_device)
         return result[:M, :M] if needs_pad else result
-    except Exception:
+    except Exception as exc:
         if _REQUIRE_NKI:
             raise
+        _warn_fallback(exc)
         return torch.matmul(A, A.T)
 
 
