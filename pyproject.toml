@@ -36,6 +36,9 @@ dev = [
     "pytest-benchmark>=4.0",
     "scipy>=1.11",
 ]
+pyscf = [
+    "pyscf>=2.4",
+]
 
 [project.urls]
 Homepage = "https://github.com/trnsci/trnblas"
