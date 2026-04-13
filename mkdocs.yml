@@ -6,6 +6,9 @@ repo_name: trnsci/trnblas
 
 theme:
   name: material
+  font:
+    text: Atkinson Hyperlegible
+    code: Atkinson Hyperlegible Mono
   palette:
     scheme: default
     primary: indigo
@@ -23,7 +26,9 @@ nav:
       - Level 3 (Matrix-Matrix): api/level3.md
       - NKI Backend: api/nki.md
   - Architecture: architecture.md
-  - AWS Setup: aws_setup.md
+  - Benchmarks: benchmarks.md
+  - Deployment:
+      - AWS Setup for Neuron CI: aws_setup.md
 
 markdown_extensions:
   - pymdownx.highlight
