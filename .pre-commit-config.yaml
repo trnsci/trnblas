@@ -1,0 +1,23 @@
+# Pre-commit config — mirrors the CI lint job (.github/workflows/ci.yml).
+# Install once per checkout: `pre-commit install` (pulled in by the [dev] extra).
+#
+# Hooks run on changed files by default; use `pre-commit run --all-files` to
+# sweep the whole tree. Keep in lockstep with the ruff version pinned in
+# pyproject.toml `[project.optional-dependencies].dev`.
+
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.10
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict

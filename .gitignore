@@ -36,3 +36,6 @@ htmlcov/
 
 # Ruff cache
 .ruff_cache/
+
+# Local agent state (not project-owned)
+.claude/

@@ -64,12 +64,12 @@ def df_mp2_energy_kernel(T_chunk, denom, out_scalar):
         T_tile    = nl.load(T_chunk[tile])           # SBUF
         denom_tile = nl.load(denom[tile])             # SBUF
         T_T_tile  = nl.transpose_sbuf(T_tile)         # SBUF-local transpose
-        
+
         # Vector Engine, SBUF-resident through all of these:
         diff = nl.subtract(nl.multiply(T_tile, 2.0), T_T_tile)
         prod = nl.multiply(T_tile, diff)
         quot = nl.divide(prod, denom_tile)
-        
+
         # Reduce-sum into PSUM accumulator
         tile_sum = nl.sum(quot, axis=(0, 1))          # PSUM
         nl.atomic_add(out_scalar, tile_sum)           # atomic
