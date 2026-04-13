@@ -512,8 +512,14 @@ if HAS_NKI:
             P_TILE -= 1
         NSTRIP = NVIR // P_TILE
 
+        # Output layout: partition axis (P_TILE) FIRST so nl.store
+        # can write the (P_TILE, 1) SBUF tile straight into the HBM
+        # slice with partition-to-partition alignment. Reshaping a
+        # partition-dim to free isn't allowed without an explicit
+        # transpose (NKI compiler rejects it as "illegal partition
+        # step"). Host caller's .sum() is layout-agnostic.
         e_partial = nl.ndarray(
-            (IC, NOCC, P_TILE), dtype=nl.float32, buffer=nl.shared_hbm
+            (P_TILE, IC, NOCC), dtype=nl.float32, buffer=nl.shared_hbm
         )
         ev_free = nl.load(eps_vir[0:1, 0:NVIR])
 
@@ -556,12 +562,12 @@ if HAS_NKI:
                     strip_partial = nl.sum(term, axis=1, keepdims=True)
                     acc_row[...] = nl.add(acc_row, strip_partial)
 
-                # Store (P_TILE,) per-partition partials for this (i, j).
-                # Reshape the SBUF (P_TILE, 1) to a (1, P_TILE) free-dim
-                # view to match the HBM slice's final axis.
+                # Store (P_TILE,) per-partition partials for this (i, j)
+                # into the partition-major output; axes align directly
+                # (no SBUF reshape required).
                 nl.store(
-                    e_partial[i:i + 1, j:j + 1, 0:P_TILE],
-                    value=acc_row.reshape((1, 1, P_TILE)),
+                    e_partial[0:P_TILE, i:i + 1, j:j + 1],
+                    value=acc_row,
                 )
 
         return e_partial
