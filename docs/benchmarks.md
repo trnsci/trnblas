@@ -13,6 +13,31 @@ Warm cache, mean of 5 calls. Aligned shapes (multiples of 128).
 | 512 × 512 × 512   | 1.6 ms |
 | 1024 × 1024 × 1024 | 4.5 ms |
 
+## NKI TRSM — per-call timing (#19)
+
+`trnblas.trsm` on Trainium uses a blocked panel algorithm: diagonal
+panels solved via `torch.linalg.solve_triangular` (tiny P×P, intrinsically
+sequential); trailing off-diagonal updates run through `nki_gemm`
+(dominant work for large M). Block size fixed at 128; autotuning is
+Phase 3 work (#26). Correctness: 7/7 `@pytest.mark.neuron` tests pass
+on trn1 across `{lower, upper} × {trans, not}` + unit-diag.
+
+Warm-cache per-call timings (mean of 5, using the DF-MP2 call pattern
+`uplo="lower", trans=True`):
+
+| Shape (M × N) | trn1 warm | trn1 TFLOPS | A10G warm | A10G TFLOPS | A10G vs trn1 |
+|---------------|----------:|------------:|----------:|------------:|-------------:|
+| 512 × 512     | 6.05 ms   | 0.02        | 0.21 ms   | 0.65        | 29×          |
+| 1024 × 512    | 11.78 ms  | 0.05        | 0.36 ms   | 1.50        | 33×          |
+| 1024 × 1024   | 15.47 ms  | 0.07        | 0.47 ms   | 2.29        | 33×          |
+| 2048 × 512    | 27.75 ms  | 0.08        | 0.81 ms   | 2.67        | 34×          |
+
+Lower TFLOPS than GEMM/SYRK is inherent to TRSM — the sequential
+panel solve limits parallelism. On trn1 the blocked structure adds
+Python-loop + per-block `nki_gemm` dispatch overhead on top; closing
+that gap is a Phase 3 follow-up (autotuner #26 and eventually a pure
+NKI substitution kernel).
+
 ## NKI SYRK — per-call timing (#18)
 
 `trnblas.syrk` on Trainium dispatches to a dedicated kernel (single-A

@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `trnblas.nki.nki_trsm` — blocked panel TRSM (#19). Diagonal panels
+  solve via `torch.linalg.solve_triangular` (small, sequential);
+  trailing off-diagonal updates run through `nki_gemm` (dominant work
+  for large M). Covers all `{lower, upper} × {trans, not} ×
+  {unit, nonunit}` combinations for `side="left"`; `side="right"` falls
+  back to torch. 7/7 new `@pytest.mark.neuron` tests pass on trn1;
+  matches torch within `atol=1e-3, rtol=1e-3`. `trnblas.trsm`
+  rewired to dispatch through it.
+- `examples/bench_trsm.py` — per-op TRSM timing across
+  cpu / cuda / trn1 following the DF-MP2 call pattern. Numbers live
+  on the [benchmarks page](https://trnsci.dev/trnblas/benchmarks/).
+
 - `trnblas.nki.nki_syrk` — NKI SYRK kernel (#18). Computes `A @ Aᵀ`
   via a dedicated `_syrk_kernel` that loads `A` once from HBM and
   reuses it for both operand roles (two `load_transpose2d` calls on

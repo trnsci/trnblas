@@ -30,9 +30,16 @@ Return value is the dense symmetric matrix (both triangles populated);
 a small post-kernel `0.5·(C + Cᵀ)` symmetrisation protects against fp32
 reduction-order asymmetry.
 
-## `trsm(alpha, A, B, side="left", uplo="upper", trans=False, unit=False)`
+## `trsm(alpha, A, B, side="left", uplo="upper", trans=False, diag="nonunit")`
 
 Triangular solve: solves `op(A)·X = α·B` (or `X·op(A) = α·B` when `side="right"`).
+
+On Trainium + `side="left"`, dispatches to a blocked panel algorithm
+(`trnblas.nki.nki_trsm`): tiny diagonal panels solve via
+`torch.linalg.solve_triangular`; trailing off-diagonal updates run
+through `nki_gemm`. Covers all combinations of `uplo ∈ {"upper", "lower"}`,
+`trans ∈ {True, False}`, `diag ∈ {"unit", "nonunit"}`. `side="right"`
+falls back to direct `torch.linalg.solve_triangular`.
 
 ## `trmm(alpha, A, B, side="left", uplo="upper", trans=False, unit=False)`
 
