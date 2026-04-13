@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `nki_mp2_energy` M1 landed: kernel now correctly produces
+  `(P_TILE, IC, NOCC)` per-partition partials on real NKI under
+  `TRNBLAS_REQUIRE_NKI=1`. All 5 previously-skipped
+  `TestNkiKernel` tests pass on trn1 across
+  `nvir ∈ {8, 16, 64, 256, 448}`. Host `.sum()` reduces to the
+  final scalar energy (partial is ≤ 258 KB, noise cost).
+- `docs/design/fused_df_mp2_energy_kernel.md` — architectural RFC
+  for the M2 fused pair-energy kernel (Phase 3 follow-up that uses
+  M1's reduction pattern as a building block).
+
+### Architectural features exploited in M1 (per the design discipline)
+
+- **SBUF persistence** across the strip loop (per-partition buffer
+  lives on-chip between all NSTRIP iterations).
+- **Scalar Engine free-dim reduction** via `nl.sum(axis=1)` — the
+  only reduction axis NKI permits.
+- **Partition-major HBM output** so the `(P_TILE, 1)` SBUF tile
+  stores with axis-to-axis alignment (no partition-dim reshape,
+  which the BIR verifier rejects).
+- **Amortised dispatch**: IC × NOCC (i, j) pairs per kernel launch.
+
+### NKI constraints navigated (documented for future kernels)
+
+| Error | Pattern rejected | Pattern that works |
+|---|---|---|
+| `partitions … exceed 128` | `nl.load(1D_tensor)` of length >128 | Reshape to `(1, N)` at caller |
+| `Reduction on partition axes is not supported` | `nl.sum(tile, axis=(0,1))` | Free-dim reduce only; accumulate per-partition |
+| `illegal partition step` (BIR) | Reshape SBUF partition↔free | Plan tensor layout so partition aligns throughout; never reshape |
+| `Unexpected output dependencies, missing indices in dst` | `acc[...] = nl.add(acc, x)` inside `affine_range` | Per-iteration SBUF slots, reduce after the loop |
+
+Each constraint was surfaced by real hardware under
+`TRNBLAS_REQUIRE_NKI=1` — the silent-fallback era would have masked
+all of them.
+
 ## [0.4.3] — 2026-04-13
 
 ### Correction: v0.4.x "trn1 NKI" numbers were silent torch.matmul fallback
