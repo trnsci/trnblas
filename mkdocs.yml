@@ -26,6 +26,8 @@ nav:
       - Level 3 (Matrix-Matrix): api/level3.md
       - NKI Backend: api/nki.md
   - Architecture: architecture.md
+  - Design:
+      - Fused DF-MP2 pair-energy kernel (Phase 3 RFC): design/fused_df_mp2_energy_kernel.md
   - Benchmarks: benchmarks.md
   - Deployment:
       - AWS Setup for Neuron CI: aws_setup.md
