@@ -8,6 +8,7 @@ from .dispatch import (
     nki_batched_gemm,
     nki_mp2_energy,
     nki_syrk,
+    nki_trsm,
 )
 
 __all__ = [
@@ -18,4 +19,5 @@ __all__ = [
     "nki_batched_gemm",
     "nki_mp2_energy",
     "nki_syrk",
+    "nki_trsm",
 ]

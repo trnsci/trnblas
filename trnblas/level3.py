@@ -161,24 +161,15 @@ def trsm(
     Critical for Cholesky-based density fitting:
     Given J = L @ L^T, solve L @ X = (μν|P) for X,
     then B_ia^P = C^T @ X gives the DF coefficients.
+
+    On Trainium + side='left', dispatches to a blocked NKI path: tiny
+    diagonal panels solve on torch.linalg.solve_triangular; the trailing
+    off-diagonal updates run through nki_gemm. side='right' and the
+    non-NKI path both use torch.linalg.solve_triangular directly.
     """
-    if uplo == "upper":
-        tri = torch.triu(A)
-    else:
-        tri = torch.tril(A)
+    from .nki import nki_trsm
 
-    if diag == "unit":
-        tri = tri - torch.diag(torch.diag(tri)) + torch.eye(A.shape[0], dtype=A.dtype, device=A.device)
-
-    mat = tri.T if trans else tri
-
-    if side == "left":
-        # Solve mat @ X = alpha * B
-        return alpha * torch.linalg.solve_triangular(mat, B, upper=(uplo == "upper" and not trans) or (uplo == "lower" and trans))
-    else:
-        # Solve X @ mat = alpha * B  →  mat^T @ X^T = alpha * B^T
-        upper_flag = (uplo == "lower" and not trans) or (uplo == "upper" and trans)
-        return alpha * torch.linalg.solve_triangular(mat.T, B.T, upper=upper_flag).T
+    return nki_trsm(A, B, side=side, uplo=uplo, trans=trans, diag=diag, alpha=alpha)
 
 
 def trmm(

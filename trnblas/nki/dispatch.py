@@ -174,6 +174,134 @@ def nki_syrk(A: torch.Tensor) -> torch.Tensor:
     return torch.matmul(A, A.T)
 
 
+def nki_trsm(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    side: str = "left",
+    uplo: str = "upper",
+    trans: bool = False,
+    diag: str = "nonunit",
+    alpha: float = 1.0,
+) -> torch.Tensor:
+    """Blocked triangular solve: op(A) X = alpha * B (side='left') or
+    X op(A) = alpha * B (side='right').
+
+    On NKI + side='left': blocked panel algorithm — the diagonal panel
+    solve stays on torch.linalg.solve_triangular (tiny P×P, intrinsically
+    sequential), while the trailing off-diagonal update is one nki_gemm
+    call per block. GEMM dominates the work for large M, so this
+    captures most of the speedup without writing a substitution kernel.
+
+    Falls back to torch for side='right' (uncommon in chemistry hot
+    paths) or when _use_nki() is False.
+    """
+    if side != "left" or not _use_nki():
+        return _trsm_torch(alpha, A, B, side, uplo, trans, diag)
+    try:
+        return _nki_trsm_left(A, B, uplo, trans, diag, alpha)
+    except Exception:
+        if _REQUIRE_NKI:
+            raise
+        return _trsm_torch(alpha, A, B, side, uplo, trans, diag)
+
+
+def _trsm_torch(
+    alpha: float,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    side: str,
+    uplo: str,
+    trans: bool,
+    diag: str,
+) -> torch.Tensor:
+    """Pure-torch TRSM reference. Mirrors the body of the original
+    `trnblas.trsm` so the NKI dispatch wrapper has a pinned fallback
+    that is independent of the public wrapper's evolution.
+    """
+    if uplo == "upper":
+        tri = torch.triu(A)
+    else:
+        tri = torch.tril(A)
+
+    if diag == "unit":
+        tri = (
+            tri
+            - torch.diag(torch.diag(tri))
+            + torch.eye(A.shape[0], dtype=A.dtype, device=A.device)
+        )
+
+    mat = tri.T if trans else tri
+
+    if side == "left":
+        upper_flag = (uplo == "upper" and not trans) or (uplo == "lower" and trans)
+        return alpha * torch.linalg.solve_triangular(mat, B, upper=upper_flag)
+    upper_flag = (uplo == "lower" and not trans) or (uplo == "upper" and trans)
+    return alpha * torch.linalg.solve_triangular(mat.T, B.T, upper=upper_flag).T
+
+
+def _nki_trsm_left(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    uplo: str,
+    trans: bool,
+    diag: str,
+    alpha: float,
+    block: int = 128,
+) -> torch.Tensor:
+    """Blocked left-side TRSM. Diagonal panels solved via
+    torch.linalg.solve_triangular (small, strictly sequential);
+    trailing updates via nki_gemm (dominant work for large M).
+    """
+    if trans:
+        mat = A.T.contiguous()
+        eff_upper = uplo == "lower"
+    else:
+        mat = A
+        eff_upper = uplo == "upper"
+
+    M = B.shape[0]
+    unit = diag == "unit"
+
+    # Small M: skip blocking — direct solve is cheap enough that
+    # blocking only adds Python-loop overhead.
+    if M <= block:
+        X = torch.linalg.solve_triangular(
+            mat, B, upper=eff_upper, unitriangular=unit
+        )
+        return alpha * X
+
+    X = B.clone()
+    if not eff_upper:
+        # Lower triangular: forward substitution.
+        for k in range(0, M, block):
+            ke = min(k + block, M)
+            X[k:ke] = torch.linalg.solve_triangular(
+                mat[k:ke, k:ke],
+                X[k:ke],
+                upper=False,
+                unitriangular=unit,
+            )
+            if ke < M:
+                X[ke:] = X[ke:] - nki_gemm(
+                    mat[ke:, k:ke].contiguous(), X[k:ke]
+                )
+    else:
+        # Upper triangular: back substitution.
+        for k in range(M, 0, -block):
+            ks = max(k - block, 0)
+            X[ks:k] = torch.linalg.solve_triangular(
+                mat[ks:k, ks:k],
+                X[ks:k],
+                upper=True,
+                unitriangular=unit,
+            )
+            if ks > 0:
+                X[:ks] = X[:ks] - nki_gemm(
+                    mat[:ks, ks:k].contiguous(), X[ks:k]
+                )
+    return alpha * X
+
+
 def _round_up(n: int, multiple: int) -> int:
     return ((n + multiple - 1) // multiple) * multiple
 
