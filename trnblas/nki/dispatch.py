@@ -158,16 +158,20 @@ def _nki_mp2_energy_impl(
 ) -> torch.Tensor:
     if not HAS_NKI:
         raise RuntimeError("NKI not available")
-    # Reshape the 1D eps_ tensors to (1, N) before crossing into NKI so
-    # `nl.load` interprets them as partition=1, free=N (sidesteps the
-    # 128-partition limit; a 1D load is treated as partition=len).
-    (t, eo_c, eo_f, ev), orig_device = _to_xla(
+    # Pass eps_* in the orientation each access needs. NKI's partition
+    # dim is physical; we can't reshape a partition=1 SBUF tile to
+    # partition=N in the kernel ('illegal partition step' BIR error).
+    #   eps_vir_col: (NVIR, 1) — strip loads pick (P_TILE, 1) slices
+    #   eps_vir_row: (1, NVIR) — full free-dim vector for broadcast
+    #   eps_occ_*:   (1, N)    — (1,1) scalars picked from the row
+    (t, eo_c, eo_f, ev_col, ev_row), orig_device = _to_xla(
         T_flat.contiguous(),
         eps_occ_chunk.reshape(1, -1).contiguous(),
         eps_occ_full.reshape(1, -1).contiguous(),
+        eps_vir.reshape(-1, 1).contiguous(),
         eps_vir.reshape(1, -1).contiguous(),
     )
-    partial = _mp2_energy_kernel(t, eo_c, eo_f, ev)
+    partial = _mp2_energy_kernel(t, eo_c, eo_f, ev_col, ev_row)
     return partial.to(orig_device).sum()
 
 
@@ -477,7 +481,9 @@ if HAS_NKI:
         return c
 
     @nki.jit
-    def _mp2_energy_kernel(T_flat, eps_occ_chunk, eps_occ_full, eps_vir):
+    def _mp2_energy_kernel(
+        T_flat, eps_occ_chunk, eps_occ_full, eps_vir_col, eps_vir_row
+    ):
         """Fused MP2 energy reduction (#15).
 
         Computes Σ_{i<ic, j<nocc, a,b<nvir} T[i,j,a,b] *
@@ -503,7 +509,7 @@ if HAS_NKI:
         final partition-axis reduction host-side (partial is small;
         ≤ 258 KB at large bench shape).
         """
-        NVIR = eps_vir.shape[1]
+        NVIR = eps_vir_row.shape[1]
         IC = eps_occ_chunk.shape[1]
         NOCC = eps_occ_full.shape[1]
 
@@ -513,15 +519,14 @@ if HAS_NKI:
         NSTRIP = NVIR // P_TILE
 
         # Output layout: partition axis (P_TILE) FIRST so nl.store
-        # can write the (P_TILE, 1) SBUF tile straight into the HBM
-        # slice with partition-to-partition alignment. Reshaping a
-        # partition-dim to free isn't allowed without an explicit
-        # transpose (NKI compiler rejects it as "illegal partition
-        # step"). Host caller's .sum() is layout-agnostic.
+        # writes the (P_TILE, 1) SBUF tile with partition-to-partition
+        # alignment. Host caller's .sum() is layout-agnostic.
         e_partial = nl.ndarray(
             (P_TILE, IC, NOCC), dtype=nl.float32, buffer=nl.shared_hbm
         )
-        ev_free = nl.load(eps_vir[0:1, 0:NVIR])
+        # Full eps_vir as a free-dim vector (partition=1, free=NVIR)
+        # for the per-b axis of denom.
+        ev_row = nl.load(eps_vir_row[0:1, 0:NVIR])
 
         for i in nl.affine_range(IC):
             eo_i = nl.load(eps_occ_chunk[0:1, i:i + 1])
@@ -549,11 +554,19 @@ if HAS_NKI:
                         T_flat[i * NVIR : (i + 1) * NVIR,
                                j * NVIR + a_off : j * NVIR + a_off + P_TILE]
                     )
-                    ev_part = nl.load(eps_vir[0:1, a_off : a_off + P_TILE])
-                    denom_col = nl.subtract(eo_sum, ev_part)
+                    # (P_TILE, 1) partition-axis load of eps_vir's
+                    # a-strip — matches the output axis of the (P_TILE,
+                    # NVIR) tile we're operating on. No partition
+                    # reshape needed anywhere.
+                    ev_col = nl.load(
+                        eps_vir_col[a_off : a_off + P_TILE, 0:1]
+                    )
+                    # denom[a, b] = eo_sum - ev_col[a] - ev_row[b]
+                    # Broadcast: (1,1) - (P_TILE,1) = (P_TILE,1);
+                    #            then - (1,NVIR) = (P_TILE,NVIR).
                     denom = nl.subtract(
-                        denom_col.reshape((P_TILE, 1)),
-                        ev_free,
+                        nl.subtract(eo_sum, ev_col),
+                        ev_row,
                     )
                     term = nl.divide(
                         nl.multiply(
