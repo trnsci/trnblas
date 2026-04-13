@@ -1,33 +1,72 @@
 # Benchmarks
 
-Performance results for trnblas kernels — comparing the PyTorch CPU fallback and NKI Trainium path (when available) across canonical Level 3 BLAS workloads.
+All numbers on `trn1.2xlarge`, `neuronxcc 2.24.5133`, warm NEFF cache
+unless noted. Source: the `examples/df_mp2.py --bench` runs captured in
+the v0.4.0 [CHANGELOG](https://github.com/trnsci/trnblas/blob/main/CHANGELOG.md#040--2026-04-12).
 
-## Status
+## NKI GEMM — per-call kernel timing
 
-Baseline PyTorch-fallback numbers run on every CI build. NKI numbers are pending on-hardware validation on trn1 / trn2 — run `scripts/run_neuron_tests.sh` to generate them locally once a Neuron CI instance is provisioned (see [AWS Setup](aws_setup.md)).
+Warm cache, mean of 5 calls. Aligned shapes (multiples of 128).
 
-Until the on-hardware data is stable enough to publish here, refer to the [examples/df_mp2.py](https://github.com/trnsci/trnblas/blob/main/examples/df_mp2.py) `--bench` output for an end-to-end DF-MP2 wall-time pass, and `scripts/run_df_mp2_bench.sh` for the SSM-driven runner.
+| Shape (M×K×N)  | Per-call |
+|----------------|---------:|
+| 512 × 512 × 512   | 1.6 ms |
+| 1024 × 1024 × 1024 | 4.5 ms |
+
+## NKI batched GEMM
+
+Warm cache, batch=32 of 256×128×256. Per-slice cost after the first is
+HBM transfer + Tensor Engine dispatch only (NEFF cache hit).
+
+| Metric    | Value   |
+|-----------|--------:|
+| Total     | 39.3 ms |
+| Per-slice | 1.23 ms |
+
+## DF-MP2 end-to-end
+
+Synthetic inputs. Energy reproducible bit-for-bit across runs.
+
+| Shape              | Flops    | Cold   | Warm   | TFLOPS | E_MP2          |
+|--------------------|---------:|-------:|-------:|-------:|---------------:|
+| small (128/16/384) | 3.4 G    | 0.025s | 0.008s |  0.43  | -1.619250e-04  |
+| medium (512/64/1536) | 2757 G | 12.9s  | 9.77s  |  0.28  | -2.487221      |
+| large (768/96/2304) | 20352 G | 65.9s  | 62.8s  |  0.32  | -4.351183e+01  |
+
+At large the energy step is 92% of wall-time — memory-bandwidth bound on
+the T tensor + intermediates. The fused `nki_mp2_energy` kernel is
+correct but does not yet beat this torch path; see
+[#15](https://github.com/trnsci/trnblas/issues/15) for the perf
+follow-up.
+
+## NEFF cache warmup
+
+Same suite run twice on a freshly started instance:
+
+| Pass                                    | Wall time         |
+|-----------------------------------------|------------------:|
+| Cold (first run after instance start)   | 7.01s             |
+| Warm (NEFF cache hit + warm XLA graph)  | 2.52s (2.8× faster) |
+
+The cache at `/var/tmp/neuron-compile-cache/` persists across instance
+stop/start (EBS-backed), so kernel compile cost is paid exactly once
+per shape per cache lifetime.
 
 ## Reproducing locally
 
 ```bash
+# Micro-benchmark harness (CPU baselines + NKI when available):
 pytest benchmarks/ --benchmark-only
+
+# Full DF-MP2 bench on trn1 (provisions + runs + stops instance):
+AWS_PROFILE=aws ./scripts/run_df_mp2_bench.sh --shape medium
 ```
 
-Or the full DF-MP2 bench:
+See [AWS Setup](aws_setup.md) for the one-time Terraform provisioning.
 
-```bash
-./scripts/run_df_mp2_bench.sh
-```
+## Out of scope
 
-## Results table (placeholder)
-
-| Op | Size | PyTorch (CPU) | NKI (Trainium) | Speedup |
-|---|---|---|---|---|
-| gemm | 1024×1024 | TBD | TBD | TBD |
-| gemm | 4096×4096 | TBD | TBD | TBD |
-| batched_gemm | 64×256×256 | TBD | TBD | TBD |
-| trsm | 1024×1024 | TBD | TBD | TBD |
-| syrk | 1024×1024 | TBD | TBD | TBD |
-
-Numbers will be populated once the NKI GEMM kernel validates on trn1 / trn2 and the benchmark harness is wired into CI.
+- **`syrk` / `trsm` NKI numbers:** those ops are PyTorch-only in v0.4.x;
+  v0.5.0 will add NKI kernels and a dedicated row here.
+- **cuBLAS head-to-head:** requires GPU access; tracked under
+  [#4](https://github.com/trnsci/trnblas/issues/4).

@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-04-13
+
+### Fixed
+
+- `trnblas.__version__` was stuck at `"0.3.0"` while `pyproject.toml`
+  advanced through `0.3.1` / `0.4.0`. Now tracks the current release
+  (`"0.4.1"`).
+
+### Changed
+
+- Documentation site stabilised to match v0.4.0 state:
+  - `docs/installation.md` — new `[pyscf]` extra section,
+    `TRNBLAS_REQUIRE_NKI` env var table, updated `neuronxcc >= 2.24`
+    and `torch-neuronx >= 2.9` pins.
+  - `docs/api/nki.md` — expanded GEMM section with HBM padding
+    behaviour + measured per-call timings; new sections for
+    `nki_batched_gemm` and `nki_mp2_energy` with perf caveats.
+  - `docs/architecture.md` — "Known gaps" refreshed with current
+    Level 3 coverage status and issue cross-references.
+  - `docs/benchmarks.md` — placeholder replaced with measured
+    trn1.2xlarge numbers (GEMM per-call, batched GEMM per-slice,
+    DF-MP2 small/medium/large, NEFF cache warmup).
+  - `docs/index.md` — pointer to the PySCF real-molecule demo.
+
 ## [0.4.0] — 2026-04-12
 
 ### Added
@@ -176,7 +200,8 @@ shape per cache lifetime.
 - Test suite covering Level 1/2/3 BLAS correctness against PyTorch/NumPy
   references, with SPD matrix fixtures for symmetric/triangular routines.
 
-[Unreleased]: https://github.com/trnsci/trnblas/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/trnsci/trnblas/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/trnsci/trnblas/releases/tag/v0.4.1
 [0.4.0]: https://github.com/trnsci/trnblas/releases/tag/v0.4.0
 [0.3.0]: https://github.com/trnsci/trnblas/releases/tag/v0.3.0
 [0.2.0]: https://github.com/trnsci/trnblas/releases/tag/v0.2.0

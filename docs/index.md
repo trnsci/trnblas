@@ -24,6 +24,14 @@ DF-MP2 quantum chemistry on large molecules (>3000 basis functions), where
 sustained GEMM throughput for tensor contractions dominates wall-time. See the
 [Architecture](architecture.md) page for the algorithm-to-BLAS mapping.
 
+As of v0.4.0, trnblas's DF-MP2 is validated against PySCF to nanohartree
+precision on H2O, CH4, and NH3 at cc-pVDZ. Run the end-to-end example with:
+
+```bash
+pip install trnblas[pyscf]
+python examples/df_mp2_pyscf.py --mol ch4 --basis cc-pvdz
+```
+
 ## Related projects
 
 - [trnfft](https://github.com/trnsci/trnfft) — FFT + complex ops for Trainium.
