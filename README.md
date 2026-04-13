@@ -1,6 +1,7 @@
 # trnblas
 
 [![CI](https://github.com/trnsci/trnblas/actions/workflows/ci.yml/badge.svg)](https://github.com/trnsci/trnblas/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/trnsci/trnblas/graph/badge.svg)](https://codecov.io/gh/trnsci/trnblas)
 [![PyPI](https://img.shields.io/pypi/v/trnblas)](https://pypi.org/project/trnblas/)
 [![Python](https://img.shields.io/pypi/pyversions/trnblas)](https://pypi.org/project/trnblas/)
 [![License](https://img.shields.io/github/license/trnsci/trnblas)](LICENSE)
