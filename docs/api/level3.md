@@ -23,6 +23,13 @@ Symmetric matrix-matrix multiply.
 
 Symmetric rank-k update: `C = α·A·Aᵀ + β·C` (or `AᵀA` when `trans=True`).
 
+Dispatches to a dedicated NKI kernel (`trnblas.nki.nki_syrk`) on
+Trainium: loads `A` once into SBUF for both operand roles, avoiding the
+`A.T.contiguous()` HBM write that `gemm(A, A.T)` would otherwise issue.
+Return value is the dense symmetric matrix (both triangles populated);
+a small post-kernel `0.5·(C + Cᵀ)` symmetrisation protects against fp32
+reduction-order asymmetry.
+
 ## `trsm(alpha, A, B, side="left", uplo="upper", trans=False, unit=False)`
 
 Triangular solve: solves `op(A)·X = α·B` (or `X·op(A) = α·B` when `side="right"`).

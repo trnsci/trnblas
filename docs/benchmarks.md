@@ -13,6 +13,33 @@ Warm cache, mean of 5 calls. Aligned shapes (multiples of 128).
 | 512 × 512 × 512   | 1.6 ms |
 | 1024 × 1024 × 1024 | 4.5 ms |
 
+## NKI SYRK — per-call timing (#18)
+
+`trnblas.syrk` on Trainium dispatches to a dedicated kernel (single-A
+HBM load via two `load_transpose2d` calls) rather than
+`gemm(A, A.T)`. Correctness: 7/7 `@pytest.mark.neuron` tests pass on
+trn1; outputs match `torch.matmul(A, A.T)` to `atol=1e-3, rtol=1e-4`.
+
+Warm-cache per-call timings and effective TFLOPS (mean of 5 runs):
+
+| Shape (M×K) | trn1 warm | trn1 TFLOPS | A10G warm | A10G TFLOPS | A10G vs trn1 |
+|-------------|----------:|------------:|----------:|------------:|-------------:|
+| 512×512     | 2.45 ms   | 0.11        | 0.11 ms   | 2.39        | 22×          |
+| 1024×512    | 6.15 ms   | 0.17        | 0.16 ms   | 6.90        | 38×          |
+| 1024×1024   | 7.91 ms   | 0.27        | 0.21 ms   | 10.07       | 38×          |
+| 2048×512    | 21.93 ms  | 0.20        | 0.53 ms   | 8.11        | 41×          |
+
+Same pattern as the DF-MP2 end-to-end: the NKI kernel is correct and
+well-tiled, but A10G's cuBLAS remains ~30× faster per-call on
+Ampere-era single-GPU hardware at these sizes. Reproducible:
+
+```bash
+AWS_PROFILE=aws ./scripts/run_neuron_tests.sh     # trn1 correctness
+# Then ad-hoc:
+python examples/bench_syrk.py                     # cpu
+python examples/bench_syrk.py --device cuda       # on a g5.xlarge
+```
+
 ## NKI batched GEMM
 
 Warm cache, batch=32 of 256×128×256. Per-slice cost after the first is

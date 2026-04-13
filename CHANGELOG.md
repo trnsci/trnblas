@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `trnblas.nki.nki_syrk` — NKI SYRK kernel (#18). Computes `A @ Aᵀ`
+  via a dedicated `_syrk_kernel` that loads `A` once from HBM and
+  reuses it for both operand roles (two `load_transpose2d` calls on
+  the same region), avoiding the materialised `A.T.contiguous()`
+  that `nki_gemm(A, A.T)` would otherwise write. `trnblas.syrk`
+  rewired to dispatch through it. 7/7 new `@pytest.mark.neuron`
+  tests pass on trn1; matches PyTorch fallback within
+  `atol=1e-3, rtol=1e-4`.
+- `examples/bench_syrk.py` — per-op SYRK timing script (cpu / cuda /
+  trn1) reporting cold + warm per-call + TFLOPS across 4 (M, K)
+  shapes. Results live on the [benchmarks page](https://trnsci.dev/trnblas/benchmarks/).
+
+### Perf note (v0.5.0 honesty discipline, per #18)
+
+Same pattern as #15: NKI SYRK is correct but A10G cuBLAS on the
+same shapes is ~30× faster per-call at 512–2048 square. Kernel
+infrastructure landed; closing the perf gap is part of ongoing
+Phase 3 work (tile autotuner #26, fused-kernel techniques).
+
 ## [0.4.2] — 2026-04-13
 
 ### Added
