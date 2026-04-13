@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] — 2026-04-13
+
+### Added
+
+- cuBLAS head-to-head infrastructure (#4). New
+  `infra/terraform-cuda/` module provisions a single-A10G
+  `g5.xlarge` CI instance (GA102 Ampere, Apr 2021 — vintage-matched
+  to Trainium1 Oct 2022). New `scripts/run_cuda_bench.sh` SSM runner
+  mirrors `run_df_mp2_bench.sh` with trap-stop cleanup.
+- `examples/df_mp2.py --device {cpu,cuda}` flag. Inputs are built on
+  CPU with a fixed seed and then moved to the requested device, so
+  GPU energies match CPU bit-for-bit (within fp32 reduction-order
+  noise). Added `torch.cuda.synchronize()` before stopping the
+  wall-clock so async kernels complete.
+
+### Changed
+
+- `df_mp2_energy` now respects the input tensor device. The
+  `torch.eye` in the metric inversion step and the scalar energy
+  accumulator previously hardcoded CPU, which broke `--device cuda`.
+- `docs/benchmarks.md` — DF-MP2 table replaced with a side-by-side
+  trn1 vs A10G comparison (new headline: A10G is **30–37× faster**
+  than the current trn1 torch-matmul path at medium/large, with
+  bit-exact energies — the gap to close via NKI kernels in v0.5.0+).
+- `docs/aws_setup.md` — new "GPU companion instance" subsection +
+  g5.xlarge cost row.
+
+### Fixed
+
+- `.gitignore` terraform-state rule extended to cover all
+  `infra/terraform*/` dirs (was scoped to the Trainium module only).
+
 ## [0.4.1] — 2026-04-13
 
 ### Fixed
@@ -200,7 +232,8 @@ shape per cache lifetime.
 - Test suite covering Level 1/2/3 BLAS correctness against PyTorch/NumPy
   references, with SPD matrix fixtures for symmetric/triangular routines.
 
-[Unreleased]: https://github.com/trnsci/trnblas/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/trnsci/trnblas/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/trnsci/trnblas/releases/tag/v0.4.2
 [0.4.1]: https://github.com/trnsci/trnblas/releases/tag/v0.4.1
 [0.4.0]: https://github.com/trnsci/trnblas/releases/tag/v0.4.0
 [0.3.0]: https://github.com/trnsci/trnblas/releases/tag/v0.3.0

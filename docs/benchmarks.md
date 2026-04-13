@@ -23,21 +23,48 @@ HBM transfer + Tensor Engine dispatch only (NEFF cache hit).
 | Total     | 39.3 ms |
 | Per-slice | 1.23 ms |
 
-## DF-MP2 end-to-end
+## DF-MP2 end-to-end — Trainium1 vs NVIDIA A10G
 
-Synthetic inputs. Energy reproducible bit-for-bit across runs.
+Synthetic inputs, same seed, same three shapes on both platforms.
+Energy matches bit-for-bit within fp32 reduction-order noise.
 
-| Shape              | Flops    | Cold   | Warm   | TFLOPS | E_MP2          |
-|--------------------|---------:|-------:|-------:|-------:|---------------:|
-| small (128/16/384) | 3.4 G    | 0.025s | 0.008s |  0.43  | -1.619250e-04  |
-| medium (512/64/1536) | 2757 G | 12.9s  | 9.77s  |  0.28  | -2.487221      |
-| large (768/96/2304) | 20352 G | 65.9s  | 62.8s  |  0.32  | -4.351183e+01  |
+**Vintage parity:** Trainium1 launched Oct 2022; NVIDIA A10G
+(GA102 Ampere) launched Apr 2021 — closest single-GPU match on AWS.
+A10G via `g5.xlarge` (~$1/hr), trn1 via `trn1.2xlarge` (~$1.34/hr).
 
-At large the energy step is 92% of wall-time — memory-bandwidth bound on
-the T tensor + intermediates. The fused `nki_mp2_energy` kernel is
-correct but does not yet beat this torch path; see
-[#15](https://github.com/trnsci/trnblas/issues/15) for the perf
-follow-up.
+| Shape                | Flops   | trn1 warm | A10G warm | trn1 TFLOPS | A10G TFLOPS | A10G vs trn1 |
+|----------------------|--------:|----------:|----------:|------------:|------------:|-------------:|
+| small (128/16/384)   | 3.4 G   | 0.008s    | 0.001s    | 0.43        | 2.25        | 8×           |
+| medium (512/64/1536) | 2 757 G | 9.77s     | 0.266s    | 0.28        | 10.36       | **37×**      |
+| large (768/96/2304)  | 20 352 G | 62.84s   | 2.018s    | 0.32        | 10.09       | **31×**      |
+
+**Energy bit-exact across platforms:**
+
+| Shape  | trn1 E_MP2 | A10G E_MP2 |
+|--------|------------|------------|
+| small  | -1.619250e-04 | -1.619250e-04 |
+| medium | -2.487221     | -2.487220 |
+| large  | -4.351183e+01 | -4.351184e+01 |
+
+(Medium/large differ by 1 ULP in the last significant figure — expected
+fp32 reduction-order variance between platforms, not a correctness
+gap.)
+
+### Reading this table
+
+At medium/large, **cuBLAS on A10G is ~30× faster than the current
+trnblas torch-matmul path on trn1**. This is the target to close with
+NKI kernels. The trn1 numbers above use the v0.4.0 NKI GEMM (validated
+but not yet a perf win over torch.matmul fallback in this pipeline); the
+fused `nki_mp2_energy` kernel also matches torch rather than beating it
+at this scale. Narrowing the gap is the v0.5.0+ kernel work, tracked
+under [#15](https://github.com/trnsci/trnblas/issues/15),
+[#18](https://github.com/trnsci/trnblas/issues/18) (syrk), and
+[#19](https://github.com/trnsci/trnblas/issues/19) (trsm).
+
+At large the energy step is 100% of A10G wall-time (2.016s of 2.018s)
+— memory-bandwidth bound on the `T` tensor + intermediates. Same shape
+on trn1 is 92%, so the bottleneck is architectural, not platform-specific.
 
 ## NEFF cache warmup
 
@@ -60,9 +87,14 @@ pytest benchmarks/ --benchmark-only
 
 # Full DF-MP2 bench on trn1 (provisions + runs + stops instance):
 AWS_PROFILE=aws ./scripts/run_df_mp2_bench.sh --shape medium
+
+# Same workload on A10G (cuBLAS reference for the same vintage):
+AWS_PROFILE=aws ./scripts/run_cuda_bench.sh --shape medium
 ```
 
-See [AWS Setup](aws_setup.md) for the one-time Terraform provisioning.
+See [AWS Setup](aws_setup.md) for the one-time Terraform provisioning
+for each instance (`infra/terraform/` for trn1, `infra/terraform-cuda/`
+for the A10G).
 
 ## Out of scope
 

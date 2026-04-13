@@ -63,6 +63,29 @@ AWS_PROFILE=aws ./scripts/run_df_mp2_bench.sh --shape medium  # one shape
 Each shape runs cold then warm in the same Python process, so NEFF cache
 effects are visible in the reported numbers.
 
+## GPU (A10G) companion instance
+
+For cuBLAS head-to-head benchmarks on the same DF-MP2 workload, a
+vintage-matched single-A10G instance lives in `infra/terraform-cuda/`:
+
+```bash
+cd infra/terraform-cuda
+AWS_PROFILE=aws terraform init
+AWS_PROFILE=aws terraform apply \
+  -var="vpc_id=vpc-xxxxxx" -var="subnet_id=subnet-xxxxxx"
+```
+
+A10G (GA102 Ampere, Apr 2021) is the closest single-GPU AWS match for
+Trainium1 (Oct 2022). Runs via:
+
+```bash
+AWS_PROFILE=aws ./scripts/run_cuda_bench.sh --shape medium
+```
+
+Uses the AWS Deep Learning AMI (PyTorch + CUDA 13). Runner passes
+`--device cuda` to the bench, so inputs go straight to GPU HBM and
+the kernel path is cuBLAS via `torch.matmul`.
+
 ## Cost
 
 Stopped = EBS only (~$10/mo for 100 GB gp3). Running:
@@ -72,6 +95,7 @@ Stopped = EBS only (~$10/mo for 100 GB gp3). Running:
 | trn1.2xlarge | $1.34 | $0.22 |
 | trn2.8xlarge | $10.00 | $1.67 |
 | inf2.xlarge | $0.76 | $0.13 |
+| g5.xlarge (A10G) | $1.006 | $0.17 |
 
 ## Troubleshooting
 
