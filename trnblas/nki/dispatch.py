@@ -529,10 +529,14 @@ if HAS_NKI:
                 eo_j = nl.load(eps_occ_full[0:1, j:j + 1])
                 eo_sum = nl.add(eo_i, eo_j)
 
-                # Per-partition SBUF row accumulator: one value per
-                # partition, summed across NSTRIP strips.
-                acc_row = nl.zeros(
-                    (P_TILE, 1), dtype=nl.float32, buffer=nl.sbuf
+                # Per-strip SBUF slots. Each affine_range iteration
+                # writes its own column; a single nl.sum over the
+                # NSTRIP free axis at the end reduces strips.
+                # (In-place += across affine_range hits NKI's
+                # "Unexpected output dependencies" — the compiler
+                # wants the strip index in the dst access explicitly.)
+                acc_rows = nl.zeros(
+                    (P_TILE, NSTRIP), dtype=nl.float32, buffer=nl.sbuf
                 )
 
                 for s in nl.affine_range(NSTRIP):
@@ -560,11 +564,15 @@ if HAS_NKI:
                     )
                     # Free-dim reduce: (P_TILE, NVIR) → (P_TILE, 1).
                     strip_partial = nl.sum(term, axis=1, keepdims=True)
-                    acc_row[...] = nl.add(acc_row, strip_partial)
+                    # Write the strip's partial into its own slot (s
+                    # indexes the free axis of acc_rows).
+                    acc_rows[0:P_TILE, s:s + 1] = strip_partial
+
+                # Reduce across strips (free dim) → (P_TILE, 1).
+                acc_row = nl.sum(acc_rows, axis=1, keepdims=True)
 
                 # Store (P_TILE,) per-partition partials for this (i, j)
-                # into the partition-major output; axes align directly
-                # (no SBUF reshape required).
+                # into the partition-major output; axes align directly.
                 nl.store(
                     e_partial[0:P_TILE, i:i + 1, j:j + 1],
                     value=acc_row,
