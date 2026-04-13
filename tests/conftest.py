@@ -7,6 +7,7 @@ import numpy as np
 
 def pytest_configure(config):
     config.addinivalue_line("markers", "neuron: requires Neuron hardware")
+    config.addinivalue_line("markers", "pyscf: requires PySCF (optional dep)")
 
 
 @pytest.fixture

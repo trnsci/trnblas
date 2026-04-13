@@ -17,6 +17,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Real-molecule DF-MP2 validation against PySCF (#11). New
+  `examples/_pyscf_bridge.py` runs RHF + builds DF integrals;
+  `examples/df_mp2_pyscf.py` is a runnable demo comparing trnblas
+  vs PySCF's own `mp.dfmp2.DFMP2` reference. New
+  `tests/test_df_mp2_pyscf.py` (marker: `pyscf`, skipped if PySCF
+  isn't installed) parameterises H2O/STO-3G, H2O/cc-pvdz,
+  CH4/cc-pvdz, NH3/cc-pvdz. Measured agreement on all four:
+  |E_trnblas - E_pyscf| < 10⁻⁷ Hartree (nanohartree precision).
+  New optional extra `pip install trnblas[pyscf]`.
+
 - `trnblas.nki.nki_mp2_energy` — fused MP2 energy-reduction NKI
   kernel (#15). Streams T_flat tiles on-chip via partition-dim
   sub-tiling (P_TILE picked as the largest divisor of nvir ≤ 128;

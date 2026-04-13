@@ -67,6 +67,16 @@ python examples/df_mp2.py --nbasis 100 --nocc 20
 
 The example demonstrates all core BLAS operations in a realistic quantum chemistry workflow: Cholesky factorization, triangular solve, half-transform GEMMs, metric contraction, and energy evaluation.
 
+### Real-molecule validation (via PySCF)
+
+```bash
+pip install trnblas[pyscf]
+python examples/df_mp2_pyscf.py                       # H2O / STO-3G
+python examples/df_mp2_pyscf.py --mol ch4 --basis cc-pvdz
+```
+
+Runs SCF + density fitting via PySCF, feeds the integrals through trnblas, and compares to PySCF's own DF-MP2 reference energy. Matches to < 10⁻⁷ Hartree on H2O, CH4, NH3 at cc-pvdz.
+
 ## Operations
 
 | Level | Operation | Description |
