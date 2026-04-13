@@ -149,7 +149,12 @@ def _flops(nbasis: int, nocc: int, naux: int) -> int:
     return f_2a + f_2b + f_3 + f_4
 
 
-def _make_inputs(nbasis: int, nocc: int, naux: int, seed: int = 42):
+def _make_inputs(nbasis: int, nocc: int, naux: int, seed: int = 42, device: str = "cpu"):
+    # Seed the CPU RNG so cold/warm + CPU/GPU runs are reproducible
+    # bit-for-bit. Build on CPU then move — this keeps the random draw
+    # identical across devices (torch.randn(..., device="cuda") uses a
+    # separate RNG stream, which would make GPU energies drift from CPU
+    # for the same seed).
     torch.manual_seed(seed)
     C_occ = torch.randn(nbasis, nocc) * 0.1
     C_vir = torch.randn(nbasis, nbasis - nocc) * 0.1
@@ -158,6 +163,13 @@ def _make_inputs(nbasis: int, nocc: int, naux: int, seed: int = 42):
     J_metric = J_raw @ J_raw.T + naux * torch.eye(naux)
     eps_occ = -torch.sort(torch.rand(nocc))[0] - 0.5
     eps_vir = torch.sort(torch.rand(nbasis - nocc))[0] + 0.1
+    if device != "cpu":
+        C_occ = C_occ.to(device)
+        C_vir = C_vir.to(device)
+        eri_3c = eri_3c.to(device)
+        J_metric = J_metric.to(device)
+        eps_occ = eps_occ.to(device)
+        eps_vir = eps_vir.to(device)
     return C_occ, C_vir, eri_3c, J_metric, eps_occ, eps_vir
 
 
@@ -168,19 +180,25 @@ _BENCH_SHAPES = {
 }
 
 
-def bench(shape_name: str):
+def bench(shape_name: str, device: str = "cpu"):
     nbasis, nocc, naux = _BENCH_SHAPES[shape_name]
     nvir = nbasis - nocc
     flops = _flops(nbasis, nocc, naux)
-    inputs = _make_inputs(nbasis, nocc, naux)
+    inputs = _make_inputs(nbasis, nocc, naux, device=device)
 
     print(f"[shape={shape_name} nbasis={nbasis} nocc={nocc} nvir={nvir} naux={naux}]")
-    print(f"  approx flops: {flops/1e9:.1f} G  backend: {trnblas.get_backend()}")
+    print(
+        f"  approx flops: {flops/1e9:.1f} G  "
+        f"backend: {trnblas.get_backend()}  device: {device}"
+    )
 
     for label in ("cold", "warm"):
         t = {}
         t0 = time.perf_counter()
         e = df_mp2_energy(*inputs, timings=t)
+        # Ensure async GPU work completes before stopping the timer.
+        if device != "cpu" and torch.cuda.is_available():
+            torch.cuda.synchronize()
         total = time.perf_counter() - t0
         tflops = flops / total / 1e12
         print(
@@ -200,12 +218,16 @@ def main():
     parser.add_argument("--nbasis", type=int, default=24)
     parser.add_argument("--nocc", type=int, default=5)
     parser.add_argument("--naux", type=int, default=None)
+    parser.add_argument("--device", default="cpu",
+                        help="Torch device for inputs (cpu, cuda, cuda:0, ...). "
+                             "CPU by default; set cuda to benchmark against cuBLAS "
+                             "on an NVIDIA GPU instance.")
     args = parser.parse_args()
 
     if args.bench:
         shapes = [args.shape] if args.shape else list(_BENCH_SHAPES)
         for s in shapes:
-            bench(s)
+            bench(s, device=args.device)
         return
 
     if args.demo:
