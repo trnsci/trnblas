@@ -27,3 +27,12 @@ infra/terraform*/*.tfvars
 
 # Build artifacts
 site/
+
+# Coverage artifacts
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Ruff cache
+.ruff_cache/
