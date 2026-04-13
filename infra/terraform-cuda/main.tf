@@ -125,14 +125,8 @@ resource "aws_instance" "ci" {
     set -euxo pipefail
     cd /home/ubuntu
     sudo -u ubuntu git clone https://github.com/trnsci/trnblas.git trnblas
-    # Install into the DLAMI's pre-built PyTorch venv. Path varies across
-    # AMI vintages — glob the likely candidates.
-    PY_VENV=$(ls -d /opt/pytorch*venv* /opt/aws_pytorch_venv_* 2>/dev/null | head -1 || true)
-    if [[ -z "$PY_VENV" ]]; then
-      # Fall back to the conda env shipped with the DLAMI.
-      PY_VENV=/opt/conda
-    fi
-    sudo -u ubuntu "$PY_VENV/bin/pip" install -e '/home/ubuntu/trnblas[dev]'
+    # The AWS CUDA DLAMI (Ubuntu 24.04) ships its PyTorch venv at /opt/pytorch.
+    sudo -u ubuntu /opt/pytorch/bin/pip install -e '/home/ubuntu/trnblas[dev]'
   EOF
 
   tags = {

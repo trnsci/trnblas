@@ -89,7 +89,7 @@ CMD_ID=$(aws ssm send-command \
   --document-name "AWS-RunShellScript" \
   --comment "trnblas cuda bench @ $SHA" \
   --parameters "commands=[
-    \"bash -c 'set -euo pipefail; cd /home/ubuntu/trnblas && sudo -u ubuntu git fetch --all && sudo -u ubuntu git checkout $SHA && PY_VENV=\$(ls -d /opt/pytorch*venv* /opt/aws_pytorch_venv_* 2>/dev/null | head -1 || echo /opt/conda) && sudo -u ubuntu \$PY_VENV/bin/pip install -e /home/ubuntu/trnblas[dev] --quiet && sudo -u ubuntu \$PY_VENV/bin/python /home/ubuntu/trnblas/examples/df_mp2.py --bench --device cuda $BENCH_ARGS'\"
+    \"bash -c 'set -euo pipefail; cd /home/ubuntu/trnblas && sudo -u ubuntu git fetch --all && sudo -u ubuntu git checkout $SHA && sudo -u ubuntu /opt/pytorch/bin/pip install -e /home/ubuntu/trnblas[dev] --quiet && sudo -u ubuntu /opt/pytorch/bin/python /home/ubuntu/trnblas/examples/df_mp2.py --bench --device cuda $BENCH_ARGS'\"
   ]" \
   --region "$REGION" \
   --output text --query 'Command.CommandId')
