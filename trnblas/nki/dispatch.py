@@ -160,6 +160,20 @@ def nki_gemm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     return torch.matmul(A, B)
 
 
+def nki_syrk(A: torch.Tensor) -> torch.Tensor:
+    """SYRK via single-operand NKI matmul. Returns A @ A.T.
+
+    On NKI: dispatches `_syrk_kernel`, which loads A directly for both
+    operand roles (avoids the A.T.contiguous() HBM write that would
+    happen if we just called `nki_gemm(A, A.T)`).
+
+    On PyTorch: falls back to `torch.matmul(A, A.T)`.
+    """
+    if _use_nki():
+        return _nki_syrk_impl(A)
+    return torch.matmul(A, A.T)
+
+
 def _round_up(n: int, multiple: int) -> int:
     return ((n + multiple - 1) // multiple) * multiple
 
@@ -210,6 +224,41 @@ def _nki_gemm_impl(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
         if _REQUIRE_NKI:
             raise
         return torch.matmul(A, B)
+
+
+def _nki_syrk_impl(A: torch.Tensor) -> torch.Tensor:
+    """NKI SYRK implementation. Returns A @ A.T for A of shape (M, K).
+
+    Pads M to TILE_M and K to TILE_K multiples. For M > TILE_N, pads to
+    a multiple of TILE_N in the N (= M) direction so the kernel can tile
+    output cleanly. Falls back to torch.matmul on kernel errors unless
+    TRNBLAS_REQUIRE_NKI=1.
+    """
+    if not HAS_NKI:
+        raise RuntimeError("NKI not available")
+    M, K = A.shape
+    M_pad = _round_up(M, _TILE_M)
+    K_pad = _round_up(K, _TILE_K)
+    # Output is (M_pad, M_pad); same TILE_N logic as GEMM applies.
+    N_pad = M_pad if M_pad <= _TILE_N else _round_up(M_pad, _TILE_N)
+    # M_pad must also equal N_pad (output is square); enforce.
+    M_pad = max(M_pad, N_pad)
+    needs_pad = (M_pad != M) or (K_pad != K)
+
+    try:
+        if needs_pad:
+            A_p = torch.zeros(M_pad, K_pad, dtype=A.dtype, device=A.device)
+            A_p[:M, :K] = A
+            (a,), orig_device = _to_xla(A_p.contiguous())
+        else:
+            (a,), orig_device = _to_xla(A.contiguous())
+        c = _syrk_kernel(a)
+        result = c.to(orig_device)
+        return result[:M, :M] if needs_pad else result
+    except Exception:
+        if _REQUIRE_NKI:
+            raise
+        return torch.matmul(A, A.T)
 
 
 if HAS_NKI:
@@ -330,3 +379,59 @@ if HAS_NKI:
                 nl.store(e_partial[i:i + 1, j:j + 1], value=acc)
 
         return e_partial
+
+    @nki.jit
+    def _syrk_kernel(a):
+        """Symmetric rank-k: C = a @ a.T with single-A HBM load.
+
+        Structurally identical to _gemm_kernel, but the "moving"
+        operand is loaded from the same `a` HBM region via a
+        second `load_transpose2d` — avoiding the materialised
+        `a.T.contiguous()` that `nki_gemm(A, A.T)` would otherwise
+        issue. K partition dim is at the load_transpose2d limit of 128.
+
+        Caller guarantees M, K are multiples of 128 and M is either
+        ≤ 512 or a multiple of 512 (handled by _nki_syrk_impl's HBM
+        padding).
+        """
+        M, K = a.shape
+
+        TILE_M = _TILE_M
+        TILE_K = _TILE_K
+        TILE_N = M if M <= _TILE_N else _TILE_N
+
+        c = nl.ndarray((M, M), dtype=a.dtype, buffer=nl.shared_hbm)
+
+        for m in nl.affine_range(M // TILE_M):
+            for n in nl.affine_range(M // TILE_N):
+                m_off = m * TILE_M
+                n_off = n * TILE_N
+
+                psum = nl.zeros(
+                    (TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum
+                )
+
+                for k in nl.affine_range(K // TILE_K):
+                    k_off = k * TILE_K
+
+                    # Stationary: a[m_off:m_off+TILE_M, k_off:k_off+TILE_K]
+                    # transposed → (TILE_K, TILE_M), partition=K ≤ 128.
+                    a_stat = nl.load_transpose2d(
+                        a[m_off:m_off + TILE_M, k_off:k_off + TILE_K]
+                    )
+                    # Moving: a.T[k_off:k_off+TILE_K, n_off:n_off+TILE_N]
+                    # = a[n_off:n_off+TILE_N, k_off:k_off+TILE_K].T
+                    # load_transpose2d swaps axes → (TILE_K, TILE_N),
+                    # partition=K ≤ 128.
+                    a_mov = nl.load_transpose2d(
+                        a[n_off:n_off + TILE_N, k_off:k_off + TILE_K]
+                    )
+                    psum[...] += nisa.nc_matmul(a_stat, a_mov)
+
+                c_sbuf = nl.copy(psum, dtype=a.dtype)
+                nl.store(
+                    c[m_off:m_off + TILE_M, n_off:n_off + TILE_N],
+                    value=c_sbuf,
+                )
+
+        return c

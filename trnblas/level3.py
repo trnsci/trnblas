@@ -126,16 +126,20 @@ def syrk(
 
     Used in metric contraction for density fitting:
     J_{PQ} = Σ_μν (P|μν)(μν|Q) which is A^T @ A form.
+
+    On Trainium, dispatches to NKI SYRK — a single-operand matmul kernel
+    that avoids the materialised `A.T.contiguous()` copy of the naive
+    `gemm(A, A.T)` call pattern.
     """
-    if trans:
-        result = alpha * torch.matmul(A.T, A)
-    else:
-        result = alpha * torch.matmul(A, A.T)
+    from .nki import nki_syrk
+
+    A_eff = A.T.contiguous() if trans else A
+    result = alpha * nki_syrk(A_eff)
 
     if C is not None and beta != 0.0:
         result = result + beta * C
 
-    # Symmetrize (numerical stability)
+    # Symmetrize (fp32 reduction-order rounding can leave tiny asymmetry).
     result = 0.5 * (result + result.T)
     return result
 
