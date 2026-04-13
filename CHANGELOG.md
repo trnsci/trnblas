@@ -5,15 +5,9 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.3.1] — 2026-04-12
-
-### Changed
-
-- Bumped `neuronxcc` floor from `>=2.15` to `>=2.24` to unify with the
-  rest of the trnsci suite (matches trnfft / trnrand). `torch-neuronx`
-  floor bumped to `>=2.9` to match.
-
 ## [Unreleased]
+
+## [0.4.0] — 2026-04-12
 
 ### Added
 
@@ -110,6 +104,15 @@ future v0.4 follow-up to #14.
   is HBM transfer + Tensor Engine dispatch only. The natural batched
   dispatch shape for DF-MP2 contractions over auxiliary basis indices.
 
+- Bumped `neuronxcc` floor from `>=2.15` to `>=2.24` to unify with the
+  rest of the trnsci suite (matches trnfft / trnrand). `torch-neuronx`
+  floor bumped to `>=2.9` to match.
+
+- Repository transferred from `scttfrdmn/trnblas` to the `trnsci`
+  GitHub organisation (`trnsci/trnblas`). Documentation now served at
+  <https://trnsci.dev/trnblas/>. Canonical `CONTRIBUTING.md` and
+  `CODE_OF_CONDUCT.md` adopted to match the trnsci suite.
+
 ### Performance (validated on trn1.2xlarge, neuronxcc 2.24.5133)
 
 17/17 `pytest -m neuron` tests pass. Cached-NEFF speedup measured by
@@ -173,7 +176,8 @@ shape per cache lifetime.
 - Test suite covering Level 1/2/3 BLAS correctness against PyTorch/NumPy
   references, with SPD matrix fixtures for symmetric/triangular routines.
 
-[Unreleased]: https://github.com/trnsci/trnblas/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/trnsci/trnblas/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/trnsci/trnblas/releases/tag/v0.4.0
 [0.3.0]: https://github.com/trnsci/trnblas/releases/tag/v0.3.0
 [0.2.0]: https://github.com/trnsci/trnblas/releases/tag/v0.2.0
 [0.1.0]: https://github.com/trnsci/trnblas/commits/main
