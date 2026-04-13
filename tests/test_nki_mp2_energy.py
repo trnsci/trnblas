@@ -73,17 +73,9 @@ class TestTorchFallback:
 
 
 class TestNkiKernel:
-    """On-hardware validation of the fused NKI kernel.
+    """On-hardware validation of the fused NKI kernel."""
 
-    Temporarily skipped as of v0.4.3 — the kernel has a partition-dim
-    bug (`nl.load(eps_vir[0:NVIR])` exceeds the 128-partition limit
-    for nvir > 128, and likely has other load-shape issues at smaller
-    nvir too). Not in the production DF-MP2 path; tracked for fix in
-    #15 Phase 2 work.
-    """
-
-    pytestmark = [pytest.mark.neuron,
-                  pytest.mark.skip(reason="kernel needs rewrite — #15")]
+    pytestmark = pytest.mark.neuron
 
     def test_small(self, nki_backend):
         T_flat, eo_c, eo_f, ev = _make_inputs(nocc=4, nvir=8, naux=16)

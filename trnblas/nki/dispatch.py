@@ -158,14 +158,16 @@ def _nki_mp2_energy_impl(
 ) -> torch.Tensor:
     if not HAS_NKI:
         raise RuntimeError("NKI not available")
+    # Reshape the 1D eps_ tensors to (1, N) before crossing into NKI so
+    # `nl.load` interprets them as partition=1, free=N (sidesteps the
+    # 128-partition limit; a 1D load is treated as partition=len).
     (t, eo_c, eo_f, ev), orig_device = _to_xla(
         T_flat.contiguous(),
-        eps_occ_chunk.contiguous(),
-        eps_occ_full.contiguous(),
-        eps_vir.contiguous(),
+        eps_occ_chunk.reshape(1, -1).contiguous(),
+        eps_occ_full.reshape(1, -1).contiguous(),
+        eps_vir.reshape(1, -1).contiguous(),
     )
     partial = _mp2_energy_kernel(t, eo_c, eo_f, ev)
-    # Kernel returns (ic, nocc, nstrip); reduce host-side.
     return partial.to(orig_device).sum()
 
 
@@ -488,11 +490,15 @@ if HAS_NKI:
         (i, j), so there is exactly one HBM store per (i, j) —
         cuts store traffic by NSTRIP× vs the per-strip-store variant.
 
+        eps_* args are shape (1, N) so `nl.load` interprets them as
+        partition=1, free=N (a 1D load is treated as partition=len,
+        which would exceed the 128-partition limit for NVIR > 128).
+
         Returns (IC, NOCC) fp32; host reduces to scalar.
         """
-        NVIR = eps_vir.shape[0]
-        IC = eps_occ_chunk.shape[0]
-        NOCC = eps_occ_full.shape[0]
+        NVIR = eps_vir.shape[1]
+        IC = eps_occ_chunk.shape[1]
+        NOCC = eps_occ_full.shape[1]
 
         P_TILE = min(NVIR, 128)
         while NVIR % P_TILE != 0:
@@ -500,12 +506,13 @@ if HAS_NKI:
         NSTRIP = NVIR // P_TILE
 
         e_partial = nl.ndarray((IC, NOCC), dtype=nl.float32, buffer=nl.shared_hbm)
-        ev_free = nl.load(eps_vir[0:NVIR])
+        # (1, NVIR) load: partition=1, free=NVIR — partition-safe for any NVIR.
+        ev_free = nl.load(eps_vir[0:1, 0:NVIR])
 
         for i in nl.affine_range(IC):
-            eo_i = nl.load(eps_occ_chunk[i:i + 1])
+            eo_i = nl.load(eps_occ_chunk[0:1, i:i + 1])
             for j in nl.affine_range(NOCC):
-                eo_j = nl.load(eps_occ_full[j:j + 1])
+                eo_j = nl.load(eps_occ_full[0:1, j:j + 1])
                 eo_sum = nl.add(eo_i, eo_j)
 
                 acc = nl.zeros((1, 1), dtype=nl.float32, buffer=nl.sbuf)
@@ -520,11 +527,13 @@ if HAS_NKI:
                         T_flat[i * NVIR : (i + 1) * NVIR,
                                j * NVIR + a_off : j * NVIR + a_off + P_TILE]
                     )
-                    ev_part = nl.load(eps_vir[a_off : a_off + P_TILE])
+                    # (P_TILE,) slice of eps_vir via a (1, P_TILE) load,
+                    # then reshape to (P_TILE, 1) for broadcast.
+                    ev_part = nl.load(eps_vir[0:1, a_off : a_off + P_TILE])
                     denom_col = nl.subtract(eo_sum, ev_part)
                     denom = nl.subtract(
                         denom_col.reshape((P_TILE, 1)),
-                        ev_free.reshape((1, NVIR)),
+                        ev_free,
                     )
                     term = nl.divide(
                         nl.multiply(
