@@ -7,7 +7,6 @@ gemv, symv, trmv, ger
 from __future__ import annotations
 
 import torch
-from typing import Optional
 
 
 def gemv(
@@ -15,7 +14,7 @@ def gemv(
     A: torch.Tensor,
     x: torch.Tensor,
     beta: float = 0.0,
-    y: Optional[torch.Tensor] = None,
+    y: torch.Tensor | None = None,
     trans: bool = False,
 ) -> torch.Tensor:
     """General matrix-vector multiply: y = alpha * op(A) * x + beta * y
@@ -34,7 +33,7 @@ def symv(
     A: torch.Tensor,
     x: torch.Tensor,
     beta: float = 0.0,
-    y: Optional[torch.Tensor] = None,
+    y: torch.Tensor | None = None,
     uplo: str = "upper",
 ) -> torch.Tensor:
     """Symmetric matrix-vector multiply: y = alpha * A * x + beta * y
@@ -68,7 +67,11 @@ def trmv(
     else:
         tri = torch.tril(A)
     if diag == "unit":
-        tri = tri - torch.diag(torch.diag(tri)) + torch.eye(A.shape[0], dtype=A.dtype, device=A.device)
+        tri = (
+            tri
+            - torch.diag(torch.diag(tri))
+            + torch.eye(A.shape[0], dtype=A.dtype, device=A.device)
+        )
     mat = tri.T if trans else tri
     return torch.mv(mat, x)
 
@@ -77,7 +80,7 @@ def ger(
     alpha: float,
     x: torch.Tensor,
     y: torch.Tensor,
-    A: Optional[torch.Tensor] = None,
+    A: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Rank-1 update: A = alpha * x * y^T + A"""
     result = alpha * torch.outer(x, y)

@@ -1,8 +1,9 @@
 """Test BLAS Level 1 operations."""
 
+import numpy as np
 import pytest
 import torch
-import numpy as np
+
 import trnblas
 
 

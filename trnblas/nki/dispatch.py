@@ -15,8 +15,9 @@ import torch
 
 try:
     import neuronxcc.nki as nki
-    import neuronxcc.nki.language as nl
     import neuronxcc.nki.isa as nisa
+    import neuronxcc.nki.language as nl
+
     HAS_NKI = True
 except ImportError:
     HAS_NKI = False
@@ -50,6 +51,7 @@ def _warn_fallback(exc: BaseException) -> None:
         NkiFallbackWarning,
         stacklevel=3,
     )
+
 
 # Tile shapes for the systolic array (NKI 2.24 limits):
 # stationary partition ≤ 128 (= K), free ≤ 128 (= M); moving free ≤ 512 (= N).
@@ -299,10 +301,8 @@ def _nki_trsm_left(
 
     # Small M: skip blocking — direct solve is cheap enough that
     # blocking only adds Python-loop overhead.
-    if M <= block:
-        X = torch.linalg.solve_triangular(
-            mat, B, upper=eff_upper, unitriangular=unit
-        )
+    if block >= M:
+        X = torch.linalg.solve_triangular(mat, B, upper=eff_upper, unitriangular=unit)
         return alpha * X
 
     X = B.clone()
@@ -317,9 +317,7 @@ def _nki_trsm_left(
                 unitriangular=unit,
             )
             if ke < M:
-                X[ke:] = X[ke:] - nki_gemm(
-                    mat[ke:, k:ke].contiguous(), X[k:ke]
-                )
+                X[ke:] = X[ke:] - nki_gemm(mat[ke:, k:ke].contiguous(), X[k:ke])
     else:
         # Upper triangular: back substitution.
         for k in range(M, 0, -block):
@@ -331,9 +329,7 @@ def _nki_trsm_left(
                 unitriangular=unit,
             )
             if ks > 0:
-                X[:ks] = X[:ks] - nki_gemm(
-                    mat[:ks, ks:k].contiguous(), X[ks:k]
-                )
+                X[:ks] = X[:ks] - nki_gemm(mat[:ks, ks:k].contiguous(), X[ks:k])
     return alpha * X
 
 
@@ -344,6 +340,7 @@ def _round_up(n: int, multiple: int) -> int:
 def _to_xla(*tensors):
     """Move tensors to the XLA device for NKI kernel dispatch."""
     import torch_xla.core.xla_model as xm
+
     device = xm.xla_device()
     orig = tensors[0].device
     return [t.to(device) for t in tensors], orig
@@ -462,28 +459,22 @@ if HAS_NKI:
                     k_off = k * TILE_K
 
                     # Load A row-tile transposed so partition dim = K.
-                    a_t = nl.load_transpose2d(
-                        a[m_off:m_off + TILE_M, k_off:k_off + TILE_K]
-                    )
+                    a_t = nl.load_transpose2d(a[m_off : m_off + TILE_M, k_off : k_off + TILE_K])
                     # B is already K-major.
-                    b_tile = nl.load(
-                        b[k_off:k_off + TILE_K, n_off:n_off + TILE_N]
-                    )
+                    b_tile = nl.load(b[k_off : k_off + TILE_K, n_off : n_off + TILE_N])
 
                     psum[...] += nisa.nc_matmul(a_t, b_tile)
 
                 c_sbuf = nl.copy(psum, dtype=a.dtype)
                 nl.store(
-                    c[m_off:m_off + TILE_M, n_off:n_off + TILE_N],
+                    c[m_off : m_off + TILE_M, n_off : n_off + TILE_N],
                     value=c_sbuf,
                 )
 
         return c
 
     @nki.jit
-    def _mp2_energy_kernel(
-        T_flat, eps_occ_chunk, eps_occ_full, eps_vir_col, eps_vir_row
-    ):
+    def _mp2_energy_kernel(T_flat, eps_occ_chunk, eps_occ_full, eps_vir_col, eps_vir_row):
         """Fused MP2 energy reduction (#15).
 
         Computes Σ_{i<ic, j<nocc, a,b<nvir} T[i,j,a,b] *
@@ -521,17 +512,15 @@ if HAS_NKI:
         # Output layout: partition axis (P_TILE) FIRST so nl.store
         # writes the (P_TILE, 1) SBUF tile with partition-to-partition
         # alignment. Host caller's .sum() is layout-agnostic.
-        e_partial = nl.ndarray(
-            (P_TILE, IC, NOCC), dtype=nl.float32, buffer=nl.shared_hbm
-        )
+        e_partial = nl.ndarray((P_TILE, IC, NOCC), dtype=nl.float32, buffer=nl.shared_hbm)
         # Full eps_vir as a free-dim vector (partition=1, free=NVIR)
         # for the per-b axis of denom.
         ev_row = nl.load(eps_vir_row[0:1, 0:NVIR])
 
         for i in nl.affine_range(IC):
-            eo_i = nl.load(eps_occ_chunk[0:1, i:i + 1])
+            eo_i = nl.load(eps_occ_chunk[0:1, i : i + 1])
             for j in nl.affine_range(NOCC):
-                eo_j = nl.load(eps_occ_full[0:1, j:j + 1])
+                eo_j = nl.load(eps_occ_full[0:1, j : j + 1])
                 eo_sum = nl.add(eo_i, eo_j)
 
                 # Per-strip SBUF slots. Each affine_range iteration
@@ -540,27 +529,25 @@ if HAS_NKI:
                 # (In-place += across affine_range hits NKI's
                 # "Unexpected output dependencies" — the compiler
                 # wants the strip index in the dst access explicitly.)
-                acc_rows = nl.zeros(
-                    (P_TILE, NSTRIP), dtype=nl.float32, buffer=nl.sbuf
-                )
+                acc_rows = nl.zeros((P_TILE, NSTRIP), dtype=nl.float32, buffer=nl.sbuf)
 
                 for s in nl.affine_range(NSTRIP):
                     a_off = s * P_TILE
                     t = nl.load(
-                        T_flat[i * NVIR + a_off : i * NVIR + a_off + P_TILE,
-                               j * NVIR : (j + 1) * NVIR]
+                        T_flat[
+                            i * NVIR + a_off : i * NVIR + a_off + P_TILE, j * NVIR : (j + 1) * NVIR
+                        ]
                     )
                     t_T = nl.load_transpose2d(
-                        T_flat[i * NVIR : (i + 1) * NVIR,
-                               j * NVIR + a_off : j * NVIR + a_off + P_TILE]
+                        T_flat[
+                            i * NVIR : (i + 1) * NVIR, j * NVIR + a_off : j * NVIR + a_off + P_TILE
+                        ]
                     )
                     # (P_TILE, 1) partition-axis load of eps_vir's
                     # a-strip — matches the output axis of the (P_TILE,
                     # NVIR) tile we're operating on. No partition
                     # reshape needed anywhere.
-                    ev_col = nl.load(
-                        eps_vir_col[a_off : a_off + P_TILE, 0:1]
-                    )
+                    ev_col = nl.load(eps_vir_col[a_off : a_off + P_TILE, 0:1])
                     # denom[a, b] = eo_sum - ev_col[a] - ev_row[b]
                     # Broadcast: (1,1) - (P_TILE,1) = (P_TILE,1);
                     #            then - (1,NVIR) = (P_TILE,NVIR).
@@ -579,7 +566,7 @@ if HAS_NKI:
                     strip_partial = nl.sum(term, axis=1, keepdims=True)
                     # Write the strip's partial into its own slot (s
                     # indexes the free axis of acc_rows).
-                    acc_rows[0:P_TILE, s:s + 1] = strip_partial
+                    acc_rows[0:P_TILE, s : s + 1] = strip_partial
 
                 # Reduce across strips (free dim) → (P_TILE, 1).
                 acc_row = nl.sum(acc_rows, axis=1, keepdims=True)
@@ -587,7 +574,7 @@ if HAS_NKI:
                 # Store (P_TILE,) per-partition partials for this (i, j)
                 # into the partition-major output; axes align directly.
                 nl.store(
-                    e_partial[0:P_TILE, i:i + 1, j:j + 1],
+                    e_partial[0:P_TILE, i : i + 1, j : j + 1],
                     value=acc_row,
                 )
 
@@ -620,30 +607,24 @@ if HAS_NKI:
                 m_off = m * TILE_M
                 n_off = n * TILE_N
 
-                psum = nl.zeros(
-                    (TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum
-                )
+                psum = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
 
                 for k in nl.affine_range(K // TILE_K):
                     k_off = k * TILE_K
 
                     # Stationary: a[m_off:m_off+TILE_M, k_off:k_off+TILE_K]
                     # transposed → (TILE_K, TILE_M), partition=K ≤ 128.
-                    a_stat = nl.load_transpose2d(
-                        a[m_off:m_off + TILE_M, k_off:k_off + TILE_K]
-                    )
+                    a_stat = nl.load_transpose2d(a[m_off : m_off + TILE_M, k_off : k_off + TILE_K])
                     # Moving: a.T[k_off:k_off+TILE_K, n_off:n_off+TILE_N]
                     # = a[n_off:n_off+TILE_N, k_off:k_off+TILE_K].T
                     # load_transpose2d swaps axes → (TILE_K, TILE_N),
                     # partition=K ≤ 128.
-                    a_mov = nl.load_transpose2d(
-                        a[n_off:n_off + TILE_N, k_off:k_off + TILE_K]
-                    )
+                    a_mov = nl.load_transpose2d(a[n_off : n_off + TILE_N, k_off : k_off + TILE_K])
                     psum[...] += nisa.nc_matmul(a_stat, a_mov)
 
                 c_sbuf = nl.copy(psum, dtype=a.dtype)
                 nl.store(
-                    c[m_off:m_off + TILE_M, n_off:n_off + TILE_N],
+                    c[m_off : m_off + TILE_M, n_off : n_off + TILE_N],
                     value=c_sbuf,
                 )
 

@@ -15,9 +15,8 @@ import pytest
 import torch
 
 import trnblas
-from trnblas import gemm, batched_gemm
-from trnblas.nki import nki_gemm, nki_batched_gemm
-
+from trnblas import batched_gemm, gemm
+from trnblas.nki import nki_batched_gemm, nki_gemm
 
 pytestmark = pytest.mark.neuron
 
@@ -44,11 +43,11 @@ def aligned_shapes():
 def edge_shapes():
     """Shapes with at least one non-128-aligned dim — exercises edge tiles."""
     return [
-        (200, 137, 400),     # all unaligned
-        (256, 200, 128),     # N unaligned
-        (137, 128, 256),     # M unaligned
-        (128, 128, 200),     # K unaligned
-        (300, 250, 175),     # all unaligned, prime-ish
+        (200, 137, 400),  # all unaligned
+        (256, 200, 128),  # N unaligned
+        (137, 128, 256),  # M unaligned
+        (128, 128, 200),  # K unaligned
+        (300, 250, 175),  # all unaligned, prime-ish
     ]
 
 
@@ -110,8 +109,7 @@ class TestGemmDispatch:
         B = torch.randn(128, 128, generator=rng)
         C0 = torch.randn(128, 128, generator=rng)
         out = gemm(2.0, A, B, beta=0.5, C=C0.clone())
-        torch.testing.assert_close(out, 2.0 * (A @ B) + 0.5 * C0,
-                                   atol=ATOL, rtol=RTOL)
+        torch.testing.assert_close(out, 2.0 * (A @ B) + 0.5 * C0, atol=ATOL, rtol=RTOL)
 
 
 class TestNkiBatchedGemm:
@@ -151,6 +149,7 @@ class TestPerformance:
     @pytest.mark.parametrize("MKN", [(512, 512, 512), (1024, 1024, 1024)])
     def test_compile_vs_cache_timing(self, nki_backend, MKN, capsys):
         import time
+
         M, K, N = MKN
         A = torch.randn(M, K)
         B = torch.randn(K, N)
@@ -172,15 +171,16 @@ class TestPerformance:
         with capsys.disabled():
             print(
                 f"\n[perf {M}x{K}x{N}] "
-                f"cold={cold*1000:7.1f}ms  "
-                f"warm_min={warm_min*1000:7.1f}ms  "
-                f"warm_avg={warm_avg*1000:7.1f}ms  "
-                f"speedup={cold/warm_min:5.1f}x"
+                f"cold={cold * 1000:7.1f}ms  "
+                f"warm_min={warm_min * 1000:7.1f}ms  "
+                f"warm_avg={warm_avg * 1000:7.1f}ms  "
+                f"speedup={cold / warm_min:5.1f}x"
             )
 
     @pytest.mark.parametrize("BMKN", [(32, 256, 128, 256)])
     def test_batched_compile_vs_cache(self, nki_backend, BMKN, capsys):
         import time
+
         B, M, K, N = BMKN
         A = torch.randn(B, M, K)
         Bm = torch.randn(B, K, N)
@@ -196,9 +196,9 @@ class TestPerformance:
         with capsys.disabled():
             print(
                 f"\n[perf batch={B} {M}x{K}x{N}] "
-                f"cold={cold*1000:7.1f}ms  "
-                f"warm_min={warm_min*1000:7.1f}ms  "
-                f"per_slice={warm_min*1000/B:6.2f}ms"
+                f"cold={cold * 1000:7.1f}ms  "
+                f"warm_min={warm_min * 1000:7.1f}ms  "
+                f"per_slice={warm_min * 1000 / B:6.2f}ms"
             )
 
 
@@ -214,5 +214,5 @@ class TestStationaryTileReuse:
         A = torch.randn(256, 256, generator=rng)
         Bs = [torch.randn(256, 128, generator=rng) for _ in range(4)]
         outs = [nki_gemm(A, B) for B in Bs]
-        for B, out in zip(Bs, outs):
+        for B, out in zip(Bs, outs, strict=True):
             torch.testing.assert_close(out, A @ B, atol=ATOL, rtol=RTOL)

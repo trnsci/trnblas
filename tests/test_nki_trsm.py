@@ -14,7 +14,6 @@ import torch
 from trnblas import trsm
 from trnblas.nki import nki_trsm
 
-
 ATOL = 1e-3
 RTOL = 1e-3
 
@@ -32,7 +31,7 @@ def tri_shapes():
         (128, 128),
         (256, 128),
         (512, 256),
-        (200, 150),   # both unaligned
+        (200, 150),  # both unaligned
     ]
 
 
@@ -118,9 +117,7 @@ class TestNkiTrsmBlocked:
         torch.testing.assert_close(U.T @ X, B, atol=ATOL, rtol=RTOL)
 
     def test_unit_diag(self, nki_backend, rng):
-        L = torch.eye(256) + 0.05 * torch.tril(
-            torch.randn(256, 256, generator=rng), diagonal=-1
-        )
+        L = torch.eye(256) + 0.05 * torch.tril(torch.randn(256, 256, generator=rng), diagonal=-1)
         B = torch.randn(256, 128, generator=rng)
         X = nki_trsm(L, B, uplo="lower", diag="unit")
         torch.testing.assert_close(L @ X, B, atol=ATOL, rtol=RTOL)

@@ -58,7 +58,7 @@ def main() -> int:
     t0 = time.perf_counter()
     out = trnblas.gemm(1.0, A, B)
     cold = time.perf_counter() - t0
-    print(f"cold call: {cold*1000:.2f} ms")
+    print(f"cold call: {cold * 1000:.2f} ms")
 
     # Warm average.
     times = []
@@ -67,7 +67,7 @@ def main() -> int:
         out = trnblas.gemm(1.0, A, B)
         times.append(time.perf_counter() - t0)
     warm = sum(times) / len(times)
-    print(f"warm mean: {warm*1000:.3f} ms")
+    print(f"warm mean: {warm * 1000:.3f} ms")
 
     # Correctness.
     ok = torch.allclose(out, ref, atol=1e-3, rtol=1e-4)
@@ -76,8 +76,10 @@ def main() -> int:
     # NKI signature test: if cold is ≥ 10× warm, NEFF compile happened
     # → real NKI. If cold ≈ warm, suspicious (likely CPU).
     ratio = cold / warm if warm > 0 else 0.0
-    print(f"cold/warm ratio: {ratio:.1f}x  "
-          f"({'NKI signature' if ratio > 10 else 'CPU-like (suspect!)'})")
+    print(
+        f"cold/warm ratio: {ratio:.1f}x  "
+        f"({'NKI signature' if ratio > 10 else 'CPU-like (suspect!)'})"
+    )
     return 0 if ok else 1
 
 

@@ -7,9 +7,7 @@ All operate on torch tensors with NKI dispatch for Trainium acceleration.
 
 from __future__ import annotations
 
-import math
 import torch
-from typing import Optional
 
 
 def axpy(alpha: float, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:

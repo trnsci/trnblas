@@ -15,9 +15,6 @@ NKI dispatch for GEMM provides stationary tile reuse on the Tensor Engine.
 from __future__ import annotations
 
 import torch
-from typing import Optional
-
-from .nki import get_backend, HAS_NKI
 
 
 def gemm(
@@ -25,7 +22,7 @@ def gemm(
     A: torch.Tensor,
     B: torch.Tensor,
     beta: float = 0.0,
-    C: Optional[torch.Tensor] = None,
+    C: torch.Tensor | None = None,
     transA: bool = False,
     transB: bool = False,
 ) -> torch.Tensor:
@@ -40,7 +37,7 @@ def gemm(
 
     On Trainium, dispatches to NKI GEMM with stationary tile reuse.
     """
-    from .nki.dispatch import nki_gemm, _use_nki
+    from .nki.dispatch import _use_nki, nki_gemm
 
     a = A.T if transA else A
     b = B.T if transB else B
@@ -61,7 +58,7 @@ def batched_gemm(
     A: torch.Tensor,
     B: torch.Tensor,
     beta: float = 0.0,
-    C: Optional[torch.Tensor] = None,
+    C: torch.Tensor | None = None,
     transA: bool = False,
     transB: bool = False,
 ) -> torch.Tensor:
@@ -87,7 +84,7 @@ def symm(
     A: torch.Tensor,
     B: torch.Tensor,
     beta: float = 0.0,
-    C: Optional[torch.Tensor] = None,
+    C: torch.Tensor | None = None,
     side: str = "left",
     uplo: str = "upper",
 ) -> torch.Tensor:
@@ -117,7 +114,7 @@ def syrk(
     alpha: float,
     A: torch.Tensor,
     beta: float = 0.0,
-    C: Optional[torch.Tensor] = None,
+    C: torch.Tensor | None = None,
     trans: bool = False,
     uplo: str = "upper",
 ) -> torch.Tensor:
@@ -182,7 +179,7 @@ def trmm(
     diag: str = "nonunit",
 ) -> torch.Tensor:
     """Triangular matrix multiply: B = alpha * op(A) @ B  (side='left')
-                               or B = alpha * B @ op(A)  (side='right')
+    or B = alpha * B @ op(A)  (side='right')
     """
     if uplo == "upper":
         tri = torch.triu(A)
@@ -190,7 +187,11 @@ def trmm(
         tri = torch.tril(A)
 
     if diag == "unit":
-        tri = tri - torch.diag(torch.diag(tri)) + torch.eye(A.shape[0], dtype=A.dtype, device=A.device)
+        tri = (
+            tri
+            - torch.diag(torch.diag(tri))
+            + torch.eye(A.shape[0], dtype=A.dtype, device=A.device)
+        )
 
     mat = tri.T if trans else tri
 

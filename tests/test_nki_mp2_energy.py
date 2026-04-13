@@ -10,7 +10,6 @@ import torch
 from trnblas.nki import nki_mp2_energy
 from trnblas.nki.dispatch import _torch_mp2_energy
 
-
 ATOL = 1e-4
 RTOL = 1e-4
 
@@ -60,7 +59,8 @@ class TestTorchFallback:
 
     def test_dispatch_wrapper_cpu(self):
         """nki_mp2_energy with pytorch backend forced — must match reference."""
-        from trnblas import set_backend, get_backend
+        from trnblas import get_backend, set_backend
+
         old = get_backend()
         set_backend("pytorch")
         try:

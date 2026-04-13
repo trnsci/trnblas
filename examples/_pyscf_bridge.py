@@ -10,8 +10,7 @@ from __future__ import annotations
 
 import numpy as np
 import torch
-
-from pyscf import gto, scf, df, mp
+from pyscf import df, gto, mp, scf
 
 
 def build_df_mp2_inputs(mol: gto.Mole, auxbasis: str = "weigend") -> dict:

@@ -27,13 +27,16 @@ def test_nki_dispatches_without_fallback():
 
     # Re-import so the module-level _REQUIRE_NKI is re-evaluated.
     import importlib
+
     import trnblas.nki.dispatch as dispatch_mod
+
     importlib.reload(dispatch_mod)
     assert dispatch_mod._REQUIRE_NKI, (
         "TRNBLAS_REQUIRE_NKI didn't take effect after reload — test setup bug"
     )
 
     import trnblas
+
     trnblas.set_backend("nki")
 
     # If the NKI dispatch silently falls back today, this call raises

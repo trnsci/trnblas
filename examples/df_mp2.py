@@ -52,7 +52,7 @@ def _energy_reduction(
     for ERI + Python + system. At medium this resolves to one chunk.
     """
     nocc, nvir, naux = B.shape
-    bytes_per_i = 4 * nvir * nocc * nvir       # one row-block of T_full (fp32)
+    bytes_per_i = 4 * nvir * nocc * nvir  # one row-block of T_full (fp32)
     i_block = max(1, min(nocc, int(mem_budget_bytes // bytes_per_i)))
 
     B_flat = B.reshape(nocc * nvir, naux).contiguous()
@@ -67,8 +67,8 @@ def _energy_reduction(
     for i_start in range(0, nocc, i_block):
         i_end = min(i_start + i_block, nocc)
         ic = i_end - i_start
-        B_chunk = B_flat[i_start * nvir : i_end * nvir]          # (ic·nvir, naux)
-        T_flat = trnblas.gemm(1.0, B_chunk, B_flat, transB=True) # (ic·nvir, nocc·nvir)
+        B_chunk = B_flat[i_start * nvir : i_end * nvir]  # (ic·nvir, naux)
+        T_flat = trnblas.gemm(1.0, B_chunk, B_flat, transB=True)  # (ic·nvir, nocc·nvir)
         T = T_flat.reshape(ic, nvir, nocc, nvir).permute(0, 2, 1, 3)
         denom = eps_o_pair[i_start:i_end] - eps_v_pair
         e_mp2 = e_mp2 + (T * (2.0 * T - T.transpose(-2, -1)) / denom).sum()
@@ -76,12 +76,12 @@ def _energy_reduction(
 
 
 def df_mp2_energy(
-    C_occ: torch.Tensor,     # (nbasis, nocc) — occupied MO coefficients
-    C_vir: torch.Tensor,     # (nbasis, nvir) — virtual MO coefficients
-    eri_3c: torch.Tensor,    # (nbasis, nbasis, naux) — 3-center integrals
+    C_occ: torch.Tensor,  # (nbasis, nocc) — occupied MO coefficients
+    C_vir: torch.Tensor,  # (nbasis, nvir) — virtual MO coefficients
+    eri_3c: torch.Tensor,  # (nbasis, nbasis, naux) — 3-center integrals
     J_metric: torch.Tensor,  # (naux, naux) — Coulomb metric J_{PQ}
-    eps_occ: torch.Tensor,   # (nocc,) — occupied orbital energies
-    eps_vir: torch.Tensor,   # (nvir,) — virtual orbital energies
+    eps_occ: torch.Tensor,  # (nocc,) — occupied orbital energies
+    eps_vir: torch.Tensor,  # (nvir,) — virtual orbital energies
     timings: dict | None = None,
 ) -> float:
     """Compute DF-MP2 correlation energy.
@@ -89,16 +89,17 @@ def df_mp2_energy(
     Returns E_MP2 (scalar). Optionally fills `timings` with per-step seconds.
     """
     nbasis, nocc = C_occ.shape
-    nvir = C_vir.shape[1]
     naux = J_metric.shape[0]
 
     # Step 1: Cholesky of metric → L; J^{-1/2} via L^{-T}: solve L^T @ X = I
     t0 = time.perf_counter()
     L = torch.linalg.cholesky(J_metric)
     J_inv_half = trnblas.trsm(
-        1.0, L,
+        1.0,
+        L,
         torch.eye(naux, dtype=J_metric.dtype, device=J_metric.device),
-        uplo="lower", trans=True,
+        uplo="lower",
+        trans=True,
     )
     t_chol = time.perf_counter() - t0
 
@@ -112,14 +113,14 @@ def df_mp2_energy(
 
     # 2b. (ia|P) = C_vir^T @ (iν|P) — one batched GEMM over occupied dim.
     #     C_vir.T broadcast across batch=nocc; iv_P is already (nocc, nbasis, naux).
-    C_vir_T_b = _bcast(C_vir.T, nocc)                       # (nocc, nvir, nbasis)
-    ia_P = trnblas.batched_gemm(1.0, C_vir_T_b, iv_P)       # (nocc, nvir, naux)
+    C_vir_T_b = _bcast(C_vir.T, nocc)  # (nocc, nvir, nbasis)
+    ia_P = trnblas.batched_gemm(1.0, C_vir_T_b, iv_P)  # (nocc, nvir, naux)
     t_half = time.perf_counter() - t0
 
     # Step 3: Metric contraction B[i] = ia_P[i] @ J_inv_half — one batched GEMM.
     t0 = time.perf_counter()
-    J_b = _bcast(J_inv_half, nocc)                          # (nocc, naux, naux)
-    B = trnblas.batched_gemm(1.0, ia_P, J_b)                # (nocc, nvir, naux)
+    J_b = _bcast(J_inv_half, nocc)  # (nocc, naux, naux)
+    B = trnblas.batched_gemm(1.0, ia_P, J_b)  # (nocc, nvir, naux)
     t_metric = time.perf_counter() - t0
 
     # Step 4: Energy via one GEMM (chunked over i if memory-tight).
@@ -133,9 +134,7 @@ def df_mp2_energy(
     t_energy = time.perf_counter() - t0
 
     if timings is not None:
-        timings.update(
-            chol=t_chol, half=t_half, metric=t_metric, energy=t_energy
-        )
+        timings.update(chol=t_chol, half=t_half, metric=t_metric, energy=t_energy)
     return float(e_mp2)
 
 
@@ -148,8 +147,8 @@ def _flops(nbasis: int, nocc: int, naux: int) -> int:
     nvir = nbasis - nocc
     f_2a = 2 * nbasis * nbasis * nocc * naux
     f_2b = 2 * nocc * nvir * nbasis * naux
-    f_3  = 2 * nocc * nvir * naux * naux
-    f_4  = 2 * nocc * nocc * nvir * nvir * naux
+    f_3 = 2 * nocc * nvir * naux * naux
+    f_4 = 2 * nocc * nocc * nvir * nvir * naux
     return f_2a + f_2b + f_3 + f_4
 
 
@@ -178,9 +177,9 @@ def _make_inputs(nbasis: int, nocc: int, naux: int, seed: int = 42, device: str 
 
 
 _BENCH_SHAPES = {
-    "small":  (128, 16, 384),     # ~75MB ERI
-    "medium": (512, 64, 1536),    # ~1.5GB ERI
-    "large":  (768, 96, 2304),    # ~5GB ERI
+    "small": (128, 16, 384),  # ~75MB ERI
+    "medium": (512, 64, 1536),  # ~1.5GB ERI
+    "large": (768, 96, 2304),  # ~5GB ERI
 }
 
 
@@ -192,8 +191,7 @@ def bench(shape_name: str, device: str = "cpu"):
 
     print(f"[shape={shape_name} nbasis={nbasis} nocc={nocc} nvir={nvir} naux={naux}]")
     print(
-        f"  approx flops: {flops/1e9:.1f} G  "
-        f"backend: {trnblas.get_backend()}  device: {device}"
+        f"  approx flops: {flops / 1e9:.1f} G  backend: {trnblas.get_backend()}  device: {device}"
     )
 
     for label in ("cold", "warm"):
@@ -215,17 +213,22 @@ def bench(shape_name: str, device: str = "cpu"):
 def main():
     parser = argparse.ArgumentParser(description="DF-MP2 using trnblas")
     parser.add_argument("--demo", action="store_true", help="Small demo (water-like)")
-    parser.add_argument("--bench", action="store_true",
-                        help="Cold/warm timing across small/medium/large shapes")
-    parser.add_argument("--shape", choices=list(_BENCH_SHAPES),
-                        help="Restrict --bench to one shape")
+    parser.add_argument(
+        "--bench", action="store_true", help="Cold/warm timing across small/medium/large shapes"
+    )
+    parser.add_argument(
+        "--shape", choices=list(_BENCH_SHAPES), help="Restrict --bench to one shape"
+    )
     parser.add_argument("--nbasis", type=int, default=24)
     parser.add_argument("--nocc", type=int, default=5)
     parser.add_argument("--naux", type=int, default=None)
-    parser.add_argument("--device", default="cpu",
-                        help="Torch device for inputs (cpu, cuda, cuda:0, ...). "
-                             "CPU by default; set cuda to benchmark against cuBLAS "
-                             "on an NVIDIA GPU instance.")
+    parser.add_argument(
+        "--device",
+        default="cpu",
+        help="Torch device for inputs (cpu, cuda, cuda:0, ...). "
+        "CPU by default; set cuda to benchmark against cuBLAS "
+        "on an NVIDIA GPU instance.",
+    )
     args = parser.parse_args()
 
     if args.bench:

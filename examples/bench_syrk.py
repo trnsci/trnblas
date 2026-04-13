@@ -16,7 +16,6 @@ import torch
 
 import trnblas
 
-
 SHAPES = [
     (512, 512),
     (1024, 512),
@@ -58,8 +57,8 @@ def bench(M: int, K: int, device: str) -> None:
     tflops_warm = flops / warm / 1e12
     print(
         f"  M={M:<5d} K={K:<5d}  "
-        f"cold={cold*1000:7.2f}ms ({tflops_cold:5.2f} TFLOPS)  "
-        f"warm={warm*1000:7.2f}ms ({tflops_warm:5.2f} TFLOPS)"
+        f"cold={cold * 1000:7.2f}ms ({tflops_cold:5.2f} TFLOPS)  "
+        f"warm={warm * 1000:7.2f}ms ({tflops_warm:5.2f} TFLOPS)"
     )
 
 

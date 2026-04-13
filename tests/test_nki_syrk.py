@@ -11,7 +11,6 @@ import torch
 from trnblas import syrk
 from trnblas.nki import nki_syrk
 
-
 ATOL = 1e-3
 RTOL = 1e-4
 

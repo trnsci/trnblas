@@ -18,7 +18,6 @@ import torch
 
 import trnblas
 
-
 # (M, N) — M is the triangular side, N is the RHS width.
 SHAPES = [
     (512, 512),
@@ -68,8 +67,8 @@ def bench(M: int, N: int, device: str) -> None:
     tflops_warm = flops / warm / 1e12
     print(
         f"  M={M:<5d} N={N:<5d}  "
-        f"cold={cold*1000:7.2f}ms ({tflops_cold:5.2f} TFLOPS)  "
-        f"warm={warm*1000:7.2f}ms ({tflops_warm:5.2f} TFLOPS)"
+        f"cold={cold * 1000:7.2f}ms ({tflops_cold:5.2f} TFLOPS)  "
+        f"warm={warm * 1000:7.2f}ms ({tflops_warm:5.2f} TFLOPS)"
     )
 
 

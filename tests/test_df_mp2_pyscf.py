@@ -19,7 +19,6 @@ sys.path.insert(0, os.path.abspath(_EXAMPLES))
 from _pyscf_bridge import build_df_mp2_inputs, make_mol, pyscf_reference_energy  # noqa: E402
 from df_mp2 import df_mp2_energy  # noqa: E402
 
-
 pytestmark = pytest.mark.pyscf
 
 
