@@ -63,7 +63,7 @@ def _energy_reduction(
     # this exact expression, but on trn1 it currently matches the torch
     # path rather than beating it — the per-(i,j) dispatch/load chain
     # swamps the compute savings. See #15 for the follow-up perf work.
-    e_mp2 = torch.zeros((), dtype=B.dtype)
+    e_mp2 = torch.zeros((), dtype=B.dtype, device=B.device)
     for i_start in range(0, nocc, i_block):
         i_end = min(i_start + i_block, nocc)
         ic = i_end - i_start
@@ -95,7 +95,11 @@ def df_mp2_energy(
     # Step 1: Cholesky of metric → L; J^{-1/2} via L^{-T}: solve L^T @ X = I
     t0 = time.perf_counter()
     L = torch.linalg.cholesky(J_metric)
-    J_inv_half = trnblas.trsm(1.0, L, torch.eye(naux), uplo="lower", trans=True)
+    J_inv_half = trnblas.trsm(
+        1.0, L,
+        torch.eye(naux, dtype=J_metric.dtype, device=J_metric.device),
+        uplo="lower", trans=True,
+    )
     t_chol = time.perf_counter() - t0
 
     # Step 2: Half-transform (μν|P) → (ia|P)
