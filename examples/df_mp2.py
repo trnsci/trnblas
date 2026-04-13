@@ -51,23 +51,27 @@ def _energy_reduction(
     Default budget targets ~6 GB peak, fits trn1.2xlarge HBM with room
     for ERI + Python + system. At medium this resolves to one chunk.
     """
-    from trnblas.nki import nki_mp2_energy
-
     nocc, nvir, naux = B.shape
     bytes_per_i = 4 * nvir * nocc * nvir       # one row-block of T_full (fp32)
     i_block = max(1, min(nocc, int(mem_budget_bytes // bytes_per_i)))
 
     B_flat = B.reshape(nocc * nvir, naux).contiguous()
+    eps_o_pair = eps_occ.view(nocc, 1, 1, 1) + eps_occ.view(1, nocc, 1, 1)
+    eps_v_pair = eps_vir.view(1, 1, nvir, 1) + eps_vir.view(1, 1, 1, nvir)
 
+    # NB: trnblas.nki.nki_mp2_energy is a validated fused kernel covering
+    # this exact expression, but on trn1 it currently matches the torch
+    # path rather than beating it — the per-(i,j) dispatch/load chain
+    # swamps the compute savings. See #15 for the follow-up perf work.
     e_mp2 = torch.zeros((), dtype=B.dtype)
     for i_start in range(0, nocc, i_block):
         i_end = min(i_start + i_block, nocc)
+        ic = i_end - i_start
         B_chunk = B_flat[i_start * nvir : i_end * nvir]          # (ic·nvir, naux)
         T_flat = trnblas.gemm(1.0, B_chunk, B_flat, transB=True) # (ic·nvir, nocc·nvir)
-        # Fused reduction (NKI path when available; torch fallback otherwise).
-        e_mp2 = e_mp2 + nki_mp2_energy(
-            T_flat, eps_occ[i_start:i_end], eps_occ, eps_vir
-        )
+        T = T_flat.reshape(ic, nvir, nocc, nvir).permute(0, 2, 1, 3)
+        denom = eps_o_pair[i_start:i_end] - eps_v_pair
+        e_mp2 = e_mp2 + (T * (2.0 * T - T.transpose(-2, -1)) / denom).sum()
     return float(e_mp2)
 
 

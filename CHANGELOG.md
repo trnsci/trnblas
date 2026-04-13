@@ -17,13 +17,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `trnblas.nki.nki_mp2_energy` — fused MP2 energy-reduction kernel
-  (#15). Streams T_flat tiles on-chip, computes
-  `T * (2T - T.T) / denom` and reduces in one pass, avoiding the
-  four HBM round-trips of the torch expression. First-cut kernel
-  covers `nvir ≤ 128`; larger `nvir` falls back to the torch
-  reference pending sub-tiling work. `examples/df_mp2.py` wired to
-  dispatch through this call.
+- `trnblas.nki.nki_mp2_energy` — fused MP2 energy-reduction NKI
+  kernel (#15). Streams T_flat tiles on-chip via partition-dim
+  sub-tiling (P_TILE picked as the largest divisor of nvir ≤ 128;
+  covers all bench shapes). Loads a (P_TILE, nvir) strip + its
+  within-block transpose (via `nl.load_transpose2d`), builds
+  `denom` on-chip, reduces into a per-(i,j) SBUF accumulator,
+  single HBM store per (i,j). Five on-hardware correctness tests
+  (`tests/test_nki_mp2_energy.py`, `@pytest.mark.neuron`) cover
+  `nvir ∈ {8, 16, 64, 256, 448}` — all pass on trn1.
+  **Perf status:** bit-exact with the torch reference but matches
+  (not beats) it at medium on trn1 — the per-(i,j) dispatch/load
+  chain swamps compute savings. `examples/df_mp2.py` keeps the
+  torch path for now; NKI dispatch re-wire deferred to a kernel
+  restructuring pass (batch multiple (i,j) per dispatch).
 
 - `examples/df_mp2.py` refactored to use `trnblas.batched_gemm` for all
   per-occupied-orbital loops (steps 2b, 3, and 4-per-i). Energy
