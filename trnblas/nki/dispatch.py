@@ -434,12 +434,13 @@ if HAS_NKI:
         padding). PSUM accumulates over K-tiles before the single store
         per (m, n) tile pair.
 
-        NKI 0.3.0 calling convention (`nisa.nc_matmul(stationary,
-        moving=..., accumulate=None)`):
+        NKI 0.3.0 calling convention (`nisa.nc_matmul(dst, stationary,
+        moving, accumulate)`):
+            dst:        (TILE_M, TILE_N)  fp32, in nl.psum — written in place
             stationary: (TILE_K, TILE_M)  partition=K ≤ 128, free ≤ 128
             moving:     (TILE_K, TILE_N)  partition=K, free ≤ 512
-            psum:       (TILE_M, TILE_N)  fp32, in nl.psum
-        `moving` became a required keyword argument in NKI 0.3.0.
+        `accumulate=True` reads-modify-writes dst (replaces the
+        `psum[...] += nc_matmul(...)` pattern from the pre-0.3.0 API).
         """
         M, K = a.shape
         _, N = b.shape
@@ -465,7 +466,7 @@ if HAS_NKI:
                     # B is already K-major.
                     b_tile = nl.load(b[k_off : k_off + TILE_K, n_off : n_off + TILE_N])
 
-                    psum[...] += nisa.nc_matmul(stationary=a_t, moving=b_tile)
+                    nisa.nc_matmul(dst=psum, stationary=a_t, moving=b_tile, accumulate=True)
 
                 c_sbuf = nl.copy(psum, dtype=a.dtype)
                 nl.store(
@@ -622,7 +623,7 @@ if HAS_NKI:
                     # load_transpose2d swaps axes → (TILE_K, TILE_N),
                     # partition=K ≤ 128.
                     a_mov = nl.load_transpose2d(a[n_off : n_off + TILE_N, k_off : k_off + TILE_K])
-                    psum[...] += nisa.nc_matmul(stationary=a_stat, moving=a_mov)
+                    nisa.nc_matmul(dst=psum, stationary=a_stat, moving=a_mov, accumulate=True)
 
                 c_sbuf = nl.copy(psum, dtype=a.dtype)
                 nl.store(
