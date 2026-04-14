@@ -1,12 +1,36 @@
 # RFC: Fused DF-MP2 pair-energy kernel
 
-**Status:** Design · **Phase:** 3 · **Tracker:** [#15](https://github.com/trnsci/trnblas/issues/15)
+**Status:** Shipped (M2.1, 2026-04-14) — correctness validated;
+measured ~1.48× on the energy step vs torch, below the RFC's 3–5×
+target. Follow-up perf work under [#15](https://github.com/trnsci/trnblas/issues/15).
+**Phase:** 3 · **Tracker:** [#15](https://github.com/trnsci/trnblas/issues/15)
 
 This RFC describes the shape of the single most valuable Phase 3
 optimization in trnblas: collapsing the DF-MP2 pair-energy reduction
 into one NKI kernel. The work is worth an RFC because the design is
 Trainium-specific — the four-engine separation and NEFF-cached plan
 model enable a pipeline that isn't cleanly expressible on GPU.
+
+## Shipped status (2026-04-14)
+
+- **M2.1a — broadcast correctness fix.** `denom` construction now
+  lifts all eps operands to `(P_TILE, NVIR)` via `nl.broadcast_to`
+  before subtracting; satisfies the NKI 0.3.0 MLIR verifier's
+  partition-matching requirement. All 5 `TestNkiKernel` MP2 cases
+  re-enabled; 37/37 neuron tests pass on trn1. Commit
+  [`c1769c6`](https://github.com/trnsci/trnblas/commit/c1769c6).
+- **M2.2 — measured perf (warm NEFF cache):**
+  - medium: energy 8.03 s torch → 5.43 s fused (**1.48×**); total 9.79 s → 7.29 s.
+  - large: energy 44.57 s torch → 30.27 s fused (**1.47×**); total 50.00 s → 35.76 s.
+  - Bit-parity at `atol=1e-4, rtol=1e-4`.
+- **RFC targets missed.** The 3× minimum / 5× stretch on the energy
+  step was not hit. The per-(i,j) launch cost scales with `nocc²`
+  the same way the torch path does, so the ratio is roughly
+  shape-invariant. The remaining gap lives in §"Open questions"
+  below — larger free-dim tiles and the atomic-add variant are the
+  two directions the follow-up work tackles.
+- **`examples/df_mp2.py --fused-energy`** exposes the kernel; default
+  path remains torch until a follow-up milestone hits 3×.
 
 ## Motivation — the problem in measured numbers
 

@@ -58,10 +58,11 @@ def _energy_reduction(
 
     B_flat = B.reshape(nocc * nvir, naux).contiguous()
 
-    # `use_fused`: route the per-chunk `T * (2T - T.T) / denom).sum()`
-    # through `trnblas.nki.nki_mp2_energy` instead of materialising three
-    # intermediates of T_chunk's shape. The fused kernel is the #15 M2
-    # target; this flag toggles it on for perf comparisons.
+    # `use_fused`: route the per-chunk `(T * (2T - T.T) / denom).sum()`
+    # through `trnblas.nki.nki_mp2_energy`. Measured on trn1 (warm NEFF
+    # cache): ~1.48× speedup on the energy step at both medium and large
+    # DF-MP2 shapes — real improvement, but below the RFC's 3× bar, so
+    # the default path stays torch until a future #15 milestone hits it.
     e_mp2 = torch.zeros((), dtype=B.dtype, device=B.device)
     if not use_fused:
         eps_o_pair = eps_occ.view(nocc, 1, 1, 1) + eps_occ.view(1, nocc, 1, 1)
