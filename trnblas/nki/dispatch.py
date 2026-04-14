@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import warnings
 
+import numpy as np
 import torch
 
 try:
@@ -25,6 +26,22 @@ except ImportError:
 # When set, kernel-path failures re-raise instead of falling back to PyTorch.
 # Used by the validation suite to catch silent kernel breakage during iteration.
 _REQUIRE_NKI = os.environ.get("TRNBLAS_REQUIRE_NKI", "").lower() in ("1", "true", "yes")
+
+# When set, dispatch bypasses torch_xla and runs kernels through
+# `nki.simulate(kernel)(np_args)` on CPU. Lets us iterate kernels on any
+# x86_64 Linux box without paying the NEFF compile + hardware dispatch
+# cost. Semantics follow NKI 0.3.0's simulator: no NEFF compile, no
+# SBUF/PSUM capacity checks, no latency/parallelism modelling. For
+# correctness iteration only; hardware still owns perf numbers.
+_USE_SIMULATOR = os.environ.get("TRNBLAS_USE_SIMULATOR", "").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+
+def _use_simulator() -> bool:
+    return _USE_SIMULATOR and HAS_NKI
 
 
 class NkiFallbackWarning(UserWarning):
@@ -166,15 +183,27 @@ def _nki_mp2_energy_impl(
     #   eps_vir_col: (NVIR, 1) — strip loads pick (P_TILE, 1) slices
     #   eps_vir_row: (1, NVIR) — full free-dim vector for broadcast
     #   eps_occ_*:   (1, N)    — (1,1) scalars picked from the row
-    (t, eo_c, eo_f, ev_col, ev_row), orig_device = _to_xla(
-        T_flat.contiguous(),
-        eps_occ_chunk.reshape(1, -1).contiguous(),
-        eps_occ_full.reshape(1, -1).contiguous(),
-        eps_vir.reshape(-1, 1).contiguous(),
-        eps_vir.reshape(1, -1).contiguous(),
-    )
-    partial = _mp2_energy_kernel(t, eo_c, eo_f, ev_col, ev_row)
-    return partial.to(orig_device).sum()
+    t_in = T_flat.contiguous()
+    eo_c_in = eps_occ_chunk.reshape(1, -1).contiguous()
+    eo_f_in = eps_occ_full.reshape(1, -1).contiguous()
+    ev_col_in = eps_vir.reshape(-1, 1).contiguous()
+    ev_row_in = eps_vir.reshape(1, -1).contiguous()
+
+    if _use_simulator():
+        partial_np = nki.simulate(_mp2_energy_kernel)(
+            t_in.cpu().numpy(),
+            eo_c_in.cpu().numpy(),
+            eo_f_in.cpu().numpy(),
+            ev_col_in.cpu().numpy(),
+            ev_row_in.cpu().numpy(),
+        )
+        partial = torch.from_numpy(np.asarray(partial_np)).to(T_flat.device)
+    else:
+        (t, eo_c, eo_f, ev_col, ev_row), orig_device = _to_xla(
+            t_in, eo_c_in, eo_f_in, ev_col_in, ev_row_in
+        )
+        partial = _mp2_energy_kernel(t, eo_c, eo_f, ev_col, ev_row).to(orig_device)
+    return partial.sum()
 
 
 def nki_gemm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
@@ -374,11 +403,19 @@ def _nki_gemm_impl(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
             A_p[:M, :K] = A
             B_p = torch.zeros(K_pad, N_pad, dtype=B.dtype, device=B.device)
             B_p[:K, :N] = B
-            (a, b), orig_device = _to_xla(A_p.contiguous(), B_p.contiguous())
+            A_feed, B_feed = A_p.contiguous(), B_p.contiguous()
         else:
-            (a, b), orig_device = _to_xla(A.contiguous(), B.contiguous())
-        c = _gemm_kernel(a, b)
-        result = c.to(orig_device)
+            A_feed, B_feed = A.contiguous(), B.contiguous()
+
+        if _use_simulator():
+            # CPU-side: feed NumPy arrays to nki.simulate(kernel). Bypasses
+            # torch_xla entirely.
+            out_np = nki.simulate(_gemm_kernel)(A_feed.cpu().numpy(), B_feed.cpu().numpy())
+            result = torch.from_numpy(np.asarray(out_np)).to(A.device)
+        else:
+            (a, b), orig_device = _to_xla(A_feed, B_feed)
+            c = _gemm_kernel(a, b)
+            result = c.to(orig_device)
         return result[:M, :N] if needs_pad else result
     except Exception as exc:
         if _REQUIRE_NKI:
@@ -410,11 +447,17 @@ def _nki_syrk_impl(A: torch.Tensor) -> torch.Tensor:
         if needs_pad:
             A_p = torch.zeros(M_pad, K_pad, dtype=A.dtype, device=A.device)
             A_p[:M, :K] = A
-            (a,), orig_device = _to_xla(A_p.contiguous())
+            A_feed = A_p.contiguous()
         else:
-            (a,), orig_device = _to_xla(A.contiguous())
-        c = _syrk_kernel(a)
-        result = c.to(orig_device)
+            A_feed = A.contiguous()
+
+        if _use_simulator():
+            out_np = nki.simulate(_syrk_kernel)(A_feed.cpu().numpy())
+            result = torch.from_numpy(np.asarray(out_np)).to(A.device)
+        else:
+            (a,), orig_device = _to_xla(A_feed)
+            c = _syrk_kernel(a)
+            result = c.to(orig_device)
         return result[:M, :M] if needs_pad else result
     except Exception as exc:
         if _REQUIRE_NKI:
