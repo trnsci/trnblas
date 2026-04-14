@@ -23,17 +23,40 @@ iteration loop from ~8–12 min per attempt (instance start + SSM +
 NEFF compile) to seconds — critical for kernel design where each
 new semantic constraint costs one round-trip to discover.
 
-Run simulator tests on the existing trn1 CI instance:
+Run simulator tests on GH Actions `ubuntu-latest` (the `nki-simulator`
+job — see below), on the existing trn1 CI instance via SSM:
 
 ```bash
 AWS_PROFILE=aws ./scripts/run_simulator_tests.sh
 ```
 
-Or inline on a Linux x86_64 box that has `nki>=0.3.0` installed:
+Or inline on any Linux x86_64 box that has `nki>=0.3.0` installed:
 
 ```bash
 TRNBLAS_USE_SIMULATOR=1 pytest tests/ -m nki_simulator -v
 ```
+
+## CI coverage
+
+Three gates, in increasing cost order:
+
+| Gate | Runner | Catches | Misses |
+|------|--------|---------|--------|
+| `test` matrix (py 3.10/3.11/3.12) | `ubuntu-latest` | Pure-Python correctness against the `torch.matmul` reference. Fast (~1 s). | Anything NKI-kernel-specific. |
+| `nki-simulator` | `ubuntu-latest` | Python trace-level kernel errors: wrong `nc_matmul` kwargs, dropped ops (`nl.divide`), shape mismatches, tile-size violations. Seconds per kernel. | MLIR verifier errors — simulator explicitly skips compile. Perf. |
+| `neuron` (SSM, manual) | `trn1.2xlarge` | Full NEFF compile + on-hardware execution. MLIR verification. Real perf numbers. | Nothing (this is the ground truth). |
+
+**Of the five NKI 0.3.0 migration breaking-changes trnblas navigated,
+four would surface on the `nki-simulator` gate.** Only the
+partition-broadcast strictness in `_mp2_energy_kernel` (MLIR-level
+verification) still requires the hardware round-trip. The gate isn't
+a perfect substitute for hardware, but it catches the 80% that cost
+the most AWS round-trips during design.
+
+Hardware (`scripts/run_neuron_tests.sh`, `scripts/run_simulator_tests.sh`)
+remains the final sign-off — in particular for any kernel that touches
+partition-dim broadcasting, PSUM→SBUF staging, or new `nc_matmul`
+patterns.
 
 ### Simulator limitations
 

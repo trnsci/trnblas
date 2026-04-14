@@ -40,8 +40,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   suite, marker `nki_simulator`. Skips unless
   `TRNBLAS_USE_SIMULATOR=1` + `nki` is importable.
 - `scripts/run_simulator_tests.sh` — SSM runner that runs the
-  simulator suite on the trn1 DLAMI. Future follow-up: host on
-  cheaper Linux instance or GH Actions `ubuntu-latest` runners.
+  simulator suite on the trn1 DLAMI.
+- **`nki-simulator` CI job on `ubuntu-latest`.** Runs the
+  `nki_simulator`-marked suite against `nki>=0.3.0` from the AWS
+  pip index (`--extra-index-url https://pip.repos.neuron.amazonaws.com`)
+  on every push + PR. Zero AWS cost for the correctness gate;
+  hardware SSM now reserved for perf + MLIR verification. Of the
+  five NKI 0.3.0 breaking-changes trnblas navigated, four would
+  have surfaced on this gate pre-merge. The fifth
+  (partition-broadcast strictness, MLIR-level) still requires
+  hardware — NKI 0.3.0 has no documented device-free NEFF compile
+  API. Main `test` matrix now excludes `-m nki_simulator` to avoid
+  running the suite twice.
 - `docs/developing_kernels.md` — kernel authoring guide: three
   dispatch modes (pytorch / hardware / simulator), simulator
   limitations, NKI 0.3.0 migration reference,
