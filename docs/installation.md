@@ -12,9 +12,31 @@ pip install trnblas
 pip install trnblas[neuron]
 ```
 
-This pulls in `neuronxcc` and `torch-neuronx`, which are only needed on
-Trainium/Inferentia instances. On CPU or GPU, trnblas falls back to
-`torch.matmul` automatically.
+This pulls in `nki`, `neuronxcc`, and `torch-neuronx`, which are only
+needed on Trainium/Inferentia instances. On CPU or GPU, trnblas falls
+back to `torch.matmul` automatically.
+
+The `nki` and `neuronxcc` wheels ship on the AWS pip index rather than
+PyPI. Pass `--extra-index-url` to pick them up:
+
+```bash
+pip install "trnblas[neuron]" \
+  --extra-index-url https://pip.repos.neuron.amazonaws.com
+```
+
+### Simulator-only install (CPU, no hardware)
+
+NKI 0.3.0 ships a CPU simulator (`nki.simulate(kernel)(numpy_args)`)
+that runs kernels without a Neuron device. The GH Actions `nki-simulator`
+job uses this install line; mirror it locally for fast kernel iteration:
+
+```bash
+pip install -e ".[dev]"
+pip install --extra-index-url https://pip.repos.neuron.amazonaws.com "nki>=0.3.0"
+```
+
+`torch-neuronx` is **not** required for the simulator path — dispatch
+routes NumPy directly through `nki.simulate` and bypasses `torch_xla`.
 
 ## With PySCF (real-molecule DF-MP2 validation)
 
@@ -41,6 +63,7 @@ pytest tests/ -v
 | Variable | Effect |
 |----------|--------|
 | `TRNBLAS_REQUIRE_NKI=1` | Re-raise on NKI kernel errors instead of silently falling back to `torch.matmul`. Useful in the validation suite to surface kernel breakage. Unset (default): kernel exceptions fall back to PyTorch. |
+| `TRNBLAS_USE_SIMULATOR=1` | Route kernel dispatch through `nki.simulate(kernel)(numpy_args)` on CPU. Bypasses `torch_xla` + NEFF compile; used for fast correctness iteration. Requires `nki>=0.3.0`. |
 
 ## Requirements
 
