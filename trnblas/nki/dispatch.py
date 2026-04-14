@@ -540,13 +540,20 @@ if HAS_NKI:
         partition=1, free=N (a 1D load is treated as partition=len,
         which would exceed the 128-partition limit for NVIR > 128).
 
-        **NKI 0.3.0 broadcast fix.** Partition-mismatched
+        **NKI 0.3.0 broadcast fix (M2.1a).** Partition-mismatched
         tensor-tensor arith (`(1,1) ⊕ (P_TILE,1)`, `(P_TILE,1) ⊕
-        (1,NVIR)`) is rejected by the MLIR verifier. `denom` is built
-        by lifting all three eps operands to `(P_TILE, NVIR)` via
-        `nl.broadcast_to` first, so every subsequent subtract sees
-        matching partition dims. This replaces the M1 pattern that
-        re-skipped the 5 MP2 tests during the 0.3.0 migration.
+        (1,NVIR)`) is rejected by the MLIR verifier. `denom` operands
+        are lifted to `(P_TILE, NVIR)` via `nl.broadcast_to` before
+        subtracting.
+
+        **Pair-invariant hoist (#31).** `ev_col + ev_row` — the part
+        of `denom` that doesn't depend on `(i, j)` — is precomputed
+        once per a-strip and stashed in an `(P_TILE, NSTRIP, NVIR)`
+        SBUF array before the pair loops. Inside the pair loop,
+        `denom = eo_sum_bc - denom_const[s]` is a single op instead
+        of the three-broadcast-plus-two-subtract chain from M2.1.
+        At large (IC=NOCC=96, NSTRIP=6), this turns ~276 000
+        scheduled denom ops into ~9 216 plus 6 setup ops.
 
         NKI only supports reduction along the free dim. A full
         `(P_TILE, NVIR) → scalar` reduce would need a partition-axis
@@ -572,13 +579,30 @@ if HAS_NKI:
         e_partial = nl.ndarray((P_TILE, IC, NOCC), dtype=nl.float32, buffer=nl.shared_hbm)
         # Full eps_vir as a free-dim vector (partition=1, free=NVIR)
         # for the per-b axis of denom.
-        ev_row = nl.load(eps_vir_row[0:1, 0:NVIR])
+        ev_row_bc = nl.broadcast_to(nl.load(eps_vir_row[0:1, 0:NVIR]), (P_TILE, NVIR))
+
+        # Precompute the pair-invariant part of denom per strip: for
+        # each a-strip s, denom_const[s] = ev_col(a_strip_s) + ev_row.
+        # Reused across all IC × NOCC = 96² = 9216 pairs at large.
+        # Storage: NSTRIP × P_TILE × NVIR × fp32 = 1.8 MB at large
+        # (well under the 48 MB SBUF budget).
+        # Inside the pair loop denom collapses from 5 ops (3 broadcasts
+        # + 2 subtracts) to 1 op: `eo_sum_bc - denom_const[s]`.
+        denom_const = nl.ndarray((P_TILE, NSTRIP, NVIR), dtype=nl.float32, buffer=nl.sbuf)
+        for s in nl.affine_range(NSTRIP):
+            a_off = s * P_TILE
+            ev_col_bc = nl.broadcast_to(
+                nl.load(eps_vir_col[a_off : a_off + P_TILE, 0:1]),
+                (P_TILE, NVIR),
+            )
+            denom_const[0:P_TILE, s, 0:NVIR] = nl.add(ev_col_bc, ev_row_bc)
 
         for i in nl.affine_range(IC):
             eo_i = nl.load(eps_occ_chunk[0:1, i : i + 1])
             for j in nl.affine_range(NOCC):
                 eo_j = nl.load(eps_occ_full[0:1, j : j + 1])
                 eo_sum = nl.add(eo_i, eo_j)
+                eo_sum_bc = nl.broadcast_to(eo_sum, (P_TILE, NVIR))
 
                 # Per-strip SBUF slots. Each affine_range iteration
                 # writes its own column; a single nl.sum over the
@@ -600,25 +624,12 @@ if HAS_NKI:
                             i * NVIR : (i + 1) * NVIR, j * NVIR + a_off : j * NVIR + a_off + P_TILE
                         ]
                     )
-                    # (P_TILE, 1) partition-axis load of eps_vir's
-                    # a-strip — matches the output axis of the (P_TILE,
-                    # NVIR) tile we're operating on.
-                    ev_col = nl.load(eps_vir_col[a_off : a_off + P_TILE, 0:1])
                     # denom[a, b] = eo_sum - ev_col[a] - ev_row[b]
-                    #
-                    # NKI 0.3.0 MLIR verifier rejects tensor-tensor
-                    # arithmetic when partition dims don't match (e.g.
-                    # `(1, 1) - (P_TILE, 1)` or `(P_TILE, 1) - (1, N)`).
-                    # Use `nl.broadcast_to` to explicitly lift every
-                    # operand to the target `(P_TILE, NVIR)` shape first,
-                    # then subtract at matching partition dims.
-                    eo_sum_bc = nl.broadcast_to(eo_sum, (P_TILE, NVIR))
-                    ev_col_bc = nl.broadcast_to(ev_col, (P_TILE, NVIR))
-                    ev_row_bc = nl.broadcast_to(ev_row, (P_TILE, NVIR))
-                    denom = nl.subtract(
-                        nl.subtract(eo_sum_bc, ev_col_bc),
-                        ev_row_bc,
-                    )
+                    #             = eo_sum_bc - denom_const[s, :, :]
+                    # One subtract replaces the M2.1 build-up of three
+                    # broadcasts + two subtracts. denom_const[s] is
+                    # pair-invariant; see the pre-loop precompute above.
+                    denom = nl.subtract(eo_sum_bc, denom_const[0:P_TILE, s, 0:NVIR])
                     # NKI 0.3.0 drops tensor-tensor nl.divide;
                     # substitute multiply × reciprocal.
                     term = nl.multiply(
