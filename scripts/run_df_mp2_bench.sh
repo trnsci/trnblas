@@ -5,21 +5,31 @@
 # Usage:
 #   AWS_PROFILE=aws ./scripts/run_df_mp2_bench.sh                 # all 3 shapes
 #   AWS_PROFILE=aws ./scripts/run_df_mp2_bench.sh --shape medium  # one shape
+#   AWS_PROFILE=aws ./scripts/run_df_mp2_bench.sh --compare       # torch vs --fused-energy, one session
 #   AWS_PROFILE=aws ./scripts/run_df_mp2_bench.sh trn2            # different instance
 #
 # Mirrors run_neuron_tests.sh: starts the tagged instance, runs the
 # bench, prints stdout/stderr, and stops the instance via trap.
 # The bench itself runs each shape twice (cold / warm cache) inside one
 # Python process — no need for a --warm flag at the script level.
+#
+# --compare runs the bench twice back-to-back in one SSM session: once
+# with the torch energy path, once with --fused-energy. Avoids a second
+# instance-start round-trip when doing A/B comparisons.
 
 set -euo pipefail
 
+COMPARE=0
 EXTRA_ARGS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --shape)
       EXTRA_ARGS+=("--shape" "$2")
       shift 2
+      ;;
+    --compare)
+      COMPARE=1
+      shift
       ;;
     trn1|trn2|inf2)
       INSTANCE_TYPE="$1"
@@ -88,13 +98,19 @@ if [[ "$PING" != "Online" ]]; then
   exit 1
 fi
 
-echo "Sending bench command (SHA=$SHA, args=$BENCH_ARGS)..."
+if [[ "$COMPARE" -eq 1 ]]; then
+  BENCH_INVOCATION="echo '--- torch path ---' && sudo -u ubuntu env PATH=\$NEURON_VENV/bin:/usr/bin:/bin \$NEURON_VENV/bin/python /home/ubuntu/trnblas/examples/df_mp2.py --bench $BENCH_ARGS && echo '--- fused path ---' && sudo -u ubuntu env PATH=\$NEURON_VENV/bin:/usr/bin:/bin \$NEURON_VENV/bin/python /home/ubuntu/trnblas/examples/df_mp2.py --bench --fused-energy $BENCH_ARGS"
+else
+  BENCH_INVOCATION="sudo -u ubuntu env PATH=\$NEURON_VENV/bin:/usr/bin:/bin \$NEURON_VENV/bin/python /home/ubuntu/trnblas/examples/df_mp2.py --bench $BENCH_ARGS"
+fi
+
+echo "Sending bench command (SHA=$SHA, args=$BENCH_ARGS, compare=$COMPARE)..."
 CMD_ID=$(aws ssm send-command \
   --instance-ids "$INSTANCE_ID" \
   --document-name "AWS-RunShellScript" \
   --comment "trnblas df_mp2 bench @ $SHA" \
   --parameters "commands=[
-    \"bash -c 'set -euo pipefail; cd /home/ubuntu/trnblas && sudo -u ubuntu git fetch --all && sudo -u ubuntu git checkout $SHA && NEURON_VENV=\$(ls -d /opt/aws_neuronx_venv_pytorch_* | head -1) && sudo -u ubuntu \$NEURON_VENV/bin/pip install -e /home/ubuntu/trnblas[dev] --quiet && sudo -u ubuntu env PATH=\$NEURON_VENV/bin:/usr/bin:/bin \$NEURON_VENV/bin/python /home/ubuntu/trnblas/examples/df_mp2.py --bench $BENCH_ARGS'\"
+    \"bash -c 'set -euo pipefail; cd /home/ubuntu/trnblas && sudo -u ubuntu git fetch --all && sudo -u ubuntu git checkout $SHA && NEURON_VENV=\$(ls -d /opt/aws_neuronx_venv_pytorch_* | head -1) && sudo -u ubuntu \$NEURON_VENV/bin/pip install -e /home/ubuntu/trnblas[dev] --quiet && $BENCH_INVOCATION'\"
   ]" \
   --region "$REGION" \
   --output text --query 'Command.CommandId')
