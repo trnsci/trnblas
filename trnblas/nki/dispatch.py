@@ -468,7 +468,10 @@ if HAS_NKI:
 
                     nisa.nc_matmul(dst=psum, stationary=a_t, moving=b_tile, accumulate=True)
 
-                c_sbuf = nl.copy(psum, dtype=a.dtype)
+                # PSUM → SBUF via tensor_copy (NKI 0.3.0 rejects
+                # dma_copy reading from PSUM; nl.copy returns a view).
+                c_sbuf = nl.ndarray((TILE_M, TILE_N), dtype=a.dtype, buffer=nl.sbuf)
+                nisa.tensor_copy(src=psum, dst=c_sbuf)
                 nl.store(
                     c[m_off : m_off + TILE_M, n_off : n_off + TILE_N],
                     value=c_sbuf,
@@ -625,7 +628,10 @@ if HAS_NKI:
                     a_mov = nl.load_transpose2d(a[n_off : n_off + TILE_N, k_off : k_off + TILE_K])
                     nisa.nc_matmul(dst=psum, stationary=a_stat, moving=a_mov, accumulate=True)
 
-                c_sbuf = nl.copy(psum, dtype=a.dtype)
+                # PSUM → SBUF via tensor_copy (NKI 0.3.0 rejects
+                # dma_copy reading from PSUM; nl.copy returns a view).
+                c_sbuf = nl.ndarray((TILE_M, TILE_N), dtype=a.dtype, buffer=nl.sbuf)
+                nisa.tensor_copy(src=psum, dst=c_sbuf)
                 nl.store(
                     c[m_off : m_off + TILE_M, n_off : n_off + TILE_N],
                     value=c_sbuf,
