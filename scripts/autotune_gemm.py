@@ -83,7 +83,7 @@ def _make_gemm_kernel(tile_m: int, tile_k: int, tile_n: int) -> Callable:
                     k_off = k * TILE_K
                     a_t = nl.load_transpose2d(a[m_off : m_off + TILE_M, k_off : k_off + TILE_K])
                     b_tile = nl.load(b[k_off : k_off + TILE_K, n_off : n_off + TILE_N])
-                    psum[...] += nisa.nc_matmul(a_t, moving=b_tile)
+                    psum[...] += nisa.nc_matmul(stationary=a_t, moving=b_tile)
                 c_sbuf = nl.copy(psum, dtype=a.dtype)
                 nl.store(c[m_off : m_off + TILE_M, n_off : n_off + TILE_N], value=c_sbuf)
         return c
