@@ -59,9 +59,9 @@ WARMS = 5  # per-config measurement passes after cold
 
 def _make_gemm_kernel(tile_m: int, tile_k: int, tile_n: int) -> Callable:
     """Factory: build a compiled NKI GEMM kernel for a specific tile tuple."""
-    import neuronxcc.nki as nki
-    import neuronxcc.nki.isa as nisa
-    import neuronxcc.nki.language as nl
+    import nki
+    import nki.isa as nisa
+    import nki.language as nl
 
     @nki.jit
     def _kernel(a, b):

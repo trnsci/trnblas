@@ -1,9 +1,11 @@
 """Probe NKI API surface + simulator availability.
 
 Run on an AWS Neuron DLAMI instance. Emits:
-- neuronxcc version
-- full nl.* / nisa.* symbol catalog (helps future kernels know what's available)
-- standalone `nki` package info if present
+- neuronxcc version (for diagnostics only — we don't import
+  neuronxcc.nki.*; trnblas migrated to standalone nki.* in NKI 0.3.0)
+- nki version
+- full nki.language.* / nki.isa.* symbol catalog (reference for
+  future kernels)
 - whether NKI_SIMULATOR=1 is live and what it does to the existing
   scripts/probe_nki.py (subprocess call)
 
@@ -42,31 +44,33 @@ def main() -> int:
     except ImportError:
         print("nki (standalone): not importable")
 
-    print("\n===== nl.* symbols =====")
+    print("\n===== nl.* symbols (via nki.language) =====")
     try:
-        import neuronxcc.nki.language as nl
+        import nki.language as nl
 
         names = sorted(n for n in dir(nl) if not n.startswith("_"))
         print(f"count: {len(names)}")
         print(json.dumps(names, indent=None))
     except ImportError as exc:
-        print(f"cannot import nl: {exc}")
+        print(f"cannot import nki.language: {exc}")
 
-    print("\n===== nisa.* symbols =====")
+    print("\n===== nisa.* symbols (via nki.isa) =====")
     try:
-        import neuronxcc.nki.isa as nisa
+        import nki.isa as nisa
 
         names = sorted(n for n in dir(nisa) if not n.startswith("_"))
         print(f"count: {len(names)}")
         print(json.dumps(names, indent=None))
     except ImportError as exc:
-        print(f"cannot import nisa: {exc}")
+        print(f"cannot import nki.isa: {exc}")
 
-    # Primitives our kernels depend on — confirm each still resolves.
+    # Primitives our kernels depend on — confirm each still resolves on the
+    # canonical nki.* namespace (NKI 0.3.0+). The neuronxcc.nki.* shim is
+    # not used.
     print("\n===== trnblas primitive presence check =====")
-    import neuronxcc.nki as _nki_root
-    import neuronxcc.nki.isa as nisa
-    import neuronxcc.nki.language as nl
+    import nki as _nki_root
+    import nki.isa as nisa
+    import nki.language as nl
 
     checks = {
         "@nki.jit": hasattr(_nki_root, "jit"),

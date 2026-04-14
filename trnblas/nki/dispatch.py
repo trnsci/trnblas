@@ -14,9 +14,9 @@ import warnings
 import torch
 
 try:
-    import neuronxcc.nki as nki
-    import neuronxcc.nki.isa as nisa
-    import neuronxcc.nki.language as nl
+    import nki
+    import nki.isa as nisa
+    import nki.language as nl
 
     HAS_NKI = True
 except ImportError:
@@ -66,7 +66,7 @@ def set_backend(backend: str):
     global _backend
     assert backend in ("auto", "pytorch", "nki")
     if backend == "nki" and not HAS_NKI:
-        raise RuntimeError("NKI backend requires neuronxcc")
+        raise RuntimeError("NKI backend requires nki>=0.3.0 (Neuron SDK 2.29+)")
     _backend = backend
 
 
