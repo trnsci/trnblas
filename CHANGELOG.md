@@ -7,7 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Migrated to NKI 0.3.0 / Neuron SDK 2.29.** Canonical `nki.*`
+  namespace; the legacy `neuronxcc.nki.*` shim is no longer used.
+  `[neuron]` extra now requires `nki>=0.3.0`. Kernels updated for
+  the NKI 0.3.0 breaking-change surface:
+  - `nc_matmul` → `nisa.nc_matmul(dst=, stationary=, moving=, accumulate=)`
+    (all kwargs; internal accumulate replaces external `psum[...] += ...`).
+  - `nl.copy(psum, ...)` returns a view; use `nl.ndarray + nisa.tensor_copy`
+    to move PSUM → SBUF before `nl.store`.
+  - Tensor-tensor `nl.divide` dropped; use `multiply × reciprocal`.
+  Kernels migrated: `_gemm_kernel`, `_syrk_kernel`, and the kernel
+  factory in `scripts/autotune_gemm.py`. 32 neuron tests pass.
+- `_mp2_energy_kernel` re-skipped pending #15 M2 redesign — NKI 0.3.0's
+  stricter tensor-tensor broadcast rules reject the current kernel's
+  `(1,1) - (P_TILE,1)` partition-dim pattern. M1 work (namespace +
+  free-dim reduction + partition-major HBM output) is preserved in
+  the kernel source; only the scalar-vs-partition subtract needs
+  rewriting.
+
 ### Added
+
+- **NKI CPU simulator dispatch** via `TRNBLAS_USE_SIMULATOR=1`.
+  Routes kernels through `nki.simulate(kernel)(numpy_args)` on CPU,
+  bypassing `torch_xla` + NEFF compile. Iteration loop drops from
+  ~8–12 min per cycle to seconds. `_nki_{gemm,syrk,mp2_energy}_impl`
+  all carry the simulator branch; `_nki_trsm_left` plumbs through
+  transitively via `nki_gemm`. Correctness-only — no perf modelling,
+  no SBUF capacity checks. See `docs/developing_kernels.md`.
+- `tests/test_nki_sim.py` — curated simulator-backed correctness
+  suite, marker `nki_simulator`. Skips unless
+  `TRNBLAS_USE_SIMULATOR=1` + `nki` is importable.
+- `scripts/run_simulator_tests.sh` — SSM runner that runs the
+  simulator suite on the trn1 DLAMI. Future follow-up: host on
+  cheaper Linux instance or GH Actions `ubuntu-latest` runners.
+- `docs/developing_kernels.md` — kernel authoring guide: three
+  dispatch modes (pytorch / hardware / simulator), simulator
+  limitations, NKI 0.3.0 migration reference,
+  architecture-exploitation design discipline.
+
+### Superseded by NKI 0.3.0 migration (history for completeness)
 
 - `nki_mp2_energy` M1 landed: kernel now correctly produces
   `(P_TILE, IC, NOCC)` per-partition partials on real NKI under

@@ -10,14 +10,19 @@ import trnblas
 
 trnblas.set_backend("auto")     # NKI on Trainium, PyTorch elsewhere (default)
 trnblas.set_backend("pytorch")  # force PyTorch fallback
-trnblas.set_backend("nki")      # force NKI (requires neuronxcc)
+trnblas.set_backend("nki")      # force NKI (requires nki>=0.3.0)
 ```
 
-`trnblas.HAS_NKI` is `True` when `neuronxcc` is importable.
+`trnblas.HAS_NKI` is `True` when the `nki` package (NKI 0.3.0+, Neuron
+SDK 2.29+) is importable. trnblas uses the canonical `nki.*`
+namespace directly; the legacy `neuronxcc.nki.*` shim is not used.
 
-Set `TRNBLAS_REQUIRE_NKI=1` in the environment to re-raise kernel
-exceptions instead of falling back to `torch.matmul` — useful in
-validation runs to surface silent breakage.
+## Environment variables
+
+| Variable | Effect |
+|---|---|
+| `TRNBLAS_REQUIRE_NKI=1` | Re-raise kernel exceptions instead of falling back to `torch.matmul` — surfaces silent breakage in validation runs. |
+| `TRNBLAS_USE_SIMULATOR=1` | Route kernel dispatch through `nki.simulate(kernel)(numpy_args)` on CPU. Bypasses `torch_xla` + NEFF compile; used for fast correctness iteration. See [docs/developing_kernels.md](../developing_kernels.md). |
 
 ## GEMM kernel
 

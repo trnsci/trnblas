@@ -8,6 +8,11 @@ import torch
 def pytest_configure(config):
     config.addinivalue_line("markers", "neuron: requires Neuron hardware")
     config.addinivalue_line("markers", "pyscf: requires PySCF (optional dep)")
+    config.addinivalue_line(
+        "markers",
+        "nki_simulator: runs NKI kernels via nki.simulate on CPU (requires "
+        "TRNBLAS_USE_SIMULATOR=1 + nki>=0.3.0)",
+    )
 
 
 @pytest.fixture
