@@ -39,6 +39,7 @@ def _energy_reduction(
     eps_vir: torch.Tensor,
     *,
     mem_budget_bytes: int = 1_500_000_000,
+    use_fused: bool = False,
 ) -> float:
     """MP2 energy from the metric-contracted three-index tensor B.
 
@@ -56,22 +57,30 @@ def _energy_reduction(
     i_block = max(1, min(nocc, int(mem_budget_bytes // bytes_per_i)))
 
     B_flat = B.reshape(nocc * nvir, naux).contiguous()
-    eps_o_pair = eps_occ.view(nocc, 1, 1, 1) + eps_occ.view(1, nocc, 1, 1)
-    eps_v_pair = eps_vir.view(1, 1, nvir, 1) + eps_vir.view(1, 1, 1, nvir)
 
-    # NB: trnblas.nki.nki_mp2_energy is a validated fused kernel covering
-    # this exact expression, but on trn1 it currently matches the torch
-    # path rather than beating it — the per-(i,j) dispatch/load chain
-    # swamps the compute savings. See #15 for the follow-up perf work.
+    # `use_fused`: route the per-chunk `(T * (2T - T.T) / denom).sum()`
+    # through `trnblas.nki.nki_mp2_energy`. Measured on trn1 (warm NEFF
+    # cache): ~1.48× speedup on the energy step at both medium and large
+    # DF-MP2 shapes — real improvement, but below the RFC's 3× bar, so
+    # the default path stays torch until a future #15 milestone hits it.
     e_mp2 = torch.zeros((), dtype=B.dtype, device=B.device)
+    if not use_fused:
+        eps_o_pair = eps_occ.view(nocc, 1, 1, 1) + eps_occ.view(1, nocc, 1, 1)
+        eps_v_pair = eps_vir.view(1, 1, nvir, 1) + eps_vir.view(1, 1, 1, nvir)
+
     for i_start in range(0, nocc, i_block):
         i_end = min(i_start + i_block, nocc)
         ic = i_end - i_start
         B_chunk = B_flat[i_start * nvir : i_end * nvir]  # (ic·nvir, naux)
         T_flat = trnblas.gemm(1.0, B_chunk, B_flat, transB=True)  # (ic·nvir, nocc·nvir)
-        T = T_flat.reshape(ic, nvir, nocc, nvir).permute(0, 2, 1, 3)
-        denom = eps_o_pair[i_start:i_end] - eps_v_pair
-        e_mp2 = e_mp2 + (T * (2.0 * T - T.transpose(-2, -1)) / denom).sum()
+        if use_fused:
+            e_mp2 = e_mp2 + trnblas.nki.nki_mp2_energy(
+                T_flat, eps_occ[i_start:i_end], eps_occ, eps_vir
+            )
+        else:
+            T = T_flat.reshape(ic, nvir, nocc, nvir).permute(0, 2, 1, 3)
+            denom = eps_o_pair[i_start:i_end] - eps_v_pair
+            e_mp2 = e_mp2 + (T * (2.0 * T - T.transpose(-2, -1)) / denom).sum()
     return float(e_mp2)
 
 
@@ -83,10 +92,13 @@ def df_mp2_energy(
     eps_occ: torch.Tensor,  # (nocc,) — occupied orbital energies
     eps_vir: torch.Tensor,  # (nvir,) — virtual orbital energies
     timings: dict | None = None,
+    use_fused: bool = False,
 ) -> float:
     """Compute DF-MP2 correlation energy.
 
     Returns E_MP2 (scalar). Optionally fills `timings` with per-step seconds.
+    When `use_fused=True`, the energy-reduction step routes through
+    `trnblas.nki.nki_mp2_energy`.
     """
     nbasis, nocc = C_occ.shape
     naux = J_metric.shape[0]
@@ -130,7 +142,7 @@ def df_mp2_energy(
     # over (i,j) needed — that was the wrong shape for this contraction.
     # For shapes where the full T_full doesn't fit HBM, chunk over i.
     t0 = time.perf_counter()
-    e_mp2 = _energy_reduction(B, eps_occ, eps_vir)
+    e_mp2 = _energy_reduction(B, eps_occ, eps_vir, use_fused=use_fused)
     t_energy = time.perf_counter() - t0
 
     if timings is not None:
@@ -183,7 +195,7 @@ _BENCH_SHAPES = {
 }
 
 
-def bench(shape_name: str, device: str = "cpu"):
+def bench(shape_name: str, device: str = "cpu", use_fused: bool = False):
     nbasis, nocc, naux = _BENCH_SHAPES[shape_name]
     nvir = nbasis - nocc
     flops = _flops(nbasis, nocc, naux)
@@ -191,13 +203,14 @@ def bench(shape_name: str, device: str = "cpu"):
 
     print(f"[shape={shape_name} nbasis={nbasis} nocc={nocc} nvir={nvir} naux={naux}]")
     print(
-        f"  approx flops: {flops / 1e9:.1f} G  backend: {trnblas.get_backend()}  device: {device}"
+        f"  approx flops: {flops / 1e9:.1f} G  backend: {trnblas.get_backend()}  "
+        f"device: {device}  fused_energy: {use_fused}"
     )
 
     for label in ("cold", "warm"):
         t = {}
         t0 = time.perf_counter()
-        e = df_mp2_energy(*inputs, timings=t)
+        e = df_mp2_energy(*inputs, timings=t, use_fused=use_fused)
         # Ensure async GPU work completes before stopping the timer.
         if device != "cpu" and torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -229,12 +242,18 @@ def main():
         "CPU by default; set cuda to benchmark against cuBLAS "
         "on an NVIDIA GPU instance.",
     )
+    parser.add_argument(
+        "--fused-energy",
+        action="store_true",
+        help="Route the energy-reduction step through trnblas.nki.nki_mp2_energy "
+        "(fused NKI kernel, #15 M2).",
+    )
     args = parser.parse_args()
 
     if args.bench:
         shapes = [args.shape] if args.shape else list(_BENCH_SHAPES)
         for s in shapes:
-            bench(s, device=args.device)
+            bench(s, device=args.device, use_fused=args.fused_energy)
         return
 
     if args.demo:
@@ -254,7 +273,7 @@ def main():
 
     timings: dict = {}
     t0 = time.perf_counter()
-    e_mp2 = df_mp2_energy(*inputs, timings=timings)
+    e_mp2 = df_mp2_energy(*inputs, timings=timings, use_fused=args.fused_energy)
     total = time.perf_counter() - t0
     for k, v in timings.items():
         print(f"  {k:15s}: {v:.3f}s")

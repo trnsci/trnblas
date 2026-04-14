@@ -26,6 +26,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   free-dim reduction + partition-major HBM output) is preserved in
   the kernel source; only the scalar-vs-partition subtract needs
   rewriting.
+- **#15 M2.1a — `_mp2_energy_kernel` broadcast correctness fix.**
+  `denom` construction now lifts all three eps operands to
+  `(P_TILE, NVIR)` via `nl.broadcast_to` before subtracting, so every
+  op sees matching partition dims. 5 `TestNkiKernel` MP2 cases
+  re-enabled (37/37 neuron tests pass on trn1). Same kernel
+  structure as M1 — same tile geometry, per-strip accumulator,
+  `(P_TILE, IC, NOCC)` output layout.
+- **#15 M2.2 — measured DF-MP2 perf on trn1 (warm NEFF cache).**
+  `trnblas.nki.nki_mp2_energy` now beats the torch reduction but
+  misses the RFC's 3–5× target:
+  - medium (nbasis=512, nocc=64, nvir=448): energy 8.03 s → 5.43 s
+    (**1.48×**); total 9.79 s → 7.29 s.
+  - large (nbasis=768, nocc=96, nvir=672): energy 44.57 s → 30.27 s
+    (**1.47×**); total 50.00 s → 35.76 s.
+  - Bit-parity with torch reference at `atol=1e-4, rtol=1e-4` at
+    both shapes.
+  Speedup ratio is roughly shape-invariant — per-(i,j) launch cost
+  scales with `nocc²` the same way torch does. RFC is updated to
+  "Shipped (M2.1)" status; perf follow-ups (larger free-dim tiles,
+  atomic-add variant, multi-engine pipeline evidence) tracked on
+  the same [#15](https://github.com/trnsci/trnblas/issues/15)
+  issue. `examples/df_mp2.py --fused-energy` exposes the kernel;
+  default path remains torch until a future milestone hits 3×.
+- `examples/df_mp2.py` — `--fused-energy` opt-in flag; threads
+  `use_fused` through `df_mp2_energy` / `_energy_reduction`.
+- `scripts/run_df_mp2_bench.sh` — `--compare` runs torch + fused
+  back-to-back in one SSM session for A/B perf measurement;
+  'stopping' instance state no longer blocks back-to-back runs.
 
 ### Added
 

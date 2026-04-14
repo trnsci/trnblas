@@ -62,12 +62,27 @@ divisor of `nvir` that is ≤ 128 (the NKI partition limit). All three
 DF-MP2 bench shapes (nvir = 112 / 448 / 672) share `P_TILE = 112`, so
 one compiled kernel serves all.
 
-**Returns:** `(ic, nocc)` fp32 tensor of per-(i,j) partials; caller
-reduces host-side via `.sum()`.
+**Returns:** `(P_TILE, ic, nocc)` fp32 tensor of per-partition partials;
+caller reduces host-side via `.sum()`.
 
 **Status:** on-hardware correctness validated across
-`nvir ∈ {8, 16, 64, 256, 448}` (all 5 tests pass on trn1). **Perf
-caveat:** at medium DF-MP2 shape the kernel matches (not beats) the
-torch reduction — per-(i,j) dispatch/load chain swamps the compute
-savings. Production `examples/df_mp2.py` keeps the torch path;
-further perf work tracked under [#15](https://github.com/trnsci/trnblas/issues/15).
+`nvir ∈ {8, 16, 64, 256, 448}` — all 5 tests pass on trn1 (under the
+NKI 0.3.0 MLIR verifier after the #15 M2 broadcast-fix commit
+[`c1769c6`](https://github.com/trnsci/trnblas/commit/c1769c6)).
+
+**Measured perf** (trn1.2xlarge, warm NEFF cache, SDK 2.29):
+
+| DF-MP2 shape | Energy step — torch | Energy step — fused | Speedup |
+|---|---:|---:|---:|
+| medium (nbasis=512, nocc=64, nvir=448) | 8.03 s | 5.43 s | **1.48×** |
+| large (nbasis=768, nocc=96, nvir=672) | 44.57 s | 30.27 s | **1.47×** |
+
+Bit-parity with the torch reference at both shapes (`atol=1e-4`,
+`rtol=1e-4`). The fused kernel beats torch consistently but the
+speedup ratio is roughly shape-invariant — per-(i,j) dispatch cost
+scales with `nocc²` same as the torch path, so the RFC's 3–5× target
+isn't hit. The remaining perf work (larger free-dim tiles, atomic-add
+variant, multi-engine pipeline evidence) is tracked under
+[#15](https://github.com/trnsci/trnblas/issues/15). Production
+`examples/df_mp2.py` exposes the kernel via `--fused-energy`; default
+remains the torch path until a future milestone hits the 3× bar.
