@@ -524,7 +524,7 @@ if HAS_NKI:
 
     @nki.jit
     def _mp2_energy_kernel(T_flat, eps_occ_chunk, eps_occ_full, eps_vir_col, eps_vir_row):
-        """Fused MP2 energy reduction (#15).
+        """Fused MP2 energy reduction (#15, M2 correctness fix).
 
         Computes Σ_{i<ic, j<nocc, a,b<nvir} T[i,j,a,b] *
         (2 T[i,j,a,b] - T[i,j,b,a]) / denom[i,j,a,b] where
@@ -540,12 +540,20 @@ if HAS_NKI:
         partition=1, free=N (a 1D load is treated as partition=len,
         which would exceed the 128-partition limit for NVIR > 128).
 
+        **NKI 0.3.0 broadcast fix.** Partition-mismatched
+        tensor-tensor arith (`(1,1) ⊕ (P_TILE,1)`, `(P_TILE,1) ⊕
+        (1,NVIR)`) is rejected by the MLIR verifier. `denom` is built
+        by lifting all three eps operands to `(P_TILE, NVIR)` via
+        `nl.broadcast_to` first, so every subsequent subtract sees
+        matching partition dims. This replaces the M1 pattern that
+        re-skipped the 5 MP2 tests during the 0.3.0 migration.
+
         NKI only supports reduction along the free dim. A full
         `(P_TILE, NVIR) → scalar` reduce would need a partition-axis
         reduce which NKI rejects. Instead: reduce free-only to get
         per-partition partials `(P_TILE, 1)`, accumulate across
         strips in an SBUF row-accumulator, emit
-        `(IC, NOCC, P_TILE)` to HBM — caller `.sum()` handles the
+        `(P_TILE, IC, NOCC)` to HBM — caller `.sum()` handles the
         final partition-axis reduction host-side (partial is small;
         ≤ 258 KB at large bench shape).
         """
@@ -594,15 +602,22 @@ if HAS_NKI:
                     )
                     # (P_TILE, 1) partition-axis load of eps_vir's
                     # a-strip — matches the output axis of the (P_TILE,
-                    # NVIR) tile we're operating on. No partition
-                    # reshape needed anywhere.
+                    # NVIR) tile we're operating on.
                     ev_col = nl.load(eps_vir_col[a_off : a_off + P_TILE, 0:1])
                     # denom[a, b] = eo_sum - ev_col[a] - ev_row[b]
-                    # Broadcast: (1,1) - (P_TILE,1) = (P_TILE,1);
-                    #            then - (1,NVIR) = (P_TILE,NVIR).
+                    #
+                    # NKI 0.3.0 MLIR verifier rejects tensor-tensor
+                    # arithmetic when partition dims don't match (e.g.
+                    # `(1, 1) - (P_TILE, 1)` or `(P_TILE, 1) - (1, N)`).
+                    # Use `nl.broadcast_to` to explicitly lift every
+                    # operand to the target `(P_TILE, NVIR)` shape first,
+                    # then subtract at matching partition dims.
+                    eo_sum_bc = nl.broadcast_to(eo_sum, (P_TILE, NVIR))
+                    ev_col_bc = nl.broadcast_to(ev_col, (P_TILE, NVIR))
+                    ev_row_bc = nl.broadcast_to(ev_row, (P_TILE, NVIR))
                     denom = nl.subtract(
-                        nl.subtract(eo_sum, ev_col),
-                        ev_row,
+                        nl.subtract(eo_sum_bc, ev_col_bc),
+                        ev_row_bc,
                     )
                     # NKI 0.3.0 drops tensor-tensor nl.divide;
                     # substitute multiply × reciprocal.

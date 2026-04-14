@@ -75,19 +75,13 @@ class TestTorchFallback:
 class TestNkiKernel:
     """On-hardware validation of the fused NKI kernel.
 
-    Skipped pending #15 M2 redesign. Under NKI 0.3.0's stricter
-    tensor-tensor arithmetic semantics, the current kernel's
-    partition-dim broadcasting (1 × P_TILE vs P_TILE × 1) hits
-    MLIR verification errors ('dst partition total elements N !=
-    rhs partition total elements M'). The kernel needs to be
-    rewritten with explicit partition alignment — scope of #15 M2.
-    Not in the production DF-MP2 path.
+    Re-enabled after the #15 M2 broadcast fix: `denom` construction
+    now lifts all eps operands to `(P_TILE, NVIR)` via
+    `nl.broadcast_to` before subtracting, satisfying the NKI 0.3.0
+    MLIR verifier's matching-partition-dim requirement.
     """
 
-    pytestmark = [
-        pytest.mark.neuron,
-        pytest.mark.skip(reason="partition broadcasting — #15 M2 redesign"),
-    ]
+    pytestmark = [pytest.mark.neuron]
 
     def test_small(self, nki_backend):
         T_flat, eo_c, eo_f, ev = _make_inputs(nocc=4, nvir=8, naux=16)
