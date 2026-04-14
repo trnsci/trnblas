@@ -561,12 +561,14 @@ if HAS_NKI:
                         nl.subtract(eo_sum, ev_col),
                         ev_row,
                     )
-                    term = nl.divide(
+                    # NKI 0.3.0 drops tensor-tensor nl.divide;
+                    # substitute multiply × reciprocal.
+                    term = nl.multiply(
                         nl.multiply(
                             t,
                             nl.subtract(nl.multiply(t, 2.0), t_T),
                         ),
-                        denom,
+                        nl.reciprocal(denom),
                     )
                     # Free-dim reduce: (P_TILE, NVIR) → (P_TILE, 1).
                     strip_partial = nl.sum(term, axis=1, keepdims=True)
