@@ -99,7 +99,10 @@ if [[ "$PING" != "Online" ]]; then
 fi
 
 if [[ "$COMPARE" -eq 1 ]]; then
-  BENCH_INVOCATION="echo '--- torch path ---' && sudo -u ubuntu env PATH=\$NEURON_VENV/bin:/usr/bin:/bin \$NEURON_VENV/bin/python /home/ubuntu/trnblas/examples/df_mp2.py --bench $BENCH_ARGS && echo '--- fused path ---' && sudo -u ubuntu env PATH=\$NEURON_VENV/bin:/usr/bin:/bin \$NEURON_VENV/bin/python /home/ubuntu/trnblas/examples/df_mp2.py --bench --fused-energy $BENCH_ARGS"
+  # No single quotes — the whole SSM command is wrapped in bash -c '...',
+  # so embedded single quotes would close the outer string and silently
+  # truncate output. printf is unambiguous across quoting layers.
+  BENCH_INVOCATION="printf %s\\\\n ==TORCH== && sudo -u ubuntu env PATH=\$NEURON_VENV/bin:/usr/bin:/bin \$NEURON_VENV/bin/python /home/ubuntu/trnblas/examples/df_mp2.py --bench $BENCH_ARGS && printf %s\\\\n ==FUSED== && sudo -u ubuntu env PATH=\$NEURON_VENV/bin:/usr/bin:/bin \$NEURON_VENV/bin/python /home/ubuntu/trnblas/examples/df_mp2.py --bench --fused-energy $BENCH_ARGS"
 else
   BENCH_INVOCATION="sudo -u ubuntu env PATH=\$NEURON_VENV/bin:/usr/bin:/bin \$NEURON_VENV/bin/python /home/ubuntu/trnblas/examples/df_mp2.py --bench $BENCH_ARGS"
 fi
