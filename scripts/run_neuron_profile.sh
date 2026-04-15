@@ -111,7 +111,9 @@ if [[ "$PROBE" -eq 1 ]]; then
   # reading more help text. show-session gives top-level metadata;
   # view --disable-ui ingests and produces parquet/json artifacts.
   LATEST_DIR=/home/ubuntu/profiles
-  BODY="LATEST=\$(ls -td $LATEST_DIR/run-*/ 2>/dev/null | head -1) && printf %s\\\\n ==LATEST== && echo \$LATEST && NTRACE=\$(find \$LATEST -name ntrace.pb | head -1) && printf %s\\\\n ==NTRACE== && echo \$NTRACE && printf %s\\\\n ==SHOW-SESSION== && ($NP show-session -s \$NTRACE 2>&1 || $NP show-session \$NTRACE 2>&1) | head -60 && printf %s\\\\n ==VIEW-INGEST== && SESSION_DIR=\$(dirname \$NTRACE) && echo session_dir=\$SESSION_DIR && $NP view --disable-ui -d \$SESSION_DIR --data-path /home/ubuntu/profile-data 2>&1 | head -60 && printf %s\\\\n ==PROFILE-DATA== && ls -laR /home/ubuntu/profile-data 2>/dev/null | head -50"
+  # Each stage runs independently (; not &&) with its own || true so a
+  # single failing attempt doesn't short-circuit the rest.
+  BODY="LATEST=\$(ls -td $LATEST_DIR/run-*/ 2>/dev/null | head -1); NTRACE=\$(find \$LATEST -name ntrace.pb | head -1); SESSION_DIR=\$(dirname \$NTRACE); printf %s\\\\n ==PATHS== ; echo latest=\$LATEST ; echo ntrace=\$NTRACE ; echo session_dir=\$SESSION_DIR ; printf %s\\\\n ==APT-TOOLS-VERSION== ; (dpkg -l aws-neuronx-tools 2>&1 | tail -3) || true ; printf %s\\\\n ==VIEW-INGEST== ; ($NP view --disable-ui -d \$SESSION_DIR --data-path /home/ubuntu/profile-data 2>&1 | head -40) || true ; printf %s\\\\n ==PROFILE-DATA== ; (ls -laR /home/ubuntu/profile-data 2>/dev/null | head -50) || true ; printf %s\\\\n ==NEURON-TOP-BATCH== ; (timeout 5 /opt/aws/neuron/bin/neuron-top -b 2>&1 | head -60) || true ; printf %s\\\\n ==NEURON-MONITOR-ONCE== ; (timeout 5 /opt/aws/neuron/bin/neuron-monitor 2>&1 | head -40) || true"
 else
   # neuron-profile inspect -o <dir> <userscript> runs the workload and
   # dumps profile artifacts. User has to be 'ubuntu' to match the
