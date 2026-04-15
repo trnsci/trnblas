@@ -113,7 +113,10 @@ if [[ "$PROBE" -eq 1 ]]; then
   LATEST_DIR=/home/ubuntu/profiles
   # Each stage runs independently (; not &&) with its own || true so a
   # single failing attempt doesn't short-circuit the rest.
-  BODY="LATEST=\$(ls -td $LATEST_DIR/run-*/ 2>/dev/null | head -1); NTRACE=\$(find \$LATEST -name ntrace.pb | head -1); SESSION_DIR=\$(dirname \$NTRACE); printf %s\\\\n ==PATHS== ; echo latest=\$LATEST ; echo ntrace=\$NTRACE ; echo session_dir=\$SESSION_DIR ; printf %s\\\\n ==APT-TOOLS-VERSION== ; (dpkg -l aws-neuronx-tools 2>&1 | tail -3) || true ; printf %s\\\\n ==VIEW-INGEST== ; ($NP view --disable-ui -d \$SESSION_DIR --data-path /home/ubuntu/profile-data 2>&1 | head -40) || true ; printf %s\\\\n ==PROFILE-DATA== ; (ls -laR /home/ubuntu/profile-data 2>/dev/null | head -50) || true ; printf %s\\\\n ==NEURON-TOP-BATCH== ; (timeout 5 /opt/aws/neuron/bin/neuron-top -b 2>&1 | head -60) || true ; printf %s\\\\n ==NEURON-MONITOR-ONCE== ; (timeout 5 /opt/aws/neuron/bin/neuron-monitor 2>&1 | head -40) || true"
+  # sudo -u ubuntu to get a proper HOME (the tool needs it), and run
+  # view --disable-ui --ingest-only so it populates the data-path and
+  # exits instead of blocking on the web UI.
+  BODY="LATEST=\$(ls -td $LATEST_DIR/run-*/ 2>/dev/null | head -1); NTRACE=\$(find \$LATEST -name ntrace.pb | head -1); SESSION_DIR=\$(dirname \$NTRACE); printf %s\\\\n ==PATHS== ; echo latest=\$LATEST ; echo ntrace=\$NTRACE ; echo session_dir=\$SESSION_DIR ; printf %s\\\\n ==VIEW-INGEST== ; sudo -u ubuntu mkdir -p /home/ubuntu/profile-data ; (sudo -u ubuntu -E env HOME=/home/ubuntu PATH=\$NEURON_VENV/bin:/opt/aws/neuron/bin:/usr/bin:/bin $NP view --disable-ui --ingest-only -d \$SESSION_DIR --data-path /home/ubuntu/profile-data 2>&1 | head -40) || true ; printf %s\\\\n ==PROFILE-DATA== ; (ls -laR /home/ubuntu/profile-data 2>/dev/null | head -50) || true"
 else
   # neuron-profile inspect -o <dir> <userscript> runs the workload and
   # dumps profile artifacts. User has to be 'ubuntu' to match the
