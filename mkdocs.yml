@@ -30,6 +30,7 @@ nav:
       - Developing NKI kernels: developing_kernels.md
   - Design:
       - Fused DF-MP2 pair-energy kernel (Phase 3 RFC): design/fused_df_mp2_energy_kernel.md
+      - MP2 energy kernel profile findings (#33): design/mp2_energy_profile_findings.md
   - Benchmarks: benchmarks.md
   - Deployment:
       - AWS Setup for Neuron CI: aws_setup.md
