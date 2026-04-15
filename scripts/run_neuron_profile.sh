@@ -107,12 +107,11 @@ fi
 NP="/opt/aws/neuron/bin/neuron-profile"
 
 if [[ "$PROBE" -eq 1 ]]; then
-  # neuron-profile 2.29 subcommands: capture, inspect, show-session, view.
-  # Capture produces ntrace.pb + trace_info.pb. To extract a text summary
-  # without launching the web UI, probe view's --disable-ui / --ingest-only
-  # modes + show-session.
-  LATEST=/home/ubuntu/profiles
-  BODY="printf %s\\\\n ==VIEW-HELP== && COLUMNS=160 $NP view --help 2>&1 | head -80 && printf %s\\\\n ==SHOW-SESSION-HELP== && COLUMNS=160 $NP show-session --help 2>&1 | head -40 && printf %s\\\\n ==LATEST-PROFILES== && ls -td $LATEST/*/ 2>/dev/null | head -5"
+  # Try extraction directly on the latest captured trace rather than
+  # reading more help text. show-session gives top-level metadata;
+  # view --disable-ui ingests and produces parquet/json artifacts.
+  LATEST_DIR=/home/ubuntu/profiles
+  BODY="LATEST=\$(ls -td $LATEST_DIR/run-*/ 2>/dev/null | head -1) && printf %s\\\\n ==LATEST== && echo \$LATEST && NTRACE=\$(find \$LATEST -name ntrace.pb | head -1) && printf %s\\\\n ==NTRACE== && echo \$NTRACE && printf %s\\\\n ==SHOW-SESSION== && ($NP show-session -s \$NTRACE 2>&1 || $NP show-session \$NTRACE 2>&1) | head -60 && printf %s\\\\n ==VIEW-INGEST== && SESSION_DIR=\$(dirname \$NTRACE) && echo \"session_dir=\$SESSION_DIR\" && $NP view --disable-ui -d \$SESSION_DIR --data-path /home/ubuntu/profile-data 2>&1 | head -60 && printf %s\\\\n ==PROFILE-DATA== && ls -laR /home/ubuntu/profile-data 2>/dev/null | head -50"
 else
   # neuron-profile inspect -o <dir> <userscript> runs the workload and
   # dumps profile artifacts. User has to be 'ubuntu' to match the
