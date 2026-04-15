@@ -111,7 +111,7 @@ if [[ "$PROBE" -eq 1 ]]; then
   # reading more help text. show-session gives top-level metadata;
   # view --disable-ui ingests and produces parquet/json artifacts.
   LATEST_DIR=/home/ubuntu/profiles
-  BODY="LATEST=\$(ls -td $LATEST_DIR/run-*/ 2>/dev/null | head -1) && printf %s\\\\n ==LATEST== && echo \$LATEST && NTRACE=\$(find \$LATEST -name ntrace.pb | head -1) && printf %s\\\\n ==NTRACE== && echo \$NTRACE && printf %s\\\\n ==SHOW-SESSION== && ($NP show-session -s \$NTRACE 2>&1 || $NP show-session \$NTRACE 2>&1) | head -60 && printf %s\\\\n ==VIEW-INGEST== && SESSION_DIR=\$(dirname \$NTRACE) && echo \"session_dir=\$SESSION_DIR\" && $NP view --disable-ui -d \$SESSION_DIR --data-path /home/ubuntu/profile-data 2>&1 | head -60 && printf %s\\\\n ==PROFILE-DATA== && ls -laR /home/ubuntu/profile-data 2>/dev/null | head -50"
+  BODY="LATEST=\$(ls -td $LATEST_DIR/run-*/ 2>/dev/null | head -1) && printf %s\\\\n ==LATEST== && echo \$LATEST && NTRACE=\$(find \$LATEST -name ntrace.pb | head -1) && printf %s\\\\n ==NTRACE== && echo \$NTRACE && printf %s\\\\n ==SHOW-SESSION== && ($NP show-session -s \$NTRACE 2>&1 || $NP show-session \$NTRACE 2>&1) | head -60 && printf %s\\\\n ==VIEW-INGEST== && SESSION_DIR=\$(dirname \$NTRACE) && echo session_dir=\$SESSION_DIR && $NP view --disable-ui -d \$SESSION_DIR --data-path /home/ubuntu/profile-data 2>&1 | head -60 && printf %s\\\\n ==PROFILE-DATA== && ls -laR /home/ubuntu/profile-data 2>/dev/null | head -50"
 else
   # neuron-profile inspect -o <dir> <userscript> runs the workload and
   # dumps profile artifacts. User has to be 'ubuntu' to match the
