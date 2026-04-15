@@ -107,9 +107,11 @@ fi
 NP="/opt/aws/neuron/bin/neuron-profile"
 
 if [[ "$PROBE" -eq 1 ]]; then
-  BODY="printf %s\\\\n ==NEURON-PROFILE-HELP== && $NP --help 2>&1 && printf %s\\\\n ==CAPTURE-HELP== && $NP capture --help 2>&1 && printf %s\\\\n ==VIEW-HELP== && $NP view --help 2>&1 || true"
+  # Use a fixed column width so SSM's terminal-width heuristic doesn't
+  # mangle the help output. Focus on the subcommand list only.
+  BODY="printf %s\\\\n ==TOP-HELP== && COLUMNS=160 $NP --help 2>&1 | head -60 && printf %s\\\\n ==CAPTURE-HELP== && COLUMNS=160 $NP capture --help 2>&1 | head -80"
 else
-  BODY="printf %s\\\\n ==CAPTURE== && mkdir -p /home/ubuntu/profiles && chown ubuntu:ubuntu /home/ubuntu/profiles && NAME=trnblas-mp2-\$(date +%s) && sudo -u ubuntu env PATH=\$NEURON_VENV/bin:/opt/aws/neuron/bin:/usr/bin:/bin $NP capture -n \$NAME -s \"\$NEURON_VENV/bin/python /home/ubuntu/trnblas/examples/df_mp2.py --bench --fused-energy $BENCH_ARGS\" -o /home/ubuntu/profiles 2>&1 | tail -40 && printf %s\\\\n ==SHOW== && ls -la /home/ubuntu/profiles/ && $NP view /home/ubuntu/profiles/*.ntff 2>&1 | head -200 || true"
+  BODY="printf %s\\\\n ==CAPTURE== && mkdir -p /home/ubuntu/profiles && chown ubuntu:ubuntu /home/ubuntu/profiles && NAME=trnblas-mp2-\$(date +%s) && sudo -u ubuntu env PATH=\$NEURON_VENV/bin:/opt/aws/neuron/bin:/usr/bin:/bin $NP capture -n \$NAME -s \"\$NEURON_VENV/bin/python /home/ubuntu/trnblas/examples/df_mp2.py --bench --fused-energy $BENCH_ARGS\" -o /home/ubuntu/profiles 2>&1 | tail -40 && printf %s\\\\n ==ARTIFACTS== && ls -la /home/ubuntu/profiles/"
 fi
 
 echo "Sending profile command (SHA=$SHA, probe=$PROBE, args=$BENCH_ARGS)..."
