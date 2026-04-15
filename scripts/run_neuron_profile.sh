@@ -107,11 +107,17 @@ fi
 NP="/opt/aws/neuron/bin/neuron-profile"
 
 if [[ "$PROBE" -eq 1 ]]; then
-  # Use a fixed column width so SSM's terminal-width heuristic doesn't
-  # mangle the help output. Focus on the subcommand list only.
-  BODY="printf %s\\\\n ==TOP-HELP== && COLUMNS=160 $NP --help 2>&1 | head -60 && printf %s\\\\n ==CAPTURE-HELP== && COLUMNS=160 $NP capture --help 2>&1 | head -80"
+  # neuron-profile 2.29 subcommands: capture, inspect, show-session, view.
+  # `capture -n <neff>` takes a pre-compiled NEFF — not a Python script;
+  # so the path for profiling an end-to-end Python workload is either
+  # `inspect` or the runtime-hooked `NEURON_PROFILE=/dir python ...`
+  # env-var convention. Probe both to choose.
+  BODY="printf %s\\\\n ==INSPECT-HELP== && COLUMNS=160 $NP inspect --help 2>&1 | head -80"
 else
-  BODY="printf %s\\\\n ==CAPTURE== && mkdir -p /home/ubuntu/profiles && chown ubuntu:ubuntu /home/ubuntu/profiles && NAME=trnblas-mp2-\$(date +%s) && sudo -u ubuntu env PATH=\$NEURON_VENV/bin:/opt/aws/neuron/bin:/usr/bin:/bin $NP capture -n \$NAME -s \"\$NEURON_VENV/bin/python /home/ubuntu/trnblas/examples/df_mp2.py --bench --fused-energy $BENCH_ARGS\" -o /home/ubuntu/profiles 2>&1 | tail -40 && printf %s\\\\n ==ARTIFACTS== && ls -la /home/ubuntu/profiles/"
+  # Runtime-hooked approach: NEURON_PROFILE=<dir> python workload.py causes
+  # the Neuron runtime to dump profile artifacts into <dir> automatically
+  # as the workload executes. Lower barrier than capture-with-NEFF.
+  BODY="printf %s\\\\n ==SETUP== && mkdir -p /home/ubuntu/profiles && chown -R ubuntu:ubuntu /home/ubuntu/profiles && PROFILE_DIR=/home/ubuntu/profiles/run-\$(date +%s) && mkdir -p \$PROFILE_DIR && chown ubuntu:ubuntu \$PROFILE_DIR && printf %s\\\\n ==RUN== && sudo -u ubuntu env PATH=\$NEURON_VENV/bin:/opt/aws/neuron/bin:/usr/bin:/bin NEURON_PROFILE=\$PROFILE_DIR \$NEURON_VENV/bin/python /home/ubuntu/trnblas/examples/df_mp2.py --bench --fused-energy $BENCH_ARGS 2>&1 | tail -30 && printf %s\\\\n ==ARTIFACTS== && ls -laR \$PROFILE_DIR | head -50"
 fi
 
 echo "Sending profile command (SHA=$SHA, probe=$PROBE, args=$BENCH_ARGS)..."
