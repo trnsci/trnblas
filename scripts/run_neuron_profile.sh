@@ -108,11 +108,11 @@ NP="/opt/aws/neuron/bin/neuron-profile"
 
 if [[ "$PROBE" -eq 1 ]]; then
   # neuron-profile 2.29 subcommands: capture, inspect, show-session, view.
-  # `capture -n <neff>` takes a pre-compiled NEFF — not a Python script;
-  # so the path for profiling an end-to-end Python workload is either
-  # `inspect` or the runtime-hooked `NEURON_PROFILE=/dir python ...`
-  # env-var convention. Probe both to choose.
-  BODY="printf %s\\\\n ==INSPECT-HELP== && COLUMNS=160 $NP inspect --help 2>&1 | head -80"
+  # Capture produces ntrace.pb + trace_info.pb. To extract a text summary
+  # without launching the web UI, probe view's --disable-ui / --ingest-only
+  # modes + show-session.
+  LATEST=/home/ubuntu/profiles
+  BODY="printf %s\\\\n ==VIEW-HELP== && COLUMNS=160 $NP view --help 2>&1 | head -80 && printf %s\\\\n ==SHOW-SESSION-HELP== && COLUMNS=160 $NP show-session --help 2>&1 | head -40 && printf %s\\\\n ==LATEST-PROFILES== && ls -td $LATEST/*/ 2>/dev/null | head -5"
 else
   # neuron-profile inspect -o <dir> <userscript> runs the workload and
   # dumps profile artifacts. User has to be 'ubuntu' to match the
