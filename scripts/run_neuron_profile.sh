@@ -1,33 +1,38 @@
 #!/usr/bin/env bash
 #
 # Capture a Neuron profiler trace of the df_mp2 --fused-energy bench
-# on the trnblas CI instance via SSM. Used to diagnose where the
-# ~30 s/chunk wall time goes inside _mp2_energy_kernel (#33).
+# on the trnblas CI instance via SSM.
 #
 # Usage:
 #   AWS_PROFILE=aws ./scripts/run_neuron_profile.sh                # medium
 #   AWS_PROFILE=aws ./scripts/run_neuron_profile.sh --shape medium
-#   AWS_PROFILE=aws ./scripts/run_neuron_profile.sh --probe        # print
-#                                                                  # neuron-profile --help
-#                                                                  # then exit
 #
-# Leaves raw `.ntff` on the instance under /home/ubuntu/profiles/
-# and retrieves the text-format `neuron-profile show` summary via
-# SSM stdout.
+# ## Status (2026-04-14, #33)
+#
+# Capture works — `neuron-profile inspect -o <dir> <userscript>` dumps
+# `ntrace.pb` + `trace_info.pb` on the instance. Extraction to anything
+# human-readable is blocked on the Neuron 2.29 DLAMI:
+#
+#   - `neuron-profile view --disable-ui --ingest-only` requires InfluxDB
+#     to be set up as the timeseries store. The DLAMI doesn't pre-install
+#     it.
+#   - `neuron-profile show-session` rejects the trace-format version the
+#     capturer produces (v130 — tool only supports v1–6 in the same
+#     2.29.18.0-d5fe7ba42 release).
+#
+# This script leaves the capture on disk under /home/ubuntu/profiles/
+# for later analysis once either InfluxDB is available or a newer
+# aws-neuronx-tools release lands. See
+# docs/design/mp2_energy_profile_findings.md for the full write-up.
 
 set -euo pipefail
 
-PROBE=0
 EXTRA_ARGS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --shape)
       EXTRA_ARGS+=("--shape" "$2")
       shift 2
-      ;;
-    --probe)
-      PROBE=1
-      shift
       ;;
     trn1|trn2|inf2)
       INSTANCE_TYPE="$1"
@@ -47,6 +52,8 @@ SHA="$(git rev-parse HEAD)"
 BENCH_ARGS="${EXTRA_ARGS[*]:---shape medium}"
 
 : "${AWS_PROFILE:?Set AWS_PROFILE, e.g. AWS_PROFILE=aws ./scripts/run_neuron_profile.sh}"
+
+NP="/opt/aws/neuron/bin/neuron-profile"
 
 echo "Looking up instance with Name=$TAG in $REGION..."
 INSTANCE_ID=$(aws ec2 describe-instances \
@@ -101,30 +108,9 @@ if [[ "$PING" != "Online" ]]; then
   exit 1
 fi
 
-# Body command depends on --probe. In either case we always print
-# `neuron-profile --help` at the top so the log pin-points CLI
-# surface differences before any capture is attempted.
-NP="/opt/aws/neuron/bin/neuron-profile"
+BODY="printf %s\\\\n ==CAPTURE== && mkdir -p /home/ubuntu/profiles && chown -R ubuntu:ubuntu /home/ubuntu/profiles && PROFILE_DIR=/home/ubuntu/profiles/run-\$(date +%s) && sudo -u ubuntu mkdir -p \$PROFILE_DIR && sudo -u ubuntu env PATH=\$NEURON_VENV/bin:/opt/aws/neuron/bin:/usr/bin:/bin $NP inspect -o \$PROFILE_DIR \$NEURON_VENV/bin/python /home/ubuntu/trnblas/examples/df_mp2.py --bench --fused-energy $BENCH_ARGS 2>&1 | tail -40 && printf %s\\\\n ==ARTIFACTS== && ls -laR \$PROFILE_DIR 2>&1 | head -30 && printf %s\\\\n ==NOTE== && echo 'Raw ntrace.pb captured. Extraction via neuron-profile view requires InfluxDB setup on the instance (not pre-installed).'"
 
-if [[ "$PROBE" -eq 1 ]]; then
-  # Try extraction directly on the latest captured trace rather than
-  # reading more help text. show-session gives top-level metadata;
-  # view --disable-ui ingests and produces parquet/json artifacts.
-  LATEST_DIR=/home/ubuntu/profiles
-  # Each stage runs independently (; not &&) with its own || true so a
-  # single failing attempt doesn't short-circuit the rest.
-  # sudo -u ubuntu to get a proper HOME (the tool needs it), and run
-  # view --disable-ui --ingest-only so it populates the data-path and
-  # exits instead of blocking on the web UI.
-  BODY="LATEST=\$(ls -td $LATEST_DIR/run-*/ 2>/dev/null | head -1); NTRACE=\$(find \$LATEST -name ntrace.pb | head -1); SESSION_DIR=\$(dirname \$NTRACE); printf %s\\\\n ==PATHS== ; echo latest=\$LATEST ; echo ntrace=\$NTRACE ; echo session_dir=\$SESSION_DIR ; printf %s\\\\n ==VIEW-INGEST== ; sudo -u ubuntu mkdir -p /home/ubuntu/profile-data ; (sudo -u ubuntu -E env HOME=/home/ubuntu PATH=\$NEURON_VENV/bin:/opt/aws/neuron/bin:/usr/bin:/bin $NP view --disable-ui --ingest-only -d \$SESSION_DIR --data-path /home/ubuntu/profile-data 2>&1 | head -40) || true ; printf %s\\\\n ==PROFILE-DATA== ; (ls -laR /home/ubuntu/profile-data 2>/dev/null | head -50) || true"
-else
-  # neuron-profile inspect -o <dir> <userscript> runs the workload and
-  # dumps profile artifacts. User has to be 'ubuntu' to match the
-  # container / venv ownership; sudo into ubuntu with the right PATH.
-  BODY="printf %s\\\\n ==SETUP== && mkdir -p /home/ubuntu/profiles && chown -R ubuntu:ubuntu /home/ubuntu/profiles && PROFILE_DIR=/home/ubuntu/profiles/run-\$(date +%s) && sudo -u ubuntu mkdir -p \$PROFILE_DIR && printf %s\\\\n ==RUN== && sudo -u ubuntu env PATH=\$NEURON_VENV/bin:/opt/aws/neuron/bin:/usr/bin:/bin $NP inspect -o \$PROFILE_DIR \$NEURON_VENV/bin/python /home/ubuntu/trnblas/examples/df_mp2.py --bench --fused-energy $BENCH_ARGS 2>&1 | tail -40 && printf %s\\\\n ==ARTIFACTS== && ls -laR \$PROFILE_DIR 2>&1 | head -80"
-fi
-
-echo "Sending profile command (SHA=$SHA, probe=$PROBE, args=$BENCH_ARGS)..."
+echo "Sending profile command (SHA=$SHA, args=$BENCH_ARGS)..."
 CMD_ID=$(aws ssm send-command \
   --instance-ids "$INSTANCE_ID" \
   --document-name "AWS-RunShellScript" \
