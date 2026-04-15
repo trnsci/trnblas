@@ -114,10 +114,10 @@ if [[ "$PROBE" -eq 1 ]]; then
   # env-var convention. Probe both to choose.
   BODY="printf %s\\\\n ==INSPECT-HELP== && COLUMNS=160 $NP inspect --help 2>&1 | head -80"
 else
-  # Runtime-hooked approach: NEURON_PROFILE=<dir> python workload.py causes
-  # the Neuron runtime to dump profile artifacts into <dir> automatically
-  # as the workload executes. Lower barrier than capture-with-NEFF.
-  BODY="printf %s\\\\n ==SETUP== && mkdir -p /home/ubuntu/profiles && chown -R ubuntu:ubuntu /home/ubuntu/profiles && PROFILE_DIR=/home/ubuntu/profiles/run-\$(date +%s) && mkdir -p \$PROFILE_DIR && chown ubuntu:ubuntu \$PROFILE_DIR && printf %s\\\\n ==RUN== && sudo -u ubuntu env PATH=\$NEURON_VENV/bin:/opt/aws/neuron/bin:/usr/bin:/bin NEURON_PROFILE=\$PROFILE_DIR \$NEURON_VENV/bin/python /home/ubuntu/trnblas/examples/df_mp2.py --bench --fused-energy $BENCH_ARGS 2>&1 | tail -30 && printf %s\\\\n ==ARTIFACTS== && ls -laR \$PROFILE_DIR | head -50"
+  # neuron-profile inspect -o <dir> <userscript> runs the workload and
+  # dumps profile artifacts. User has to be 'ubuntu' to match the
+  # container / venv ownership; sudo into ubuntu with the right PATH.
+  BODY="printf %s\\\\n ==SETUP== && mkdir -p /home/ubuntu/profiles && chown -R ubuntu:ubuntu /home/ubuntu/profiles && PROFILE_DIR=/home/ubuntu/profiles/run-\$(date +%s) && sudo -u ubuntu mkdir -p \$PROFILE_DIR && printf %s\\\\n ==RUN== && sudo -u ubuntu env PATH=\$NEURON_VENV/bin:/opt/aws/neuron/bin:/usr/bin:/bin $NP inspect -o \$PROFILE_DIR \$NEURON_VENV/bin/python /home/ubuntu/trnblas/examples/df_mp2.py --bench --fused-energy $BENCH_ARGS 2>&1 | tail -40 && printf %s\\\\n ==ARTIFACTS== && ls -laR \$PROFILE_DIR 2>&1 | head -80"
 fi
 
 echo "Sending profile command (SHA=$SHA, probe=$PROBE, args=$BENCH_ARGS)..."
