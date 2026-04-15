@@ -105,7 +105,7 @@ fi
 # `neuron-profile --help` at the top so the log pin-points CLI
 # surface differences before any capture is attempted.
 if [[ "$PROBE" -eq 1 ]]; then
-  BODY="printf %s\\\\n ==NEURON-PROFILE-HELP== && neuron-profile --help 2>&1 | head -40 && printf %s\\\\n ==VERSION== && (neuron-profile --version 2>&1 || true)"
+  BODY="printf %s\\\\n ==SEARCH-BINARIES== && ls /opt/aws/neuron/bin/ 2>&1 && printf %s\\\\n ==PACKAGES== && (dpkg -l | grep -i neuron 2>&1 || true) && printf %s\\\\n ==FIND-NEURON-PROFILE== && find /opt /usr/local 2>/dev/null -name 'neuron-profile*' && printf %s\\\\n ==FIND-NEURON-TOP== && find /opt /usr/local 2>/dev/null -name 'neuron-top*' && printf %s\\\\n ==FIND-IN-VENV== && NEURON_VENV=\$(ls -d /opt/aws_neuronx_venv_pytorch_* | head -1) && ls \$NEURON_VENV/bin/ | grep -i 'neuron\\\\|profile' 2>&1"
 else
   BODY="printf %s\\\\n ==NEURON-PROFILE-HELP== && neuron-profile --help 2>&1 | head -40 && printf %s\\\\n ==CAPTURE== && mkdir -p /home/ubuntu/profiles && cd /home/ubuntu/trnblas && sudo -u ubuntu mkdir -p /home/ubuntu/profiles && sudo -u ubuntu env PATH=\$NEURON_VENV/bin:/usr/bin:/bin NEURON_CC_FLAGS= neuron-profile capture -n trnblas-mp2-\$(date +%s) -s \"\$NEURON_VENV/bin/python /home/ubuntu/trnblas/examples/df_mp2.py --bench --fused-energy $BENCH_ARGS\" -o /home/ubuntu/profiles && printf %s\\\\n ==SHOW== && ls -la /home/ubuntu/profiles/ && sudo -u ubuntu neuron-profile show /home/ubuntu/profiles/*.ntff 2>&1 | head -200"
 fi
