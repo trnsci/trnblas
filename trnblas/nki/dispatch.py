@@ -95,7 +95,7 @@ _TILE_CANDIDATES: list[tuple[int, int, int]] = [
     (128, 128, 256),
     (128, 128, 512),
 ]
-# Registry: tile config → cached @nki.jit kernel closure.
+# Registry: tile config → @nki.jit kernel (populated at import time in if HAS_NKI block).
 _gemm_kernel_registry: dict[tuple[int, int, int], Any] = {}
 # Persistent autotune results: shape bucket → winning tile config.
 _autotune_mem: dict[tuple[int, int, int], tuple[int, int, int]] = {}
@@ -400,44 +400,21 @@ def _to_xla(*tensors):
     return [t.to(device) for t in tensors], orig
 
 
-def _make_gemm_kernel(tile_m: int, tile_k: int, tile_n: int):
-    """Return a new @nki.jit GEMM kernel with tile_m/tile_k/tile_n baked into
-    the closure at trace time.  Each unique config produces a separately-cached
-    NEFF; the XLA/NEFF cache amortises compile across the nocc² pair loop.
-    Only callable when HAS_NKI is True.
-    """
-    tm, tk, tn = tile_m, tile_k, tile_n
-
-    def _kernel(a, b):
-        M, K = a.shape
-        _, N = b.shape
-        TILE_M = tm
-        TILE_K = tk
-        TILE_N = tn if tn < N else N  # single-tile shortcut when N fits
-        c = nl.ndarray((M, N), dtype=a.dtype, buffer=nl.shared_hbm)
-        for m in nl.affine_range(M // TILE_M):
-            for n in nl.affine_range(N // TILE_N):
-                m_off = m * TILE_M
-                n_off = n * TILE_N
-                psum = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
-                for k in nl.affine_range(K // TILE_K):
-                    k_off = k * TILE_K
-                    a_t = nl.load_transpose2d(a[m_off : m_off + TILE_M, k_off : k_off + TILE_K])
-                    b_tile = nl.load(b[k_off : k_off + TILE_K, n_off : n_off + TILE_N])
-                    nisa.nc_matmul(dst=psum, stationary=a_t, moving=b_tile, accumulate=True)
-                c_sbuf = nl.ndarray((TILE_M, TILE_N), dtype=a.dtype, buffer=nl.sbuf)
-                nisa.tensor_copy(src=psum, dst=c_sbuf)
-                nl.store(c[m_off : m_off + TILE_M, n_off : n_off + TILE_N], value=c_sbuf)
-        return c
-
-    return nki.jit(_kernel)
-
-
 def _get_gemm_kernel(tile_m: int, tile_k: int, tile_n: int):
-    """Return (possibly cached) @nki.jit kernel for the given tile config."""
+    """Return the @nki.jit kernel for the given tile config.
+
+    NKI's AST-based compiler resolves names from source rather than following
+    Python closure chains, so tile constants must be literal integers baked
+    into each kernel's function body at definition time.  All six candidates
+    are defined as module-level @nki.jit functions in the ``if HAS_NKI:``
+    block below and registered in ``_gemm_kernel_registry`` at import time.
+    """
     key = (tile_m, tile_k, tile_n)
     if key not in _gemm_kernel_registry:
-        _gemm_kernel_registry[key] = _make_gemm_kernel(tile_m, tile_k, tile_n)
+        raise KeyError(
+            f"No pre-compiled GEMM kernel for tile config {key}. "
+            f"Valid configs: {sorted(_gemm_kernel_registry)}"
+        )
     return _gemm_kernel_registry[key]
 
 
@@ -755,10 +732,168 @@ def _nki_syrk_impl(A: torch.Tensor) -> torch.Tensor:
 
 
 if HAS_NKI:
-    # Populate default tile config in the kernel registry.
-    # _gemm_kernel is kept as a module-level alias for backward compatibility
-    # (simulator path and any external callers that reference it directly).
-    _gemm_kernel = _get_gemm_kernel(_TILE_M, _TILE_K, _TILE_N)
+    # ---------------------------------------------------------------------------
+    # GEMM tile-config kernels — one @nki.jit per candidate in _TILE_CANDIDATES.
+    #
+    # NKI's AST-based compiler reads source from the on-disk file and resolves
+    # names from the local namespace only; closure variables from an enclosing
+    # factory function are treated as "unbound" and cause a compile error.
+    # The fix is to define each variant as a module-level function with literal
+    # integer constants (no closures), and register all six in
+    # _gemm_kernel_registry at import time.
+    # ---------------------------------------------------------------------------
+
+    @nki.jit
+    def _gemm_kernel_64_128_128(a, b):
+        M, K = a.shape
+        _, N = b.shape
+        TILE_M = 64
+        TILE_K = 128
+        TILE_N = 128 if N > 128 else N
+        c = nl.ndarray((M, N), dtype=a.dtype, buffer=nl.shared_hbm)
+        for m in nl.affine_range(M // TILE_M):
+            for n in nl.affine_range(N // TILE_N):
+                m_off = m * TILE_M
+                n_off = n * TILE_N
+                psum = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
+                for k in nl.affine_range(K // TILE_K):
+                    k_off = k * TILE_K
+                    a_t = nl.load_transpose2d(a[m_off : m_off + TILE_M, k_off : k_off + TILE_K])
+                    b_tile = nl.load(b[k_off : k_off + TILE_K, n_off : n_off + TILE_N])
+                    nisa.nc_matmul(dst=psum, stationary=a_t, moving=b_tile, accumulate=True)
+                c_sbuf = nl.ndarray((TILE_M, TILE_N), dtype=a.dtype, buffer=nl.sbuf)
+                nisa.tensor_copy(src=psum, dst=c_sbuf)
+                nl.store(c[m_off : m_off + TILE_M, n_off : n_off + TILE_N], value=c_sbuf)
+        return c
+
+    @nki.jit
+    def _gemm_kernel_64_128_256(a, b):
+        M, K = a.shape
+        _, N = b.shape
+        TILE_M = 64
+        TILE_K = 128
+        TILE_N = 256 if N > 256 else N
+        c = nl.ndarray((M, N), dtype=a.dtype, buffer=nl.shared_hbm)
+        for m in nl.affine_range(M // TILE_M):
+            for n in nl.affine_range(N // TILE_N):
+                m_off = m * TILE_M
+                n_off = n * TILE_N
+                psum = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
+                for k in nl.affine_range(K // TILE_K):
+                    k_off = k * TILE_K
+                    a_t = nl.load_transpose2d(a[m_off : m_off + TILE_M, k_off : k_off + TILE_K])
+                    b_tile = nl.load(b[k_off : k_off + TILE_K, n_off : n_off + TILE_N])
+                    nisa.nc_matmul(dst=psum, stationary=a_t, moving=b_tile, accumulate=True)
+                c_sbuf = nl.ndarray((TILE_M, TILE_N), dtype=a.dtype, buffer=nl.sbuf)
+                nisa.tensor_copy(src=psum, dst=c_sbuf)
+                nl.store(c[m_off : m_off + TILE_M, n_off : n_off + TILE_N], value=c_sbuf)
+        return c
+
+    @nki.jit
+    def _gemm_kernel_64_128_512(a, b):
+        M, K = a.shape
+        _, N = b.shape
+        TILE_M = 64
+        TILE_K = 128
+        TILE_N = 512 if N > 512 else N
+        c = nl.ndarray((M, N), dtype=a.dtype, buffer=nl.shared_hbm)
+        for m in nl.affine_range(M // TILE_M):
+            for n in nl.affine_range(N // TILE_N):
+                m_off = m * TILE_M
+                n_off = n * TILE_N
+                psum = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
+                for k in nl.affine_range(K // TILE_K):
+                    k_off = k * TILE_K
+                    a_t = nl.load_transpose2d(a[m_off : m_off + TILE_M, k_off : k_off + TILE_K])
+                    b_tile = nl.load(b[k_off : k_off + TILE_K, n_off : n_off + TILE_N])
+                    nisa.nc_matmul(dst=psum, stationary=a_t, moving=b_tile, accumulate=True)
+                c_sbuf = nl.ndarray((TILE_M, TILE_N), dtype=a.dtype, buffer=nl.sbuf)
+                nisa.tensor_copy(src=psum, dst=c_sbuf)
+                nl.store(c[m_off : m_off + TILE_M, n_off : n_off + TILE_N], value=c_sbuf)
+        return c
+
+    @nki.jit
+    def _gemm_kernel_128_128_128(a, b):
+        M, K = a.shape
+        _, N = b.shape
+        TILE_M = 128
+        TILE_K = 128
+        TILE_N = 128 if N > 128 else N
+        c = nl.ndarray((M, N), dtype=a.dtype, buffer=nl.shared_hbm)
+        for m in nl.affine_range(M // TILE_M):
+            for n in nl.affine_range(N // TILE_N):
+                m_off = m * TILE_M
+                n_off = n * TILE_N
+                psum = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
+                for k in nl.affine_range(K // TILE_K):
+                    k_off = k * TILE_K
+                    a_t = nl.load_transpose2d(a[m_off : m_off + TILE_M, k_off : k_off + TILE_K])
+                    b_tile = nl.load(b[k_off : k_off + TILE_K, n_off : n_off + TILE_N])
+                    nisa.nc_matmul(dst=psum, stationary=a_t, moving=b_tile, accumulate=True)
+                c_sbuf = nl.ndarray((TILE_M, TILE_N), dtype=a.dtype, buffer=nl.sbuf)
+                nisa.tensor_copy(src=psum, dst=c_sbuf)
+                nl.store(c[m_off : m_off + TILE_M, n_off : n_off + TILE_N], value=c_sbuf)
+        return c
+
+    @nki.jit
+    def _gemm_kernel_128_128_256(a, b):
+        M, K = a.shape
+        _, N = b.shape
+        TILE_M = 128
+        TILE_K = 128
+        TILE_N = 256 if N > 256 else N
+        c = nl.ndarray((M, N), dtype=a.dtype, buffer=nl.shared_hbm)
+        for m in nl.affine_range(M // TILE_M):
+            for n in nl.affine_range(N // TILE_N):
+                m_off = m * TILE_M
+                n_off = n * TILE_N
+                psum = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
+                for k in nl.affine_range(K // TILE_K):
+                    k_off = k * TILE_K
+                    a_t = nl.load_transpose2d(a[m_off : m_off + TILE_M, k_off : k_off + TILE_K])
+                    b_tile = nl.load(b[k_off : k_off + TILE_K, n_off : n_off + TILE_N])
+                    nisa.nc_matmul(dst=psum, stationary=a_t, moving=b_tile, accumulate=True)
+                c_sbuf = nl.ndarray((TILE_M, TILE_N), dtype=a.dtype, buffer=nl.sbuf)
+                nisa.tensor_copy(src=psum, dst=c_sbuf)
+                nl.store(c[m_off : m_off + TILE_M, n_off : n_off + TILE_N], value=c_sbuf)
+        return c
+
+    @nki.jit
+    def _gemm_kernel_128_128_512(a, b):
+        M, K = a.shape
+        _, N = b.shape
+        TILE_M = 128
+        TILE_K = 128
+        TILE_N = 512 if N > 512 else N
+        c = nl.ndarray((M, N), dtype=a.dtype, buffer=nl.shared_hbm)
+        for m in nl.affine_range(M // TILE_M):
+            for n in nl.affine_range(N // TILE_N):
+                m_off = m * TILE_M
+                n_off = n * TILE_N
+                psum = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
+                for k in nl.affine_range(K // TILE_K):
+                    k_off = k * TILE_K
+                    a_t = nl.load_transpose2d(a[m_off : m_off + TILE_M, k_off : k_off + TILE_K])
+                    b_tile = nl.load(b[k_off : k_off + TILE_K, n_off : n_off + TILE_N])
+                    nisa.nc_matmul(dst=psum, stationary=a_t, moving=b_tile, accumulate=True)
+                c_sbuf = nl.ndarray((TILE_M, TILE_N), dtype=a.dtype, buffer=nl.sbuf)
+                nisa.tensor_copy(src=psum, dst=c_sbuf)
+                nl.store(c[m_off : m_off + TILE_M, n_off : n_off + TILE_N], value=c_sbuf)
+        return c
+
+    # Register all six variants.  The default (128, 128, 512) is also kept as
+    # the module-level alias _gemm_kernel for backward compatibility.
+    _gemm_kernel_registry.update(
+        {
+            (64, 128, 128): _gemm_kernel_64_128_128,
+            (64, 128, 256): _gemm_kernel_64_128_256,
+            (64, 128, 512): _gemm_kernel_64_128_512,
+            (128, 128, 128): _gemm_kernel_128_128_128,
+            (128, 128, 256): _gemm_kernel_128_128_256,
+            (128, 128, 512): _gemm_kernel_128_128_512,
+        }
+    )
+    _gemm_kernel = _gemm_kernel_registry[(_TILE_M, _TILE_K, _TILE_N)]
 
     @nki.jit
     def _mp2_energy_kernel(T_flat, eps_occ_chunk, eps_occ_full, eps_vir_col, eps_vir_row):
