@@ -42,6 +42,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   aligned/unaligned correctness (atol=1e-2), symmetry (`E(i,j) == E(j,i)`),
   zero-B_i, NEFF cache reuse (cold vs warm timing).
 
+### Fixed
+
+- **NKI closure variable limitation in autotuner (#26 regression).** The
+  v0.5.0 `_make_gemm_kernel` factory returned a `@nki.jit` closure that
+  referenced tile sizes (`tm`, `tk`, `tn`) as Python free variables.
+  NKI's AST-based compiler reads source from the on-disk file and resolves
+  names from the local namespace only — it cannot traverse closure cells,
+  producing `error: unbound variable 'tm'` for every tile config.
+
+  **Fix:** replaced the factory with six static `@nki.jit` kernel definitions
+  at module level (`_gemm_kernel_64_128_128` … `_gemm_kernel_128_128_512`),
+  each with literal integer tile constants.  All six are registered in
+  `_gemm_kernel_registry` at import time; `_get_gemm_kernel()` is now a
+  dict lookup.  `_make_gemm_kernel` is removed.  Autotuner behaviour
+  (sweep, cache, escape-hatch) is unchanged.
+
+  **Root cause note:** NKI `@nki.jit` functions must have tile constants
+  visible as literal integers or module-level globals at AST trace time.
+  Closure variables from an enclosing factory scope are not reachable.
+
 ## [0.5.0] — 2026-04-15
 
 ### Added
