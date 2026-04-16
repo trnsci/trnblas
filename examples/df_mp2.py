@@ -96,14 +96,43 @@ def _energy_reduction_fused_gemm(
     into one @nki.jit kernel — eliminating the T_flat HBM round-trip
     present in `_energy_reduction`.
 
-    This is the per-pair loop the RFC (fused_df_mp2_energy_kernel.md)
-    describes.  The NEFF cache amortises the two-GEMM compile cost
-    across all nocc² pairs since every (i, j) invocation has the same
-    shape and hits the same NEFF.
+    **XLA accumulation.** If the NKI backend is active, B and eps_vir are
+    pre-transferred to the XLA device before the pair loop so that all
+    nocc² `nki_fused_gemm_energy` calls stay on-device.  Partial sums
+    accumulate as lazy XLA tensors; the single CPU sync happens at the end
+    via `.item()`.  Without this, the implicit `.to(cpu)` inside each
+    `nki_fused_gemm_energy` return forces nocc² synchronisation points
+    (measured at ~108ms each on trn1 = ~27s for nocc=16).
+
+    `xm.mark_step()` is called every `nocc` pairs (once per i-row) so
+    the XLA lazy graph doesn't grow unboundedly across all nocc² pairs.
     """
     from trnblas.nki import nki_fused_gemm_energy
+    from trnblas.nki.dispatch import HAS_NKI, _use_nki
 
     nocc, nvir, naux = B.shape
+
+    if HAS_NKI and _use_nki():
+        try:
+            import torch_xla.core.xla_model as xm
+
+            xla_dev = xm.xla_device()
+            B_xla = B.to(xla_dev)
+            ev_xla = eps_vir.to(xla_dev)
+            e_xla = torch.zeros((), dtype=torch.float32, device=xla_dev)
+            for i in range(nocc):
+                eps_occ_i = float(eps_occ[i])
+                for j in range(nocc):
+                    eps_occ_j = float(eps_occ[j])
+                    e_xla = e_xla + nki_fused_gemm_energy(
+                        B_xla[i], B_xla[j], eps_occ_i, eps_occ_j, ev_xla
+                    )
+                xm.mark_step()  # flush per i-row; keeps lazy graph bounded
+            return float(e_xla.to("cpu").item())
+        except Exception:
+            pass  # fall through to CPU-tensor path below
+
+    # CPU-tensor fallback (or when NKI is unavailable): per-pair sync.
     e_mp2 = torch.zeros((), dtype=B.dtype, device=B.device)
     for i in range(nocc):
         eps_occ_i = float(eps_occ[i])
