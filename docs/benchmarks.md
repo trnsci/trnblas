@@ -180,6 +180,32 @@ See [AWS Setup](aws_setup.md) for the one-time Terraform provisioning
 for each instance (`infra/terraform/` for trn1, `infra/terraform-cuda/`
 for the A10G).
 
+## Tile-shape autotuner (v0.5.0)
+
+`nki_gemm` now sweeps six tile candidates `{64,128} × {128} × {128,256,512}` on
+the first call per shape bucket and caches the winner to
+`/var/tmp/trnblas-autotune/cache.json` (overrideable via `TRNBLAS_AUTOTUNE_CACHE`).
+
+### How it works
+
+| Step | Detail |
+|---|---|
+| Shape bucket | `ceil_pow2(M) × ceil_pow2(K) × ceil_pow2(N)` — all shapes in a DF-MP2 run land in the same bucket |
+| Sweep | 3 warm runs per candidate; candidates that don't evenly divide the padded shape are skipped |
+| Winner | Stored in-process in `_autotune_mem`; written to JSON cache |
+| Cache hit | Same bucket → dict lookup only, no re-sweep |
+| Escape hatch | `TRNBLAS_AUTOTUNE=0` → fixed `(128,128,512)`, identical to v0.4.x |
+
+The sweep runs once per shape bucket per instance lifetime (the cache file persists
+on EBS across stop/start). DF-MP2's `nocc²` pair loop sees zero sweep overhead after
+the first call.
+
+### Measured numbers (trn1.2xlarge, warm NEFF cache)
+
+Hardware sweep timings are recorded after the first DF-MP2 bench run with v0.5.0.
+Numbers will be added here once the hardware run completes
+([#26](https://github.com/trnsci/trnblas/issues/26) tracking).
+
 ## Out of scope
 
 - **`syrk` / `trsm` NKI numbers:** those ops are PyTorch-only in v0.4.x;

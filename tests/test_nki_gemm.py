@@ -216,3 +216,113 @@ class TestStationaryTileReuse:
         outs = [nki_gemm(A, B) for B in Bs]
         for B, out in zip(Bs, outs, strict=True):
             torch.testing.assert_close(out, A @ B, atol=ATOL, rtol=RTOL)
+
+
+class TestAutotuner:
+    """GEMM tile-shape autotuner (#26, milestone v0.5.0).
+
+    CPU-side tests (cache_hit, escape_hatch, persistent_cache) use monkeypatching
+    to exercise the autotuner logic without hardware dispatch overhead.
+    test_correctness_per_config dispatches all six tile configs on hardware.
+    test_hardware_sweep verifies the full end-to-end sweep path on trn1.
+    """
+
+    def test_escape_hatch(self, nki_backend, rng, monkeypatch):
+        """TRNBLAS_AUTOTUNE=0 bypasses sweep and uses default tile config."""
+        import trnblas.nki.dispatch as D
+
+        monkeypatch.setattr(D, "_AUTOTUNE_ENABLED", False)
+        A = torch.randn(256, 128, generator=rng)
+        B = torch.randn(128, 256, generator=rng)
+        out = nki_gemm(A, B)
+        torch.testing.assert_close(out, A @ B, atol=ATOL, rtol=RTOL)
+
+    def test_cache_hit(self, nki_backend, rng, monkeypatch):
+        """Same shape bucket does not trigger a second sweep."""
+        import trnblas.nki.dispatch as D
+
+        sweep_calls: list[tuple[int, int, int]] = []
+        original_sweep = D._sweep_on_default_pad
+
+        def counting_sweep(M, K, N, A, B):
+            sweep_calls.append((M, K, N))
+            return original_sweep(M, K, N, A, B)
+
+        monkeypatch.setattr(D, "_autotune_mem", {})
+        monkeypatch.setattr(D, "_autotune_loaded", True)  # skip disk load
+        monkeypatch.setattr(D, "_sweep_on_default_pad", counting_sweep)
+
+        A = torch.randn(256, 128, generator=rng)
+        B = torch.randn(128, 256, generator=rng)
+        nki_gemm(A, B)  # first call: sweep fires
+        assert len(sweep_calls) == 1
+        nki_gemm(A, B)  # second call: bucket in mem, no re-sweep
+        assert len(sweep_calls) == 1
+
+    def test_persistent_cache(self, nki_backend, rng, tmp_path, monkeypatch):
+        """Winning tile config survives a process restart via JSON cache."""
+        import trnblas.nki.dispatch as D
+
+        cache_file = tmp_path / "autotune_cache.json"
+        monkeypatch.setattr(D, "_AUTOTUNE_CACHE_FILE", cache_file)
+        monkeypatch.setattr(D, "_autotune_mem", {})
+        monkeypatch.setattr(D, "_autotune_loaded", False)
+
+        A = torch.randn(256, 128, generator=rng)
+        B = torch.randn(128, 256, generator=rng)
+        nki_gemm(A, B)  # triggers sweep + write
+
+        assert cache_file.exists(), "cache file was not written"
+        # Simulate new process: clear in-process state, reload from disk.
+        monkeypatch.setattr(D, "_autotune_mem", {})
+        monkeypatch.setattr(D, "_autotune_loaded", False)
+        D._load_autotune_cache()
+        bucket = D._autotune_bucket(256, 128, 256)
+        assert bucket in D._autotune_mem, "bucket not restored from cache"
+        tile_m, tile_k, tile_n = D._autotune_mem[bucket]
+        assert (tile_m, tile_k, tile_n) in D._TILE_CANDIDATES
+
+    def test_correctness_per_config(self, nki_backend, rng):
+        """Every tile candidate that divides (128,128,512) produces correct output."""
+        from trnblas.nki.dispatch import _TILE_CANDIDATES, _get_gemm_kernel, _to_xla
+
+        M, K, N = 128, 128, 512
+        A = torch.randn(M, K, generator=rng)
+        B = torch.randn(K, N, generator=rng)
+        ref = A @ B
+        for tm, tk, tn in _TILE_CANDIDATES:
+            if M % tm or K % tk or N % tn:
+                continue
+            kernel = _get_gemm_kernel(tm, tk, tn)
+            (a, b), orig = _to_xla(A.contiguous(), B.contiguous())
+            result = kernel(a, b).to(orig)
+            torch.testing.assert_close(
+                result,
+                ref,
+                atol=ATOL,
+                rtol=RTOL,
+                msg=f"tile config ({tm},{tk},{tn}) mismatch",
+            )
+
+    def test_hardware_sweep(self, nki_backend, rng, tmp_path, capsys, monkeypatch):
+        """Full sweep on hardware: result correct; winner is a valid candidate."""
+        import trnblas.nki.dispatch as D
+
+        monkeypatch.setattr(D, "_autotune_mem", {})
+        monkeypatch.setattr(D, "_autotune_loaded", True)
+        monkeypatch.setattr(D, "_AUTOTUNE_CACHE_FILE", tmp_path / "hw_sweep.json")
+
+        M, K, N = 512, 128, 512
+        A = torch.randn(M, K, generator=rng)
+        B = torch.randn(K, N, generator=rng)
+        ref = A @ B
+
+        out = nki_gemm(A, B)
+        torch.testing.assert_close(out, ref, atol=ATOL, rtol=RTOL)
+
+        bucket = D._autotune_bucket(M, K, N)
+        assert bucket in D._autotune_mem, "winner not stored in _autotune_mem"
+        winner = D._autotune_mem[bucket]
+        assert winner in D._TILE_CANDIDATES, f"winner {winner} not in candidates"
+        with capsys.disabled():
+            print(f"\n[autotuner] shape ({M},{K},{N}) → bucket {bucket} → winner {winner}")
