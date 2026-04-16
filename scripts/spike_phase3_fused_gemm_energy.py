@@ -96,13 +96,14 @@ except ImportError:
 if HAS_NKI:
 
     @nki.jit
-    def _spike_a_psum_to_ve(a, b, out):
-        """GEMM(a, b) → PSUM → tensor_copy → SBUF → VE multiply(2.0) → sum → out.
+    def _spike_a_psum_to_ve(a, b):
+        """GEMM(a, b) → PSUM → tensor_copy → SBUF → VE multiply(2.0) → sum → HBM.
 
         No HBM intermediate for the tile result. Proves the TE→VE chain
         works within one @nki.jit without materialising T_flat.
 
-        Caller guarantees: a is (128, 128), b is (128, 128), out is (128, 1).
+        Output declared inside and returned (same pattern as _mp2_energy_kernel).
+        Caller guarantees: a is (128, 128), b is (128, 128).
         """
         TILE_M, TILE_K, TILE_N = 128, 128, 128
 
@@ -120,7 +121,9 @@ if HAS_NKI:
 
         # Free-dim reduce: (TILE_M, TILE_N) → (TILE_M, 1).
         row_sums = nl.sum(scaled, axis=1, keepdims=True)
+        out = nl.ndarray((TILE_M, 1), dtype=nl.float32, buffer=nl.shared_hbm)
         nl.store(out[0:TILE_M, 0:1], value=row_sums)
+        return out
 
     # ---------------------------------------------------------------------------
     # Spike B: T and T_T from two GEMMs — no HBM for either
@@ -129,14 +132,14 @@ if HAS_NKI:
     # energy ops use both SBUF tiles. Answers "how do we get T.T without HBM?".
 
     @nki.jit
-    def _spike_b_two_gemm(b_i, b_j, denom, out):
+    def _spike_b_two_gemm(b_i, b_j, denom):
         """Two-GEMM spike for Phase 3 T.T strategy.
 
         Computes in one @nki.jit:
           T     = B_i @ B_j.T   (GEMM 1, PSUM → t_sbuf)
           T_T   = B_j @ B_i.T   (GEMM 2, PSUM → t_t_sbuf)
           energy = T * (2*T - T_T) / denom   (VE, fully SBUF-resident)
-          out   = sum(energy, axis=1)         (free-dim reduce → HBM)
+          return sum(energy, axis=1)          (free-dim reduce → HBM)
 
         No HBM intermediate for T or T_T. nc_matmul convention:
           stationary = load_transpose2d(X): (TILE_K, TILE_M), partition=K
@@ -146,8 +149,8 @@ if HAS_NKI:
         Two separate nl.psum allocations — spike tests whether the compiler
         allows sequential PSUM reuse or rejects double-allocation.
 
+        Output declared inside and returned (same pattern as _mp2_energy_kernel).
         Caller guarantees: b_i, b_j are (128, 128). denom is (128, 128).
-        out is (128, 1).
         """
         TILE_M, TILE_K = 128, 128
 
@@ -180,7 +183,9 @@ if HAS_NKI:
 
         # Free-dim reduce → (TILE_M, 1).
         row_sums = nl.sum(energy_tile, axis=1, keepdims=True)
+        out = nl.ndarray((TILE_M, 1), dtype=nl.float32, buffer=nl.shared_hbm)
         nl.store(out[0:TILE_M, 0:1], value=row_sums)
+        return out
 
     # ---------------------------------------------------------------------------
     # Spike C: TE/VE concurrency within a pair loop
@@ -190,28 +195,33 @@ if HAS_NKI:
     # profiler — this Python file gives the NEFF to capture.
 
     @nki.jit
-    def _spike_c_te_ve_overlap(b_pairs, denom, out):
+    def _spike_c_te_ve_overlap(b_pairs, denom):
         """Interleaved GEMM + energy across NPAIRS iterations.
 
         Loop body for pair k:
-          - GEMM tile k+1 into PSUM (TE work, prefetch next pair)
+          - GEMM tile k into PSUM (TE work)
           - tensor_copy psum → sbuf  (TE→VE handoff)
           - Energy reduction on sbuf tile k (VE work)
+          - Store pair k result into column k of out
 
         Profiler should show: TE active while VE is active for adjacent pairs.
 
+        Output declared inside and returned as (TILE_M, NPAIRS); caller
+        transposes to (NPAIRS, TILE_M, 1) for comparison with reference.
+
         Caller guarantees:
           b_pairs: (NPAIRS, NVIR, TILE_K), each slice is B[i] or B[j]
-          denom:   (NVIR, NVIR)
-          out:     (NPAIRS, NVIR, 1) — per-pair row sums (reduce host-side)
+          denom:   (NVIR, NVIR) — unused in simplified energy (2*T)
 
         NVIR = TILE_M = 128, TILE_K = 128, NPAIRS ≥ 2.
         """
         NPAIRS = b_pairs.shape[0]
         TILE_M, TILE_K = 128, 128
 
+        out = nl.ndarray((TILE_M, NPAIRS), dtype=nl.float32, buffer=nl.shared_hbm)
+
         for k in nl.affine_range(NPAIRS):
-            # GEMM for pair k (TE).
+            # GEMM for pair k: B[k] @ B[k].T (SYRK, TE).
             psum = nl.zeros((TILE_M, TILE_M), dtype=nl.float32, buffer=nl.psum)
             b_stat = nl.load_transpose2d(b_pairs[k, 0:TILE_M, 0:TILE_K])
             b_mov = nl.load_transpose2d(b_pairs[k, 0:TILE_M, 0:TILE_K])
@@ -224,7 +234,9 @@ if HAS_NKI:
             # VE: simplified energy (2*T sum) on SBUF-resident tile.
             scaled = nl.multiply(t_sbuf, 2.0)
             row_sums = nl.sum(scaled, axis=1, keepdims=True)
-            nl.store(out[k, 0:TILE_M, 0:1], value=row_sums)
+            nl.store(out[0:TILE_M, k : k + 1], value=row_sums)
+
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -255,17 +267,15 @@ def run_spike_a() -> bool:
     rng.manual_seed(42)
     A = torch.randn(TILE, TILE, generator=rng)
     B = torch.randn(TILE, TILE, generator=rng)
-    out_buf = torch.zeros(TILE, 1)
 
     # Reference: 2 * (A @ B), summed per row.
     ref = (2.0 * (A @ B)).sum(dim=1, keepdim=True)
 
     try:
-        (a, b, out), orig = _to_xla(A.contiguous(), B.contiguous(), out_buf)
+        (a, b), orig = _to_xla(A.contiguous(), B.contiguous())
         t0 = time.perf_counter()
-        _spike_a_psum_to_ve(a, b, out)
+        result = _spike_a_psum_to_ve(a, b).to(orig)
         dt = time.perf_counter() - t0
-        result = out.to(orig)
         ok = torch.allclose(result, ref, atol=1e-2, rtol=1e-3)
         print(f"  Result: {'PASS' if ok else 'FAIL'}  ({dt * 1000:.1f} ms)")
         if not ok:
@@ -285,7 +295,6 @@ def run_spike_b() -> bool:
     B_i = torch.randn(TILE, TILE, generator=rng)
     B_j = torch.randn(TILE, TILE, generator=rng)
     denom = torch.ones(TILE, TILE) * 2.0  # fixed denominator for reference clarity
-    out_buf = torch.zeros(TILE, 1)
 
     # Reference: T = B_i @ B_j.T, T_T = B_j @ B_i.T
     T = B_i @ B_j.T
@@ -293,13 +302,10 @@ def run_spike_b() -> bool:
     ref = (T * (2.0 * T - T_T) / denom).sum(dim=1, keepdim=True)
 
     try:
-        (bi, bj, d, out), orig = _to_xla(
-            B_i.contiguous(), B_j.contiguous(), denom.contiguous(), out_buf
-        )
+        (bi, bj, d), orig = _to_xla(B_i.contiguous(), B_j.contiguous(), denom.contiguous())
         t0 = time.perf_counter()
-        _spike_b_two_gemm(bi, bj, d, out)
+        result = _spike_b_two_gemm(bi, bj, d).to(orig)
         dt = time.perf_counter() - t0
-        result = out.to(orig)
         ok = torch.allclose(result, ref, atol=1e-2, rtol=1e-3)
         print(f"  Result: {'PASS' if ok else 'FAIL'}  ({dt * 1000:.1f} ms)")
         if not ok:
@@ -322,7 +328,6 @@ def run_spike_c(npairs: int = 8) -> bool:
     rng.manual_seed(3)
     B_pairs = torch.randn(npairs, TILE, TILE, generator=rng)
     denom = torch.ones(TILE, TILE)
-    out_buf = torch.zeros(npairs, TILE, 1)
 
     # Reference: for each pair k, 2 * (B_pairs[k] @ B_pairs[k].T) summed per row.
     ref_list = []
@@ -333,11 +338,12 @@ def run_spike_c(npairs: int = 8) -> bool:
     ref = torch.stack(ref_list)  # (npairs, TILE, 1)
 
     try:
-        (bp, d, out), orig = _to_xla(B_pairs.contiguous(), denom.contiguous(), out_buf)
+        (bp, d), orig = _to_xla(B_pairs.contiguous(), denom.contiguous())
         t0 = time.perf_counter()
-        _spike_c_te_ve_overlap(bp, d, out)
+        # Kernel returns (TILE_M, NPAIRS); transpose to (NPAIRS, TILE_M, 1) for ref comparison.
+        raw = _spike_c_te_ve_overlap(bp, d).to(orig)
         dt = time.perf_counter() - t0
-        result = out.to(orig)
+        result = raw.T.unsqueeze(-1)  # (npairs, TILE, 1)
         ok = torch.allclose(result, ref, atol=1e-2, rtol=1e-3)
         print(f"  Result: {'PASS' if ok else 'FAIL'}  ({dt * 1000:.1f} ms, {npairs} pairs)")
         if not ok:
