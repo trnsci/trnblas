@@ -190,19 +190,70 @@ Phase 3 on-hardware testing must prove:
    throughput: trn1.2xlarge at $1.34/hr vs A10G at $1.20/hr, end-to-
    end wall time normalized per problem.
 
-## Open questions
+## Implementation plan (v0.5.1)
 
-- **Tile shape.** For 64512² T-chunks, a `(128, 128)` tile fits all
-  three SBUF-resident operands (T, T.T, denom) at ~192 KB. A
-  `(128, 512)` tile reduces transpose edge effects but needs ~768 KB
-  — still under SBUF's 48 MB but crowds the denom tile. Autotuner
-  picks at plan time.
-- **SBUF-local transpose.** Does Vector Engine have a cheap
-  transpose primitive, or is it stride-2 loads from SBUF? Answer
-  depends on NKI 2.24 primitives; worth spiking before committing
-  the tile shape.
+The profiler findings from [#33](https://github.com/trnsci/trnblas/issues/33) and
+the Amdahl analysis confirm the fused path is the only route to 3×. With
+the tile-shape autotuner ([#26](https://github.com/trnsci/trnblas/issues/26)) now
+shipped in v0.5.0, the next milestone is the fused GEMM+energy kernel (#38, v0.5.1).
+
+### Pre-implementation spike (`scripts/spike_phase3_fused_gemm_energy.py`)
+
+Three minimal kernels probe the NKI primitives before committing to the full
+implementation. Run via `AWS_PROFILE=aws ./scripts/run_phase3_spike.sh`.
+
+| Spike | Question | Success criterion |
+|---|---|---|
+| A — `_spike_a_psum_to_ve` | Can VE energy ops consume PSUM output (via SBUF) in one `@nki.jit` without HBM intermediate? | Compiles, runs, result matches `2*(A@B).sum(axis=1)` within atol=1e-2 |
+| B — `_spike_b_two_gemm` | Does the two-GEMM strategy (T and T_T each in PSUM→SBUF) allow the energy expression to run fully SBUF-resident? | Both GEMM tiles compile into one `@nki.jit`; energy result matches reference within atol=1e-2 |
+| C — `_spike_c_te_ve_overlap` | Does the profiler show TE and VE active simultaneously in a kernel with interleaved GEMM + energy? | `summary-json` shows `tensor_engine_active_time_percent > 5%` and `vector_engine_active_time_percent > 50%` simultaneously; Perfetto trace shows instruction-level overlap |
+
+**T_T strategy from spike B:** Rather than using `nl.load_transpose2d` from HBM (which
+defeats the HBM elimination), T_T = B_j @ B_i.T is computed as a second GEMM tile in
+the same `@nki.jit`. Both T and T_T end up in SBUF via `tensor_copy`; the VE energy
+expression never reads from HBM for either operand.
+
+### Full kernel design (post-spike)
+
+```
+_nki_fused_gemm_energy(b_i, b_j, eps_occ_i, eps_occ_j, eps_vir) → scalar
+
+For each tile (a_strip, b_strip):
+  GEMM 1:  nc_matmul(B_i[a_strip].T, B_j[b_strip].T) → PSUM → t_sbuf
+  GEMM 2:  nc_matmul(B_j[b_strip].T, B_i[a_strip].T) → PSUM → t_t_sbuf
+  VE:      denom = broadcast(eps_occ_i + eps_occ_j - eps_vir[a] - eps_vir[b])
+           energy_tile = t_sbuf * (2*t_sbuf - t_t_sbuf) * reciprocal(denom)
+           partial += sum(energy_tile, axis=1)
+  Store:   partial → HBM once per pair (IC stores total)
+```
+
+The NEFF cache amortises the two-GEMM compile cost across the `nocc²` pair loop
+exactly as the single-GEMM kernel does today.
+
+### SBUF budget at medium shape (TILE=128)
+
+| Tile | Size |
+|---|---|
+| t_sbuf (TILE_M, TILE_M) fp32 | 64 KB |
+| t_t_sbuf (TILE_M, TILE_M) fp32 | 64 KB |
+| denom (TILE_M, TILE_M) fp32 | 64 KB |
+| scratch VE tiles | ~128 KB |
+| **Total** | **~320 KB** |
+
+SBUF limit is 48 MB on trn1 — well under budget. The dominant SBUF
+consumer is the VE pipeline scratch, not the T tiles.
+
+## Open questions (post-spike)
+
+- **PSUM double-allocation.** Spike B uses two `nl.psum` allocations in one
+  kernel body (`psum_t` and `psum_tt`). The compiler may accept this
+  (sequential reuse of physical PSUM buffer) or reject it (aliasing error).
+  If rejected, the fix is to zero and reuse a single `psum` between GEMMs.
+- **SBUF-local transpose.** If the two-GEMM strategy has excessive GEMM
+  overhead vs. one GEMM + HBM reload of T_T, investigate whether NKI 2.24
+  exposes a SBUF stride-transpose primitive for the alternative path.
 - **trn1 vs trn2 trade-offs.** Wider PSUM on trn2 enables larger
-  tiles, which shifts the transpose / compute ratio. Phase 5
+  tiles, which shifts the GEMM/VE compute ratio. Phase 5
   ([#25](https://github.com/trnsci/trnblas/issues/25)) handles the
   generation-specific path; this RFC targets trn1 first.
 - **Relationship to [trntensor #13](https://github.com/trnsci/trntensor/issues/13).**
