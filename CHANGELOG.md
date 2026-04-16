@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **#33 resolved — `_mp2_energy_kernel` profile via Neuron Profiler 2.0.**
+  The April-14 profiling attempt was blocked by the deprecated Neuron 2.29
+  API (`inspect`/`show-session` → NTFF v130 format mismatch). Retried
+  April-15 using the new `neuron-profile capture` + `view --output-format
+  summary-text` API (no InfluxDB, no browser). Key findings at medium bench
+  shape (trn1.2xlarge, neuronxcc 2.24.5133):
+  - **Vector Engine: 96.45% active** — the entire reduction (`T*(2T-Tᵀ)/denom`)
+    is element-wise arithmetic; Tensor Engine runs 21 instructions in 0.48 µs.
+  - **HBM reads: 6.58 GB** — matches the analytical 2-pass prediction exactly
+    (previous napkin of 33 GB was for the unfused torch path).
+  - **Kernel wall time: ~0.21 s** vs ~2.83 s for the torch reduction — **~13×
+    speedup on the reduction step alone.**
+  - **Amdahl ceiling: 1.48×.** The GEMM (T_flat = B_chunk @ B_flat.T) takes
+    ~5.2 s in both paths and is 96% of fused energy step time. The 1.48× overall
+    result is an exact Amdahl prediction (f=0.35, s=13.5 → 1.48×), not a tuning
+    failure. Path to 3× requires fusing the GEMM into the energy pass (Phase 3
+    RFC) or a different algorithm.
+  See `docs/design/mp2_energy_profile_findings.md` for full data and next steps.
+  `scripts/run_neuron_profile.sh` updated to Neuron Profiler 2.0 API with
+  base64-encoded SSM commands (bypasses all shell-quoting issues; supports
+  `--probe` mode for API discovery).
+
 - **#35 — cross-pair batching in `_mp2_energy_kernel` (store-fence
   hypothesis falsified).** Restructured the kernel to accumulate all
   NOCC pair partials for each `i`-row in SBUF before a single batched
@@ -21,9 +43,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   compiler appears to tolerate the store traffic without serializing
   across pairs. The kernel is kept with batched stores (no functional
   regression, 64× less store traffic); the 1.47× ceiling stands.
-  Remaining hypotheses require a working profile trace (#33 DLAMI
-  tooling blocker still open). Tracked on
-  [#31](https://github.com/trnsci/trnblas/issues/31).
+  Ceiling now explained by Amdahl (#33 profile); no remaining unknown
+  hypotheses. Tracked on [#31](https://github.com/trnsci/trnblas/issues/31).
 
 - **Migrated to NKI 0.3.0 / Neuron SDK 2.29.** Canonical `nki.*`
   namespace; the legacy `neuronxcc.nki.*` shim is no longer used.
