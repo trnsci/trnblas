@@ -132,3 +132,45 @@ class TestMp2EnergySimulator:
     def test_nvir448_bench_shape(self):
         """NVIR=448 (medium DF-MP2): P_TILE=112, NSTRIP=4."""
         self._run(nocc=2, nvir=448, naux=8, atol=1e-2, rtol=1e-3)
+
+
+class TestFusedGemmEnergySimulator:
+    """Simulator correctness tests for _fused_gemm_energy_kernel (#38, v0.5.1).
+
+    Small shapes only — the simulator is slow at large NVIR/NAUX.  Shapes
+    are restricted to multiples of TILE=128 here (the kernel requires this
+    post-padding); the padding logic is tested on hardware via
+    TestFusedGemmEnergy in test_nki_gemm.py.
+    """
+
+    def _ref(self, b_i, b_j, eps_occ_i, eps_occ_j, eps_vir):
+        T = b_i @ b_j.T
+        denom = eps_occ_i + eps_occ_j - eps_vir.unsqueeze(1) - eps_vir.unsqueeze(0)
+        return (T * (2.0 * T - T.T) / denom).sum()
+
+    def _run(self, nvir, naux, atol=1e-2, rtol=1e-3):
+        import torch
+
+        from trnblas.nki import nki_fused_gemm_energy
+
+        torch.manual_seed(42)
+        b_i = torch.randn(nvir, naux)
+        b_j = torch.randn(nvir, naux)
+        eps_occ_i = 1.5
+        eps_occ_j = 1.2
+        eps_vir = torch.rand(nvir) * 0.5 + 0.1  # keep denom > 0
+        got = nki_fused_gemm_energy(b_i, b_j, eps_occ_i, eps_occ_j, eps_vir)
+        ref = self._ref(b_i, b_j, eps_occ_i, eps_occ_j, eps_vir)
+        torch.testing.assert_close(got, ref, atol=atol, rtol=rtol)
+
+    def test_single_tile(self):
+        """NVIR=128, NAUX=128: one (a, b) tile — simplest case."""
+        self._run(nvir=128, naux=128)
+
+    def test_two_a_tiles(self):
+        """NVIR=256: two a-strips, exercises acc_b batching."""
+        self._run(nvir=256, naux=128)
+
+    def test_two_k_tiles(self):
+        """NAUX=256: two TILE_K strips in the GEMM k-loop."""
+        self._run(nvir=128, naux=256)

@@ -7,6 +7,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] — 2026-04-15
+
+### Added
+
+- **Fused GEMM+energy kernel (#38, `nki_fused_gemm_energy`).** A single
+  `@nki.jit` kernel handles one DF-MP2 orbital pair — both GEMMs (T and T_T)
+  and the VE energy expression — without writing the `(nvir, nvir)` T_flat
+  intermediate to HBM.
+
+  **Two-GEMM T_T strategy:** `T.T[a,b] = T[b,a] = (B_j @ B_i.T)[a,b]`.
+  Rather than `nl.load_transpose2d` of T from HBM (which re-introduces the
+  HBM round-trip), T_T is computed as a second GEMM tile in the same kernel
+  body.  Both T and T_T land in SBUF via `tensor_copy` — no HBM write for
+  either intermediate.
+
+  **Kernel design:**
+  - `TILE = 128` everywhere (`nl.load_transpose2d` constrains both dims to ≤ 128).
+  - Outer a-loop, inner b-loop; two sequential PSUM allocations per (a, b) tile
+    (one for T, one for T_T); VE energy expression fully SBUF-resident.
+  - Cross-b batching: `acc_b (TILE, N_B_TILES)` in SBUF accumulates all b-strip
+    partials before one `nl.store` per a-strip — same pattern as `_mp2_energy_kernel`.
+  - NEFF cache amortises the two-GEMM compile across all `nocc²` pairs (same
+    shape every invocation).
+  - NKI 0.3.0 broadcast fix applied to `denom` construction (same as `_mp2_energy_kernel`).
+
+  **Public API:** `trnblas.nki.nki_fused_gemm_energy(b_i, b_j, eps_occ_i, eps_occ_j, eps_vir)` → scalar.
+
+  **Example integration:** `examples/df_mp2.py --fused-gemm-energy` routes the
+  energy step through the per-pair kernel.  Default path remains the chunk-GEMM
+  path — see benchmark note below.
+
+  **On-hardware benchmark (trn1, small shape: nbasis=128, nocc=16, nvir=112,
+  naux=384; 256 pairs):**
+
+  | Step | Baseline warm | Fused warm |
+  |---|---|---|
+  | energy | **0.13s** | **27.8s** |
+  | total | 3.98s | 31.5s |
+
+  The fused kernel is correct (energies agree to 6 significant figures) but
+  the per-pair loop is **215× slower** on the energy step.  Root cause:
+  Neuron XLA imposes ~100ms per-NEFF-dispatch overhead, independent of kernel
+  compute time.  With 256 pairs × 100ms = 25.6s ≈ 27.8s observed.  The
+  chunk-GEMM baseline amortises this with two dispatches total.
+
+  Pre-transferring B to the XLA device and accumulating on-device (eliminating
+  per-pair CPU syncs) produces the same warm timing because Neuron XLA's
+  per-dispatch overhead is in the dispatch pipeline itself, not in the
+  CPU→XLA transfer.
+
+  **Follow-on:** production speedup requires a batched kernel that processes
+  all nocc² pairs in one `@nki.jit` invocation — tracked in #43.
+
+  **Tests:** `TestFusedGemmEnergy` in `tests/test_nki_gemm.py`:
+  aligned/unaligned correctness (atol=1e-2), symmetry (`E(i,j) == E(j,i)`),
+  zero-B_i, NEFF cache reuse (cold vs warm timing).
+
+### Fixed
+
+- **NKI closure variable limitation in autotuner (#26 regression).** The
+  v0.5.0 `_make_gemm_kernel` factory returned a `@nki.jit` closure that
+  referenced tile sizes (`tm`, `tk`, `tn`) as Python free variables.
+  NKI's AST-based compiler reads source from the on-disk file and resolves
+  names from the local namespace only — it cannot traverse closure cells,
+  producing `error: unbound variable 'tm'` for every tile config.
+
+  **Fix:** replaced the factory with six static `@nki.jit` kernel definitions
+  at module level (`_gemm_kernel_64_128_128` … `_gemm_kernel_128_128_512`),
+  each with literal integer tile constants.  All six are registered in
+  `_gemm_kernel_registry` at import time; `_get_gemm_kernel()` is now a
+  dict lookup.  `_make_gemm_kernel` is removed.  Autotuner behaviour
+  (sweep, cache, escape-hatch) is unchanged.
+
+  **Root cause note:** NKI `@nki.jit` functions must have tile constants
+  visible as literal integers or module-level globals at AST trace time.
+  Closure variables from an enclosing factory scope are not reachable.
+
 ## [0.5.0] — 2026-04-15
 
 ### Added

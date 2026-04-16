@@ -114,9 +114,8 @@ device = xm.xla_device()
 TILE, NPAIRS = 128, 8
 B = torch.randn(NPAIRS, TILE, TILE).to(device)
 D = torch.ones(TILE, TILE).to(device)
-O = torch.zeros(NPAIRS, TILE, 1).to(device)
 print("Compiling spike C...", flush=True)
-_spike_c_te_ve_overlap(B, D, O)
+_spike_c_te_ve_overlap(B, D)
 print("Done.", flush=True)
 ')
 printf '%s' "$WARMUP_PY" > /tmp/spike_c_warmup.py
