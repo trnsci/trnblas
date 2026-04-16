@@ -26,7 +26,12 @@ fi
 
 INSTANCE_TYPE="${1:-trn1}"
 TAG="trnblas-ci-${INSTANCE_TYPE}"
-REGION="${AWS_REGION:-us-east-1}"
+# Default region by instance family; AWS_REGION overrides.
+# trn2.3xlarge is only available in sa-east-1 (as of 2026-04-16).
+case "$INSTANCE_TYPE" in
+  trn2*) REGION="${AWS_REGION:-sa-east-1}" ;;
+  *)     REGION="${AWS_REGION:-us-east-1}" ;;
+esac
 SHA="$(git rev-parse HEAD)"
 
 : "${AWS_PROFILE:?Set AWS_PROFILE, e.g. AWS_PROFILE=aws ./scripts/run_neuron_tests.sh}"
