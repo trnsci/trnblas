@@ -532,9 +532,17 @@ if HAS_NKI:
 
         Sub-tiles the nvir partition dim into strips of P_TILE ≤ 128
         (largest divisor of NVIR under the NKI partition limit).
-        Strip partials are accumulated in a 1×1 SBUF register per
-        (i, j), so there is exactly one HBM store per (i, j) —
-        cuts store traffic by NSTRIP× vs the per-strip-store variant.
+        Strip partials are accumulated in a (P_TILE, 1) SBUF register
+        per (i, j).
+
+        **#35 cross-pair batching.** Rather than storing each (i, j)
+        pair's partial immediately to HBM (IC×NOCC stores per chunk),
+        all NOCC j-partials for a given i are accumulated in an SBUF
+        tile `acc_j (P_TILE, NOCC)` and flushed in a single HBM store
+        after the j-loop — IC stores per chunk total. Hypothesis: the
+        per-pair store was a serialization fence preventing the compiler
+        from pipelining consecutive pairs. SBUF cost: P_TILE×NOCC×4
+        bytes (≤ 43 KB at the large bench shape; well under budget).
 
         eps_* args are shape (1, N) so `nl.load` interprets them as
         partition=1, free=N (a 1D load is treated as partition=len,
@@ -551,11 +559,9 @@ if HAS_NKI:
         NKI only supports reduction along the free dim. A full
         `(P_TILE, NVIR) → scalar` reduce would need a partition-axis
         reduce which NKI rejects. Instead: reduce free-only to get
-        per-partition partials `(P_TILE, 1)`, accumulate across
-        strips in an SBUF row-accumulator, emit
-        `(P_TILE, IC, NOCC)` to HBM — caller `.sum()` handles the
-        final partition-axis reduction host-side (partial is small;
-        ≤ 258 KB at large bench shape).
+        per-partition partials `(P_TILE, 1)`, batch NOCC of them in
+        SBUF, emit `(P_TILE, IC*NOCC)` to HBM — caller `.sum()`
+        handles the final partition-axis reduction host-side.
         """
         NVIR = eps_vir_row.shape[1]
         IC = eps_occ_chunk.shape[1]
@@ -566,16 +572,20 @@ if HAS_NKI:
             P_TILE -= 1
         NSTRIP = NVIR // P_TILE
 
-        # Output layout: partition axis (P_TILE) FIRST so nl.store
-        # writes the (P_TILE, 1) SBUF tile with partition-to-partition
-        # alignment. Host caller's .sum() is layout-agnostic.
-        e_partial = nl.ndarray((P_TILE, IC, NOCC), dtype=nl.float32, buffer=nl.shared_hbm)
+        # Output layout: (P_TILE, IC*NOCC) — 2D flat so each i-row's
+        # NOCC partials can be stored in one nl.store call.  Partition
+        # axis FIRST so the store aligns with SBUF partition layout.
+        # Host caller's .sum() is shape-agnostic.
+        e_partial = nl.ndarray((P_TILE, IC * NOCC), dtype=nl.float32, buffer=nl.shared_hbm)
         # Full eps_vir as a free-dim vector (partition=1, free=NVIR)
         # for the per-b axis of denom.
         ev_row = nl.load(eps_vir_row[0:1, 0:NVIR])
 
         for i in nl.affine_range(IC):
             eo_i = nl.load(eps_occ_chunk[0:1, i : i + 1])
+            # Batch all NOCC pair partials for this i into SBUF before
+            # a single HBM store.  IC×NOCC stores → IC stores per chunk.
+            acc_j = nl.zeros((P_TILE, NOCC), dtype=nl.float32, buffer=nl.sbuf)
             for j in nl.affine_range(NOCC):
                 eo_j = nl.load(eps_occ_full[0:1, j : j + 1])
                 eo_sum = nl.add(eo_i, eo_j)
@@ -637,12 +647,15 @@ if HAS_NKI:
                 # Reduce across strips (free dim) → (P_TILE, 1).
                 acc_row = nl.sum(acc_rows, axis=1, keepdims=True)
 
-                # Store (P_TILE,) per-partition partials for this (i, j)
-                # into the partition-major output; axes align directly.
-                nl.store(
-                    e_partial[0:P_TILE, i : i + 1, j : j + 1],
-                    value=acc_row,
-                )
+                # Accumulate this pair's partial into SBUF; no HBM
+                # traffic until after all NOCC j-iterations complete.
+                acc_j[0:P_TILE, j : j + 1] = acc_row
+
+            # One HBM store for all NOCC pairs in this i-row.
+            nl.store(
+                e_partial[0:P_TILE, i * NOCC : (i + 1) * NOCC],
+                value=acc_j,
+            )
 
         return e_partial
 

@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **#35 — cross-pair batching in `_mp2_energy_kernel` (store-fence
+  hypothesis falsified).** Restructured the kernel to accumulate all
+  NOCC pair partials for each `i`-row in SBUF before a single batched
+  HBM store, replacing IC×NOCC per-pair stores with IC stores per chunk
+  (4,096 → 64 stores at medium; 9,216 → 96 at large). Measured result
+  on trn1 (warm NEFF cache):
+  - medium: energy 5.43 s → **5.38 s** (within noise; 1.49× vs torch)
+  - large: energy 30.27 s → **30.13 s** (within noise; 1.47× vs torch)
+  The per-pair HBM-store fence hypothesis is now falsified — the
+  compiler appears to tolerate the store traffic without serializing
+  across pairs. The kernel is kept with batched stores (no functional
+  regression, 64× less store traffic); the 1.47× ceiling stands.
+  Remaining hypotheses require a working profile trace (#33 DLAMI
+  tooling blocker still open). Tracked on
+  [#31](https://github.com/trnsci/trnblas/issues/31).
+
 - **Migrated to NKI 0.3.0 / Neuron SDK 2.29.** Canonical `nki.*`
   namespace; the legacy `neuronxcc.nki.*` shim is no longer used.
   `[neuron]` extra now requires `nki>=0.3.0`. Kernels updated for
