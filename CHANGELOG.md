@@ -36,7 +36,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   **Example integration:** `examples/df_mp2.py --fused-gemm-energy` routes the
   energy step through the per-pair kernel.  Default path remains the chunk-GEMM
-  path until on-hardware timings confirm the phase-3 speedup target.
+  path — see benchmark note below.
+
+  **On-hardware benchmark (trn1, small shape: nbasis=128, nocc=16, nvir=112,
+  naux=384; 256 pairs):**
+
+  | Step | Baseline warm | Fused warm |
+  |---|---|---|
+  | energy | **0.13s** | **27.8s** |
+  | total | 3.98s | 31.5s |
+
+  The fused kernel is correct (energies agree to 6 significant figures) but
+  the per-pair loop is **215× slower** on the energy step.  Root cause:
+  Neuron XLA imposes ~100ms per-NEFF-dispatch overhead, independent of kernel
+  compute time.  With 256 pairs × 100ms = 25.6s ≈ 27.8s observed.  The
+  chunk-GEMM baseline amortises this with two dispatches total.
+
+  Pre-transferring B to the XLA device and accumulating on-device (eliminating
+  per-pair CPU syncs) produces the same warm timing because Neuron XLA's
+  per-dispatch overhead is in the dispatch pipeline itself, not in the
+  CPU→XLA transfer.
+
+  **Follow-on:** production speedup requires a batched kernel that processes
+  all nocc² pairs in one `@nki.jit` invocation — tracked in #43.
 
   **Tests:** `TestFusedGemmEnergy` in `tests/test_nki_gemm.py`:
   aligned/unaligned correctness (atol=1e-2), symmetry (`E(i,j) == E(j,i)`),
