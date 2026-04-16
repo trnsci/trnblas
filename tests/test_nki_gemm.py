@@ -16,7 +16,7 @@ import torch
 
 import trnblas
 from trnblas import batched_gemm, gemm
-from trnblas.nki import nki_batched_gemm, nki_gemm
+from trnblas.nki import nki_batched_gemm, nki_fused_gemm_energy, nki_gemm
 
 pytestmark = pytest.mark.neuron
 
@@ -326,3 +326,113 @@ class TestAutotuner:
         assert winner in D._TILE_CANDIDATES, f"winner {winner} not in candidates"
         with capsys.disabled():
             print(f"\n[autotuner] shape ({M},{K},{N}) → bucket {bucket} → winner {winner}")
+
+
+class TestFusedGemmEnergy:
+    """Fused GEMM+energy kernel (#38, v0.5.1).
+
+    These tests exercise `nki_fused_gemm_energy` — one DF-MP2 pair's
+    fused (B_i @ B_j.T) + energy expression in a single @nki.jit.
+
+    Structure mirrors TestNkiKernel: correctness tests compare against
+    _torch_fused_pair_energy; performance tests measure cold vs warm
+    NEFF cache timing.
+    """
+
+    # Loose tolerance: FP32 GEMM accumulation + reduction chain.
+    ATOL = 1e-2
+    RTOL = 1e-3
+
+    def _ref(self, b_i, b_j, eps_occ_i, eps_occ_j, eps_vir):
+        """PyTorch reference: T = B_i @ B_j.T, energy = sum T*(2T-T.T)/denom."""
+        T = b_i @ b_j.T
+        denom = eps_occ_i + eps_occ_j - eps_vir.unsqueeze(1) - eps_vir.unsqueeze(0)
+        return (T * (2.0 * T - T.T) / denom).sum()
+
+    @pytest.mark.parametrize(
+        "nvir,naux",
+        [
+            (128, 128),  # single tile
+            (256, 256),  # 2×2 tile grid
+            (512, 512),  # 4×4 tile grid
+            (256, 128),  # naux = one TILE_K
+        ],
+    )
+    def test_correctness_aligned(self, nki_backend, nvir, naux, rng):
+        """Aligned shapes: fused result matches torch reference."""
+        b_i = torch.randn(nvir, naux, generator=rng)
+        b_j = torch.randn(nvir, naux, generator=rng)
+        eps_occ_i = float(torch.rand(1, generator=rng) + 1.0)
+        eps_occ_j = float(torch.rand(1, generator=rng) + 1.0)
+        eps_vir = torch.rand(nvir, generator=rng) * 0.5  # keep denom > 0
+        ref = self._ref(b_i, b_j, eps_occ_i, eps_occ_j, eps_vir)
+        out = nki_fused_gemm_energy(b_i, b_j, eps_occ_i, eps_occ_j, eps_vir)
+        torch.testing.assert_close(out, ref, atol=self.ATOL, rtol=self.RTOL)
+
+    @pytest.mark.parametrize(
+        "nvir,naux",
+        [
+            (200, 137),  # all unaligned
+            (256, 200),  # naux unaligned
+            (144, 128),  # nvir unaligned
+        ],
+    )
+    def test_correctness_unaligned(self, nki_backend, nvir, naux, rng):
+        """Unaligned shapes: padding logic keeps result correct."""
+        b_i = torch.randn(nvir, naux, generator=rng)
+        b_j = torch.randn(nvir, naux, generator=rng)
+        eps_occ_i = float(torch.rand(1, generator=rng) + 1.0)
+        eps_occ_j = float(torch.rand(1, generator=rng) + 1.0)
+        eps_vir = torch.rand(nvir, generator=rng) * 0.5
+        ref = self._ref(b_i, b_j, eps_occ_i, eps_occ_j, eps_vir)
+        out = nki_fused_gemm_energy(b_i, b_j, eps_occ_i, eps_occ_j, eps_vir)
+        torch.testing.assert_close(out, ref, atol=self.ATOL, rtol=self.RTOL)
+
+    def test_symmetry(self, nki_backend, rng):
+        """Pair energy is symmetric: E(i,j) == E(j,i)."""
+        nvir, naux = 256, 256
+        b_i = torch.randn(nvir, naux, generator=rng)
+        b_j = torch.randn(nvir, naux, generator=rng)
+        eps_occ_i = 1.2
+        eps_occ_j = 0.8
+        eps_vir = torch.rand(nvir, generator=rng) * 0.5
+        e_ij = nki_fused_gemm_energy(b_i, b_j, eps_occ_i, eps_occ_j, eps_vir)
+        e_ji = nki_fused_gemm_energy(b_j, b_i, eps_occ_j, eps_occ_i, eps_vir)
+        torch.testing.assert_close(e_ij, e_ji, atol=self.ATOL, rtol=self.RTOL)
+
+    def test_zero_b_i(self, nki_backend):
+        """B_i = 0 → T = 0 → energy = 0."""
+        nvir, naux = 128, 128
+        b_i = torch.zeros(nvir, naux)
+        b_j = torch.randn(nvir, naux)
+        eps_vir = torch.rand(nvir) * 0.5
+        out = nki_fused_gemm_energy(b_i, b_j, 1.0, 1.0, eps_vir)
+        torch.testing.assert_close(out, torch.tensor(0.0), atol=0, rtol=0)
+
+    def test_neff_cache_reuse(self, nki_backend, rng, capsys):
+        """Second pair invocation with same shape hits NEFF cache (warm << cold)."""
+        import time
+
+        nvir, naux = 256, 256
+        b_i = torch.randn(nvir, naux, generator=rng)
+        b_j = torch.randn(nvir, naux, generator=rng)
+        eps_vir = torch.rand(nvir, generator=rng) * 0.5
+
+        t0 = time.perf_counter()
+        nki_fused_gemm_energy(b_i, b_j, 1.0, 0.9, eps_vir)
+        cold = time.perf_counter() - t0
+
+        warm_times = []
+        for _ in range(4):
+            t = time.perf_counter()
+            nki_fused_gemm_energy(b_i, b_j, 1.0, 0.9, eps_vir)
+            warm_times.append(time.perf_counter() - t)
+        warm_min = min(warm_times)
+
+        with capsys.disabled():
+            print(
+                f"\n[fused_gemm_energy {nvir}×{naux}] "
+                f"cold={cold * 1000:7.1f}ms  "
+                f"warm_min={warm_min * 1000:7.1f}ms  "
+                f"speedup={cold / warm_min:.1f}x"
+            )

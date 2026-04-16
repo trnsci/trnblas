@@ -84,6 +84,35 @@ def _energy_reduction(
     return float(e_mp2)
 
 
+def _energy_reduction_fused_gemm(
+    B: torch.Tensor,
+    eps_occ: torch.Tensor,
+    eps_vir: torch.Tensor,
+) -> float:
+    """Energy via the fused GEMM+energy kernel (#38, v0.5.1).
+
+    Calls `nki_fused_gemm_energy` once per (i, j) orbital pair.  Each
+    call fuses the GEMM (B[i] @ B[j].T) and the VE energy expression
+    into one @nki.jit kernel — eliminating the T_flat HBM round-trip
+    present in `_energy_reduction`.
+
+    This is the per-pair loop the RFC (fused_df_mp2_energy_kernel.md)
+    describes.  The NEFF cache amortises the two-GEMM compile cost
+    across all nocc² pairs since every (i, j) invocation has the same
+    shape and hits the same NEFF.
+    """
+    from trnblas.nki import nki_fused_gemm_energy
+
+    nocc, nvir, naux = B.shape
+    e_mp2 = torch.zeros((), dtype=B.dtype, device=B.device)
+    for i in range(nocc):
+        eps_occ_i = float(eps_occ[i])
+        for j in range(nocc):
+            eps_occ_j = float(eps_occ[j])
+            e_mp2 = e_mp2 + nki_fused_gemm_energy(B[i], B[j], eps_occ_i, eps_occ_j, eps_vir)
+    return float(e_mp2)
+
+
 def df_mp2_energy(
     C_occ: torch.Tensor,  # (nbasis, nocc) — occupied MO coefficients
     C_vir: torch.Tensor,  # (nbasis, nvir) — virtual MO coefficients
@@ -93,12 +122,17 @@ def df_mp2_energy(
     eps_vir: torch.Tensor,  # (nvir,) — virtual orbital energies
     timings: dict | None = None,
     use_fused: bool = False,
+    use_fused_gemm: bool = False,
 ) -> float:
     """Compute DF-MP2 correlation energy.
 
     Returns E_MP2 (scalar). Optionally fills `timings` with per-step seconds.
-    When `use_fused=True`, the energy-reduction step routes through
-    `trnblas.nki.nki_mp2_energy`.
+
+    use_fused:       Route energy-reduction through `nki_mp2_energy`
+                     (fused chunk-level kernel, #15 M2 — 1.48× on energy step).
+    use_fused_gemm:  Route energy through `nki_fused_gemm_energy` per (i,j)
+                     pair (fused GEMM+energy kernel, #38 v0.5.1 — eliminates
+                     T_flat HBM round-trip).
     """
     nbasis, nocc = C_occ.shape
     naux = J_metric.shape[0]
@@ -135,14 +169,18 @@ def df_mp2_energy(
     B = trnblas.batched_gemm(1.0, ia_P, J_b)  # (nocc, nvir, naux)
     t_metric = time.perf_counter() - t0
 
-    # Step 4: Energy via one GEMM (chunked over i if memory-tight).
+    # Step 4: Energy.
     #   T(i,j)_{ab} = Σ_P B[i,a,P] B[j,b,P]
-    # Reshape B → X of shape (nocc·nvir, naux); then T_full = X @ X.T is
-    # one GEMM, and T_full[i·nvir+a, j·nvir+b] = T(i,j)_{ab}. No batching
-    # over (i,j) needed — that was the wrong shape for this contraction.
-    # For shapes where the full T_full doesn't fit HBM, chunk over i.
+    #
+    # Three paths in order of increasing fusion:
+    #   default:         chunk-GEMM (B_flat @ B_flat.T) + torch reduction
+    #   --fused-energy:  chunk-GEMM + fused NKI energy kernel (#15 M2)
+    #   --fused-gemm-energy: per-pair fused GEMM+energy NKI kernel (#38 v0.5.1)
     t0 = time.perf_counter()
-    e_mp2 = _energy_reduction(B, eps_occ, eps_vir, use_fused=use_fused)
+    if use_fused_gemm:
+        e_mp2 = _energy_reduction_fused_gemm(B, eps_occ, eps_vir)
+    else:
+        e_mp2 = _energy_reduction(B, eps_occ, eps_vir, use_fused=use_fused)
     t_energy = time.perf_counter() - t0
 
     if timings is not None:
@@ -195,22 +233,28 @@ _BENCH_SHAPES = {
 }
 
 
-def bench(shape_name: str, device: str = "cpu", use_fused: bool = False):
+def bench(
+    shape_name: str,
+    device: str = "cpu",
+    use_fused: bool = False,
+    use_fused_gemm: bool = False,
+):
     nbasis, nocc, naux = _BENCH_SHAPES[shape_name]
     nvir = nbasis - nocc
     flops = _flops(nbasis, nocc, naux)
     inputs = _make_inputs(nbasis, nocc, naux, device=device)
 
+    energy_mode = "fused-gemm" if use_fused_gemm else ("fused" if use_fused else "torch")
     print(f"[shape={shape_name} nbasis={nbasis} nocc={nocc} nvir={nvir} naux={naux}]")
     print(
         f"  approx flops: {flops / 1e9:.1f} G  backend: {trnblas.get_backend()}  "
-        f"device: {device}  fused_energy: {use_fused}"
+        f"device: {device}  energy_mode: {energy_mode}"
     )
 
     for label in ("cold", "warm"):
         t = {}
         t0 = time.perf_counter()
-        e = df_mp2_energy(*inputs, timings=t, use_fused=use_fused)
+        e = df_mp2_energy(*inputs, timings=t, use_fused=use_fused, use_fused_gemm=use_fused_gemm)
         # Ensure async GPU work completes before stopping the timer.
         if device != "cpu" and torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -246,14 +290,25 @@ def main():
         "--fused-energy",
         action="store_true",
         help="Route the energy-reduction step through trnblas.nki.nki_mp2_energy "
-        "(fused NKI kernel, #15 M2).",
+        "(fused chunk-level kernel, #15 M2 — 1.48× on energy step).",
+    )
+    parser.add_argument(
+        "--fused-gemm-energy",
+        action="store_true",
+        help="Route the energy step through nki_fused_gemm_energy (per-pair fused "
+        "GEMM+energy kernel, #38 v0.5.1 — eliminates T_flat HBM round-trip).",
     )
     args = parser.parse_args()
 
     if args.bench:
         shapes = [args.shape] if args.shape else list(_BENCH_SHAPES)
         for s in shapes:
-            bench(s, device=args.device, use_fused=args.fused_energy)
+            bench(
+                s,
+                device=args.device,
+                use_fused=args.fused_energy,
+                use_fused_gemm=args.fused_gemm_energy,
+            )
         return
 
     if args.demo:
@@ -273,7 +328,12 @@ def main():
 
     timings: dict = {}
     t0 = time.perf_counter()
-    e_mp2 = df_mp2_energy(*inputs, timings=timings, use_fused=args.fused_energy)
+    e_mp2 = df_mp2_energy(
+        *inputs,
+        timings=timings,
+        use_fused=args.fused_energy,
+        use_fused_gemm=args.fused_gemm_energy,
+    )
     total = time.perf_counter() - t0
     for k, v in timings.items():
         print(f"  {k:15s}: {v:.3f}s")

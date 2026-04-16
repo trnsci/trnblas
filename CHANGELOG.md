@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] — 2026-04-15
+
+### Added
+
+- **Fused GEMM+energy kernel (#38, `nki_fused_gemm_energy`).** A single
+  `@nki.jit` kernel handles one DF-MP2 orbital pair — both GEMMs (T and T_T)
+  and the VE energy expression — without writing the `(nvir, nvir)` T_flat
+  intermediate to HBM.
+
+  **Two-GEMM T_T strategy:** `T.T[a,b] = T[b,a] = (B_j @ B_i.T)[a,b]`.
+  Rather than `nl.load_transpose2d` of T from HBM (which re-introduces the
+  HBM round-trip), T_T is computed as a second GEMM tile in the same kernel
+  body.  Both T and T_T land in SBUF via `tensor_copy` — no HBM write for
+  either intermediate.
+
+  **Kernel design:**
+  - `TILE = 128` everywhere (`nl.load_transpose2d` constrains both dims to ≤ 128).
+  - Outer a-loop, inner b-loop; two sequential PSUM allocations per (a, b) tile
+    (one for T, one for T_T); VE energy expression fully SBUF-resident.
+  - Cross-b batching: `acc_b (TILE, N_B_TILES)` in SBUF accumulates all b-strip
+    partials before one `nl.store` per a-strip — same pattern as `_mp2_energy_kernel`.
+  - NEFF cache amortises the two-GEMM compile across all `nocc²` pairs (same
+    shape every invocation).
+  - NKI 0.3.0 broadcast fix applied to `denom` construction (same as `_mp2_energy_kernel`).
+
+  **Public API:** `trnblas.nki.nki_fused_gemm_energy(b_i, b_j, eps_occ_i, eps_occ_j, eps_vir)` → scalar.
+
+  **Example integration:** `examples/df_mp2.py --fused-gemm-energy` routes the
+  energy step through the per-pair kernel.  Default path remains the chunk-GEMM
+  path until on-hardware timings confirm the phase-3 speedup target.
+
+  **Tests:** `TestFusedGemmEnergy` in `tests/test_nki_gemm.py`:
+  aligned/unaligned correctness (atol=1e-2), symmetry (`E(i,j) == E(j,i)`),
+  zero-B_i, NEFF cache reuse (cold vs warm timing).
+
 ## [0.5.0] — 2026-04-15
 
 ### Added
