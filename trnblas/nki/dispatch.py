@@ -8,8 +8,11 @@ tile reuse on the Tensor Engine for 2x fewer SBUF loads vs naive.
 
 from __future__ import annotations
 
+import json
 import os
 import warnings
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -75,6 +78,28 @@ def _warn_fallback(exc: BaseException) -> None:
 _TILE_M = 128
 _TILE_K = 128
 _TILE_N = 512
+
+# Autotuner — sweeps tile candidates on hardware once per shape bucket and
+# caches the winner to disk. Disabled in simulator mode and by TRNBLAS_AUTOTUNE=0.
+_AUTOTUNE_ENABLED: bool = os.environ.get("TRNBLAS_AUTOTUNE", "1") != "0"
+_AUTOTUNE_CACHE_FILE: Path = Path(
+    os.environ.get("TRNBLAS_AUTOTUNE_CACHE", "/var/tmp/trnblas-autotune/cache.json")
+)
+# Tile candidates: {64,128} × {128} × {128,256,512}.
+# Default (128,128,512) is always included; filtered by divisibility at sweep time.
+_TILE_CANDIDATES: list[tuple[int, int, int]] = [
+    (64, 128, 128),
+    (64, 128, 256),
+    (64, 128, 512),
+    (128, 128, 128),
+    (128, 128, 256),
+    (128, 128, 512),
+]
+# Registry: tile config → cached @nki.jit kernel closure.
+_gemm_kernel_registry: dict[tuple[int, int, int], Any] = {}
+# Persistent autotune results: shape bucket → winning tile config.
+_autotune_mem: dict[tuple[int, int, int], tuple[int, int, int]] = {}
+_autotune_loaded: bool = False
 
 _backend = "auto"
 
@@ -375,26 +400,164 @@ def _to_xla(*tensors):
     return [t.to(device) for t in tensors], orig
 
 
+def _make_gemm_kernel(tile_m: int, tile_k: int, tile_n: int):
+    """Return a new @nki.jit GEMM kernel with tile_m/tile_k/tile_n baked into
+    the closure at trace time.  Each unique config produces a separately-cached
+    NEFF; the XLA/NEFF cache amortises compile across the nocc² pair loop.
+    Only callable when HAS_NKI is True.
+    """
+    tm, tk, tn = tile_m, tile_k, tile_n
+
+    def _kernel(a, b):
+        M, K = a.shape
+        _, N = b.shape
+        TILE_M = tm
+        TILE_K = tk
+        TILE_N = tn if tn < N else N  # single-tile shortcut when N fits
+        c = nl.ndarray((M, N), dtype=a.dtype, buffer=nl.shared_hbm)
+        for m in nl.affine_range(M // TILE_M):
+            for n in nl.affine_range(N // TILE_N):
+                m_off = m * TILE_M
+                n_off = n * TILE_N
+                psum = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
+                for k in nl.affine_range(K // TILE_K):
+                    k_off = k * TILE_K
+                    a_t = nl.load_transpose2d(a[m_off : m_off + TILE_M, k_off : k_off + TILE_K])
+                    b_tile = nl.load(b[k_off : k_off + TILE_K, n_off : n_off + TILE_N])
+                    nisa.nc_matmul(dst=psum, stationary=a_t, moving=b_tile, accumulate=True)
+                c_sbuf = nl.ndarray((TILE_M, TILE_N), dtype=a.dtype, buffer=nl.sbuf)
+                nisa.tensor_copy(src=psum, dst=c_sbuf)
+                nl.store(c[m_off : m_off + TILE_M, n_off : n_off + TILE_N], value=c_sbuf)
+        return c
+
+    return nki.jit(_kernel)
+
+
+def _get_gemm_kernel(tile_m: int, tile_k: int, tile_n: int):
+    """Return (possibly cached) @nki.jit kernel for the given tile config."""
+    key = (tile_m, tile_k, tile_n)
+    if key not in _gemm_kernel_registry:
+        _gemm_kernel_registry[key] = _make_gemm_kernel(tile_m, tile_k, tile_n)
+    return _gemm_kernel_registry[key]
+
+
+def _ceil_pow2(n: int) -> int:
+    p = 1
+    while p < n:
+        p <<= 1
+    return p
+
+
+def _autotune_bucket(M: int, K: int, N: int) -> tuple[int, int, int]:
+    """Coarse shape bucket — same bucket for shapes within a DF-MP2 run."""
+    return (_ceil_pow2(M), _ceil_pow2(K), _ceil_pow2(N))
+
+
+def _load_autotune_cache() -> None:
+    global _autotune_mem, _autotune_loaded
+    if _autotune_loaded:
+        return
+    try:
+        if _AUTOTUNE_CACHE_FILE.exists():
+            raw = json.loads(_AUTOTUNE_CACHE_FILE.read_text())
+            _autotune_mem = {
+                tuple(map(int, k.split(","))): tuple(v)  # type: ignore[assignment]
+                for k, v in raw.items()
+            }
+    except Exception:
+        pass
+    _autotune_loaded = True
+
+
+def _save_autotune_cache() -> None:
+    try:
+        _AUTOTUNE_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _AUTOTUNE_CACHE_FILE.write_text(
+            json.dumps({",".join(map(str, k)): list(v) for k, v in _autotune_mem.items()})
+        )
+    except Exception:
+        pass
+
+
+def _sweep_tile_configs(M_pad: int, K_pad: int, N_pad: int, a_xla, b_xla) -> tuple[int, int, int]:
+    """Time each candidate tile config on hardware; return the fastest.
+
+    Skips configs that don't evenly divide the padded shape. Falls back to
+    the default if every candidate errors or gets filtered out.
+    """
+    import time
+
+    best: tuple[int, int, int] = (_TILE_M, _TILE_K, _TILE_N)
+    best_t = float("inf")
+    for tm, tk, tn in _TILE_CANDIDATES:
+        if M_pad % tm or K_pad % tk or N_pad % tn:
+            continue
+        k = _get_gemm_kernel(tm, tk, tn)
+        try:
+            k(a_xla, b_xla)  # warm-up (compile + first run)
+            t0 = time.perf_counter()
+            for _ in range(3):
+                k(a_xla, b_xla)
+            t = (time.perf_counter() - t0) / 3
+            if t < best_t:
+                best, best_t = (tm, tk, tn), t
+        except Exception:
+            continue
+    return best
+
+
+def _sweep_on_default_pad(
+    M: int, K: int, N: int, A: torch.Tensor, B: torch.Tensor
+) -> tuple[int, int, int]:
+    """Pad with default tile sizes to produce aligned sweep inputs, then sweep."""
+    M_p = _round_up(M, _TILE_M)
+    K_p = _round_up(K, _TILE_K)
+    N_p = N if N <= _TILE_N else _round_up(N, _TILE_N)
+    A_p = torch.zeros(M_p, K_p, dtype=A.dtype, device=A.device)
+    A_p[:M, :K] = A
+    B_p = torch.zeros(K_p, N_p, dtype=B.dtype, device=B.device)
+    B_p[:K, :N] = B
+    (a, b), _ = _to_xla(A_p, B_p)
+    return _sweep_tile_configs(M_p, K_p, N_p, a, b)
+
+
 def _nki_gemm_impl(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
-    """NKI GEMM implementation.
+    """NKI GEMM implementation with tile-shape autotuner (#26).
 
-    Pads M/K up to TILE_M/TILE_K and N up to TILE_N (only when N > TILE_N
-    and not already a multiple) before dispatching the aligned kernel.
-    The result is sliced back to the original (M, N).
+    On hardware: sweeps tile candidates once per shape bucket and caches the
+    winner to disk (``/var/tmp/trnblas-autotune/cache.json`` by default).
+    Subsequent calls for the same bucket hit the in-process dict and then the
+    NEFF cache — no re-sweep.
 
-    Set `TRNBLAS_REQUIRE_NKI=1` to re-raise on kernel errors instead of
-    falling back to `torch.matmul`; useful in the validation loop to
-    surface silent kernel breakage.
+    Padding is computed *after* tile selection so alignment matches the chosen
+    tile sizes.  In simulator mode or when ``TRNBLAS_AUTOTUNE=0`` is set,
+    the default (128, 128, 512) config is used without sweeping.
+
+    Set ``TRNBLAS_REQUIRE_NKI=1`` to re-raise kernel errors instead of falling
+    back to ``torch.matmul``.
     """
     if not HAS_NKI:
         raise RuntimeError("NKI not available")
     M, K = A.shape
     _, N = B.shape
-    M_pad = _round_up(M, _TILE_M)
-    K_pad = _round_up(K, _TILE_K)
-    # When N <= TILE_N, the kernel uses TILE_N = N (single N-tile, no remainder).
-    # Otherwise we need N to be a clean multiple of TILE_N.
-    N_pad = N if N <= _TILE_N else _round_up(N, _TILE_N)
+
+    # Tile selection: autotuner on hardware, defaults elsewhere.
+    if _AUTOTUNE_ENABLED and not _use_simulator():
+        _load_autotune_cache()
+        bucket = _autotune_bucket(M, K, N)
+        if bucket not in _autotune_mem:
+            tile_m, tile_k, tile_n = _sweep_on_default_pad(M, K, N, A, B)
+            _autotune_mem[bucket] = (tile_m, tile_k, tile_n)
+            _save_autotune_cache()
+        tile_m, tile_k, tile_n = _autotune_mem[bucket]
+    else:
+        tile_m, tile_k, tile_n = _TILE_M, _TILE_K, _TILE_N
+
+    # Pad to chosen tile sizes.
+    M_pad = _round_up(M, tile_m)
+    K_pad = _round_up(K, tile_k)
+    # When N ≤ tile_n the kernel uses a single N-tile (no remainder needed).
+    N_pad = N if tile_n >= N else _round_up(N, tile_n)
     needs_pad = (M_pad != M) or (K_pad != K) or (N_pad != N)
 
     try:
@@ -407,15 +570,13 @@ def _nki_gemm_impl(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
         else:
             A_feed, B_feed = A.contiguous(), B.contiguous()
 
+        kernel = _get_gemm_kernel(tile_m, tile_k, tile_n)
         if _use_simulator():
-            # CPU-side: feed NumPy arrays to nki.simulate(kernel). Bypasses
-            # torch_xla entirely.
-            out_np = nki.simulate(_gemm_kernel)(A_feed.cpu().numpy(), B_feed.cpu().numpy())
+            out_np = nki.simulate(kernel)(A_feed.cpu().numpy(), B_feed.cpu().numpy())
             result = torch.from_numpy(np.asarray(out_np)).to(A.device)
         else:
             (a, b), orig_device = _to_xla(A_feed, B_feed)
-            c = _gemm_kernel(a, b)
-            result = c.to(orig_device)
+            result = kernel(a, b).to(orig_device)
         return result[:M, :N] if needs_pad else result
     except Exception as exc:
         if _REQUIRE_NKI:
@@ -467,60 +628,10 @@ def _nki_syrk_impl(A: torch.Tensor) -> torch.Tensor:
 
 
 if HAS_NKI:
-
-    @nki.jit
-    def _gemm_kernel(a, b):
-        """Real GEMM: C = A @ B with stationary tile reuse.
-
-        Caller guarantees M, K are multiples of 128 and N is either ≤ 512
-        or a multiple of 512 (handled by the dispatch wrapper's HBM
-        padding). PSUM accumulates over K-tiles before the single store
-        per (m, n) tile pair.
-
-        NKI 0.3.0 calling convention (`nisa.nc_matmul(dst, stationary,
-        moving, accumulate)`):
-            dst:        (TILE_M, TILE_N)  fp32, in nl.psum — written in place
-            stationary: (TILE_K, TILE_M)  partition=K ≤ 128, free ≤ 128
-            moving:     (TILE_K, TILE_N)  partition=K, free ≤ 512
-        `accumulate=True` reads-modify-writes dst (replaces the
-        `psum[...] += nc_matmul(...)` pattern from the pre-0.3.0 API).
-        """
-        M, K = a.shape
-        _, N = b.shape
-
-        TILE_M = _TILE_M
-        TILE_K = _TILE_K
-        TILE_N = N if N <= _TILE_N else _TILE_N
-
-        c = nl.ndarray((M, N), dtype=a.dtype, buffer=nl.shared_hbm)
-
-        for m in nl.affine_range(M // TILE_M):
-            for n in nl.affine_range(N // TILE_N):
-                m_off = m * TILE_M
-                n_off = n * TILE_N
-
-                psum = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
-
-                for k in nl.affine_range(K // TILE_K):
-                    k_off = k * TILE_K
-
-                    # Load A row-tile transposed so partition dim = K.
-                    a_t = nl.load_transpose2d(a[m_off : m_off + TILE_M, k_off : k_off + TILE_K])
-                    # B is already K-major.
-                    b_tile = nl.load(b[k_off : k_off + TILE_K, n_off : n_off + TILE_N])
-
-                    nisa.nc_matmul(dst=psum, stationary=a_t, moving=b_tile, accumulate=True)
-
-                # PSUM → SBUF via tensor_copy (NKI 0.3.0 rejects
-                # dma_copy reading from PSUM; nl.copy returns a view).
-                c_sbuf = nl.ndarray((TILE_M, TILE_N), dtype=a.dtype, buffer=nl.sbuf)
-                nisa.tensor_copy(src=psum, dst=c_sbuf)
-                nl.store(
-                    c[m_off : m_off + TILE_M, n_off : n_off + TILE_N],
-                    value=c_sbuf,
-                )
-
-        return c
+    # Populate default tile config in the kernel registry.
+    # _gemm_kernel is kept as a module-level alias for backward compatibility
+    # (simulator path and any external callers that reference it directly).
+    _gemm_kernel = _get_gemm_kernel(_TILE_M, _TILE_K, _TILE_N)
 
     @nki.jit
     def _mp2_energy_kernel(T_flat, eps_occ_chunk, eps_occ_full, eps_vir_col, eps_vir_row):

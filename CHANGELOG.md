@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-04-15
+
+### Added
+
+- **GEMM tile-shape autotuner (#26).** `_nki_gemm_impl` now sweeps six tile
+  candidates `{64,128} × {128} × {128,256,512}` on the first call per shape
+  bucket and caches the winner to disk
+  (`/var/tmp/trnblas-autotune/cache.json`, overrideable via
+  `TRNBLAS_AUTOTUNE_CACHE`). Subsequent calls for the same bucket hit the
+  in-process dict first, then the NEFF cache — no re-sweep. Padding is now
+  computed *after* tile selection so alignment always matches the chosen tile
+  sizes. Opt out with `TRNBLAS_AUTOTUNE=0` to restore v0.4.x fixed
+  `(128,128,512)` behaviour. Backward compatible: `_gemm_kernel` alias
+  preserved; `_TILE_M/K/N` fallback constants kept for SYRK/TRSM.
+  - `_make_gemm_kernel(tile_m, tile_k, tile_n)` — factory returning a new
+    `@nki.jit` closure with tile values baked in at trace time; each config
+    produces a separately-cached NEFF.
+  - `_get_gemm_kernel(...)` — registry wrapper (call once per config, reuse).
+  - `_autotune_bucket(M, K, N)` — `ceil_pow2` coarse bucket; all shapes in
+    a DF-MP2 run land in the same bucket.
+  - `_sweep_tile_configs` / `_sweep_on_default_pad` — hardware timing (3
+    warm runs each), safe fallback to default on per-config errors.
+  - Persistent JSON cache with atomic directory creation.
+  - `TestAutotuner` class in `tests/test_nki_gemm.py`: escape-hatch,
+    cache-hit (no re-sweep), persistent-cache round-trip, per-config
+    correctness, hardware sweep.
+
 ### Changed
 
 - **#33 resolved — `_mp2_energy_kernel` profile via Neuron Profiler 2.0.**
