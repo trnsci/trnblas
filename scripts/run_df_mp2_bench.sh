@@ -3,23 +3,26 @@
 # Run the DF-MP2 bench example on the trnblas CI instance via SSM.
 #
 # Usage:
-#   AWS_PROFILE=aws ./scripts/run_df_mp2_bench.sh                 # all 3 shapes
-#   AWS_PROFILE=aws ./scripts/run_df_mp2_bench.sh --shape medium  # one shape
-#   AWS_PROFILE=aws ./scripts/run_df_mp2_bench.sh --compare       # torch vs --fused-energy, one session
-#   AWS_PROFILE=aws ./scripts/run_df_mp2_bench.sh trn2            # different instance
+#   AWS_PROFILE=aws ./scripts/run_df_mp2_bench.sh                       # all 3 shapes, torch energy
+#   AWS_PROFILE=aws ./scripts/run_df_mp2_bench.sh --shape medium        # one shape
+#   AWS_PROFILE=aws ./scripts/run_df_mp2_bench.sh --compare             # torch vs --fused-energy
+#   AWS_PROFILE=aws ./scripts/run_df_mp2_bench.sh --compare-all         # torch vs fused vs batched-pair
+#   AWS_PROFILE=aws ./scripts/run_df_mp2_bench.sh --batched-pair-energy # batched-pair only
+#   AWS_PROFILE=aws ./scripts/run_df_mp2_bench.sh trn2                  # different instance
 #
 # Mirrors run_neuron_tests.sh: starts the tagged instance, runs the
 # bench, prints stdout/stderr, and stops the instance via trap.
 # The bench itself runs each shape twice (cold / warm cache) inside one
 # Python process — no need for a --warm flag at the script level.
 #
-# --compare runs the bench twice back-to-back in one SSM session: once
-# with the torch energy path, once with --fused-energy. Avoids a second
-# instance-start round-trip when doing A/B comparisons.
+# --compare runs torch then --fused-energy in one SSM session.
+# --compare-all runs torch, --fused-gemm-energy, and --batched-pair-energy
+#   in sequence — the full Phase 3 benchmark table in one instance start.
 
 set -euo pipefail
 
 COMPARE=0
+COMPARE_ALL=0
 EXTRA_ARGS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -29,6 +32,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --compare)
       COMPARE=1
+      shift
+      ;;
+    --compare-all)
+      COMPARE_ALL=1
       shift
       ;;
     trn1|trn2|inf2)
@@ -106,16 +113,19 @@ if [[ "$PING" != "Online" ]]; then
   exit 1
 fi
 
-if [[ "$COMPARE" -eq 1 ]]; then
-  # No single quotes — the whole SSM command is wrapped in bash -c '...',
-  # so embedded single quotes would close the outer string and silently
-  # truncate output. printf is unambiguous across quoting layers.
-  BENCH_INVOCATION="printf %s\\\\n ==TORCH== && sudo -u ubuntu env PATH=\$NEURON_VENV/bin:/usr/bin:/bin \$NEURON_VENV/bin/python /home/ubuntu/trnblas/examples/df_mp2.py --bench $BENCH_ARGS && printf %s\\\\n ==FUSED== && sudo -u ubuntu env PATH=\$NEURON_VENV/bin:/usr/bin:/bin \$NEURON_VENV/bin/python /home/ubuntu/trnblas/examples/df_mp2.py --bench --fused-energy $BENCH_ARGS"
+_PY="sudo -u ubuntu env PATH=\$NEURON_VENV/bin:/usr/bin:/bin \$NEURON_VENV/bin/python /home/ubuntu/trnblas/examples/df_mp2.py --bench"
+
+if [[ "$COMPARE_ALL" -eq 1 ]]; then
+  # Full Phase 3 table: torch → fused-gemm → batched-pair in one SSM session.
+  BENCH_INVOCATION="printf %s\\\\n ==TORCH== && $_PY $BENCH_ARGS && printf %s\\\\n ==FUSED-GEMM== && $_PY --fused-gemm-energy $BENCH_ARGS && printf %s\\\\n ==BATCHED-PAIR== && $_PY --batched-pair-energy $BENCH_ARGS"
+elif [[ "$COMPARE" -eq 1 ]]; then
+  # Legacy: torch vs --fused-energy (the chunk-GEMM fused kernel, #15 M2).
+  BENCH_INVOCATION="printf %s\\\\n ==TORCH== && $_PY $BENCH_ARGS && printf %s\\\\n ==FUSED== && $_PY --fused-energy $BENCH_ARGS"
 else
-  BENCH_INVOCATION="sudo -u ubuntu env PATH=\$NEURON_VENV/bin:/usr/bin:/bin \$NEURON_VENV/bin/python /home/ubuntu/trnblas/examples/df_mp2.py --bench $BENCH_ARGS"
+  BENCH_INVOCATION="$_PY $BENCH_ARGS"
 fi
 
-echo "Sending bench command (SHA=$SHA, args=$BENCH_ARGS, compare=$COMPARE)..."
+echo "Sending bench command (SHA=$SHA, args=$BENCH_ARGS, compare=$COMPARE, compare_all=$COMPARE_ALL)..."
 CMD_ID=$(aws ssm send-command \
   --instance-ids "$INSTANCE_ID" \
   --document-name "AWS-RunShellScript" \
