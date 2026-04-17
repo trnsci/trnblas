@@ -108,6 +108,29 @@ HBM transfer + Tensor Engine dispatch only (NEFF cache hit).
 | Total     | 39.3 ms |
 | Per-slice | 1.23 ms |
 
+## DF-MP2 energy step — 3-way kernel comparison
+
+**Small shape (nbasis=128, nocc=16, nvir=112, naux=384 — 256 pairs),
+trn1.2xlarge, warm NEFF cache, v0.5.2:**
+
+| Energy path | Warm energy | Warm total | vs torch |
+|---|---:|---:|---:|
+| torch (chunk-GEMM baseline) | 0.018 s | 0.096 s | 1× |
+| fused-gemm (per-pair, v0.5.1) | 0.381 s | 0.454 s | 21× slower |
+| **batched-pair (v0.5.2)** | **0.005 s** | **0.081 s** | **3.6× faster** |
+
+The batched-pair kernel is the first energy path that beats the chunk-GEMM
+torch baseline end-to-end on the energy step. Cold energy (first call,
+includes NEFF compile): 6.7 s for batched-pair — paid once per instance
+lifetime, amortised across all subsequent calls.
+
+Energies agree to FP32 noise: torch / fused-gemm = -1.619250e-04,
+batched-pair = -1.619249e-04.
+
+Medium shape (nbasis=512, nocc=64, nvir=448, naux=1536 — 4096 pairs):
+numbers pending next bench run — tracked in
+[#23](https://github.com/trnsci/trnblas/issues/23).
+
 ## DF-MP2 end-to-end — Trainium1 vs NVIDIA A10G
 
 Synthetic inputs, same seed, same three shapes on both platforms.
