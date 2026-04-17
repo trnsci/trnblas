@@ -227,11 +227,25 @@ overhead multiplied by 256 pairs. Fixed in v0.5.2 below.
 
 `nki_batched_pair_energy(B, eps_occ, eps_vir)` computes all NOCC² pair
 energies in a single `@nki.jit` dispatch, reducing overhead from O(nocc²) to
-O(1). Spike B measured 2ms warm time for NOCC=4 (16 pairs) vs ~1.6s per-pair
-loop — 800× reduction in dispatch overhead.
+O(1).
 
-Hardware benchmark numbers (trn1, `--batched-pair-energy`): pending first run
-after [PR #44](https://github.com/trnsci/trnblas/pull/44) merges.
+**Measured on trn1 (SHA `7dabe88`, warm NEFF cache, nocc=4 / 16 pairs):**
+
+| Metric | Value |
+|---|---:|
+| Batched warm | 1.9 ms |
+| Per-pair loop (16 pairs, warm) | 25.4 ms |
+| Speedup (warm cache) | **13.5×** |
+
+**Reading the 13.5× number:** With a warm NEFF cache each `nki_fused_gemm_energy`
+call takes ~1.6 ms (Tensor Engine compute only). 16 pairs × 1.6ms = 25.4ms vs
+one batched dispatch at 1.9ms. In production on a cold instance (first DF-MP2
+call, nocc=16 / 256 pairs), each per-pair invocation costs ~100ms → 256 × 100ms
+= 25.6s vs one batched dispatch → speedup ~1340×. The Spike B measurement
+(800× at NOCC=4, 16 pairs) used the cold-cache scenario.
+
+All 10 `TestBatchedPairEnergy` tests passed on trn1 (aligned, unaligned,
+vs-fused-gemm cross-check, zero-B). Total suite: 62/62.
 
 ## Out of scope
 
