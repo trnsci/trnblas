@@ -55,6 +55,16 @@ Issues = "https://github.com/trnsci/trnblas/issues"
 [tool.setuptools.packages.find]
 include = ["trnblas*"]
 
+[tool.uv]
+# neuronxcc / torch-neuronx are only available on Trainium instances.
+# Exclude the [neuron] extra from local uv resolution so `uv run` / `uv sync`
+# works on dev machines without hardware (CI installs it on-instance manually).
+exclude-dependencies = [
+    "neuronxcc",
+    "torch-neuronx",
+    "nki",
+]
+
 [tool.ruff]
 # Match the rest of the trnsci suite. Line length 100 is a compromise
 # between black's 88 and the wider tables common in scientific code.

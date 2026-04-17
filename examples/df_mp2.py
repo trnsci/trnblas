@@ -113,6 +113,22 @@ def _energy_reduction_fused_gemm(
     return float(e_mp2)
 
 
+def _energy_reduction_batched_pair(
+    B: torch.Tensor,
+    eps_occ: torch.Tensor,
+    eps_vir: torch.Tensor,
+) -> float:
+    """Energy via the batched-pair kernel (#43, v0.5.2).
+
+    Calls `nki_batched_pair_energy` once for all NOCC² orbital pairs in a
+    single @nki.jit dispatch — eliminating the ~100ms × nocc² per-dispatch
+    overhead of the per-pair loop.
+    """
+    from trnblas.nki import nki_batched_pair_energy
+
+    return float(nki_batched_pair_energy(B, eps_occ, eps_vir))
+
+
 def df_mp2_energy(
     C_occ: torch.Tensor,  # (nbasis, nocc) — occupied MO coefficients
     C_vir: torch.Tensor,  # (nbasis, nvir) — virtual MO coefficients
@@ -123,16 +139,20 @@ def df_mp2_energy(
     timings: dict | None = None,
     use_fused: bool = False,
     use_fused_gemm: bool = False,
+    use_batched_pair: bool = False,
 ) -> float:
     """Compute DF-MP2 correlation energy.
 
     Returns E_MP2 (scalar). Optionally fills `timings` with per-step seconds.
 
-    use_fused:       Route energy-reduction through `nki_mp2_energy`
-                     (fused chunk-level kernel, #15 M2 — 1.48× on energy step).
-    use_fused_gemm:  Route energy through `nki_fused_gemm_energy` per (i,j)
-                     pair (fused GEMM+energy kernel, #38 v0.5.1 — eliminates
-                     T_flat HBM round-trip).
+    use_fused:         Route energy-reduction through `nki_mp2_energy`
+                       (fused chunk-level kernel, #15 M2 — 1.48× on energy step).
+    use_fused_gemm:    Route energy through `nki_fused_gemm_energy` per (i,j)
+                       pair (fused GEMM+energy kernel, #38 v0.5.1 — eliminates
+                       T_flat HBM round-trip).
+    use_batched_pair:  Route energy through `nki_batched_pair_energy` (#43 v0.5.2
+                       — single dispatch for all nocc² pairs, eliminates
+                       ~100ms × nocc² per-dispatch overhead).
     """
     nbasis, nocc = C_occ.shape
     naux = J_metric.shape[0]
@@ -172,12 +192,15 @@ def df_mp2_energy(
     # Step 4: Energy.
     #   T(i,j)_{ab} = Σ_P B[i,a,P] B[j,b,P]
     #
-    # Three paths in order of increasing fusion:
-    #   default:         chunk-GEMM (B_flat @ B_flat.T) + torch reduction
-    #   --fused-energy:  chunk-GEMM + fused NKI energy kernel (#15 M2)
+    # Four paths in order of increasing fusion:
+    #   default:            chunk-GEMM (B_flat @ B_flat.T) + torch reduction
+    #   --fused-energy:     chunk-GEMM + fused NKI energy kernel (#15 M2)
     #   --fused-gemm-energy: per-pair fused GEMM+energy NKI kernel (#38 v0.5.1)
+    #   --batched-pair-energy: single dispatch for all nocc² pairs (#43 v0.5.2)
     t0 = time.perf_counter()
-    if use_fused_gemm:
+    if use_batched_pair:
+        e_mp2 = _energy_reduction_batched_pair(B, eps_occ, eps_vir)
+    elif use_fused_gemm:
         e_mp2 = _energy_reduction_fused_gemm(B, eps_occ, eps_vir)
     else:
         e_mp2 = _energy_reduction(B, eps_occ, eps_vir, use_fused=use_fused)
@@ -238,13 +261,21 @@ def bench(
     device: str = "cpu",
     use_fused: bool = False,
     use_fused_gemm: bool = False,
+    use_batched_pair: bool = False,
 ):
     nbasis, nocc, naux = _BENCH_SHAPES[shape_name]
     nvir = nbasis - nocc
     flops = _flops(nbasis, nocc, naux)
     inputs = _make_inputs(nbasis, nocc, naux, device=device)
 
-    energy_mode = "fused-gemm" if use_fused_gemm else ("fused" if use_fused else "torch")
+    if use_batched_pair:
+        energy_mode = "batched-pair"
+    elif use_fused_gemm:
+        energy_mode = "fused-gemm"
+    elif use_fused:
+        energy_mode = "fused"
+    else:
+        energy_mode = "torch"
     print(f"[shape={shape_name} nbasis={nbasis} nocc={nocc} nvir={nvir} naux={naux}]")
     print(
         f"  approx flops: {flops / 1e9:.1f} G  backend: {trnblas.get_backend()}  "
@@ -254,7 +285,13 @@ def bench(
     for label in ("cold", "warm"):
         t = {}
         t0 = time.perf_counter()
-        e = df_mp2_energy(*inputs, timings=t, use_fused=use_fused, use_fused_gemm=use_fused_gemm)
+        e = df_mp2_energy(
+            *inputs,
+            timings=t,
+            use_fused=use_fused,
+            use_fused_gemm=use_fused_gemm,
+            use_batched_pair=use_batched_pair,
+        )
         # Ensure async GPU work completes before stopping the timer.
         if device != "cpu" and torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -298,6 +335,12 @@ def main():
         help="Route the energy step through nki_fused_gemm_energy (per-pair fused "
         "GEMM+energy kernel, #38 v0.5.1 — eliminates T_flat HBM round-trip).",
     )
+    parser.add_argument(
+        "--batched-pair-energy",
+        action="store_true",
+        help="Route the energy step through nki_batched_pair_energy (single dispatch "
+        "for all nocc² pairs, #43 v0.5.2 — eliminates ~100ms × nocc² overhead).",
+    )
     args = parser.parse_args()
 
     if args.bench:
@@ -308,6 +351,7 @@ def main():
                 device=args.device,
                 use_fused=args.fused_energy,
                 use_fused_gemm=args.fused_gemm_energy,
+                use_batched_pair=args.batched_pair_energy,
             )
         return
 
@@ -333,6 +377,7 @@ def main():
         timings=timings,
         use_fused=args.fused_energy,
         use_fused_gemm=args.fused_gemm_energy,
+        use_batched_pair=args.batched_pair_energy,
     )
     total = time.perf_counter() - t0
     for k, v in timings.items():

@@ -16,7 +16,7 @@ import torch
 
 import trnblas
 from trnblas import batched_gemm, gemm
-from trnblas.nki import nki_batched_gemm, nki_fused_gemm_energy, nki_gemm
+from trnblas.nki import nki_batched_gemm, nki_batched_pair_energy, nki_fused_gemm_energy, nki_gemm
 
 pytestmark = pytest.mark.neuron
 
@@ -435,4 +435,139 @@ class TestFusedGemmEnergy:
                 f"cold={cold * 1000:7.1f}ms  "
                 f"warm_min={warm_min * 1000:7.1f}ms  "
                 f"speedup={cold / warm_min:.1f}x"
+            )
+
+
+class TestBatchedPairEnergy:
+    """Batched DF-MP2 pair energy kernel (#43, milestone v0.5.2).
+
+    `nki_batched_pair_energy(B, eps_occ, eps_vir)` computes the full DF-MP2
+    pair energy for all NOCC² orbital pairs in a single @nki.jit dispatch,
+    eliminating the ~100ms × nocc² per-dispatch overhead of the per-pair loop.
+
+    3D NKI indexing (B[i, a_off:, k_off:] with affine_range i) was validated
+    on trn1 via the Spike A / Spike B scripts on 2026-04-17.
+    """
+
+    # Loose FP32 tolerance — the kernel accumulates across nocc² pairs.
+    ATOL = 1e-2
+    RTOL = 1e-3
+
+    def _ref(self, B, eps_occ, eps_vir):
+        """PyTorch reference: explicit nocc × nocc loop."""
+        nocc = B.shape[0]
+        e = torch.zeros((), dtype=B.dtype)
+        for i in range(nocc):
+            for j in range(nocc):
+                T = B[i] @ B[j].T
+                denom = (
+                    float(eps_occ[i])
+                    + float(eps_occ[j])
+                    - eps_vir.unsqueeze(1)
+                    - eps_vir.unsqueeze(0)
+                )
+                e = e + (T * (2.0 * T - T.T) / denom).sum()
+        return e
+
+    @pytest.mark.parametrize(
+        "nocc,nvir,naux",
+        [
+            (4, 128, 128),  # minimal aligned
+            (4, 256, 256),  # 2× tile grid
+            (8, 128, 128),  # larger nocc, single tile
+            (4, 256, 128),  # naux = one TILE_K
+        ],
+    )
+    def test_correctness_aligned(self, nki_backend, nocc, nvir, naux, rng):
+        """Aligned shapes: batched result matches PyTorch reference."""
+        B = torch.randn(nocc, nvir, naux, generator=rng) * 0.1
+        eps_occ = torch.rand(nocc, generator=rng) * 0.5 + 2.0
+        eps_vir = torch.rand(nvir, generator=rng) * 0.5
+        ref = self._ref(B, eps_occ, eps_vir)
+        out = nki_batched_pair_energy(B, eps_occ, eps_vir)
+        torch.testing.assert_close(out, ref, atol=self.ATOL, rtol=self.RTOL)
+
+    @pytest.mark.parametrize(
+        "nocc,nvir,naux",
+        [
+            (4, 200, 137),  # all unaligned
+            (4, 256, 200),  # naux unaligned
+            (4, 144, 128),  # nvir unaligned
+        ],
+    )
+    def test_correctness_unaligned(self, nki_backend, nocc, nvir, naux, rng):
+        """Unaligned shapes: padding logic keeps result correct."""
+        B = torch.randn(nocc, nvir, naux, generator=rng) * 0.1
+        eps_occ = torch.rand(nocc, generator=rng) * 0.5 + 2.0
+        eps_vir = torch.rand(nvir, generator=rng) * 0.5
+        ref = self._ref(B, eps_occ, eps_vir)
+        out = nki_batched_pair_energy(B, eps_occ, eps_vir)
+        torch.testing.assert_close(out, ref, atol=self.ATOL, rtol=self.RTOL)
+
+    def test_matches_fused_gemm_energy(self, nki_backend, rng):
+        """Batched result matches per-pair nki_fused_gemm_energy sum."""
+        nocc, nvir, naux = 4, 256, 256
+        B = torch.randn(nocc, nvir, naux, generator=rng) * 0.1
+        eps_occ = torch.rand(nocc, generator=rng) * 0.5 + 2.0
+        eps_vir = torch.rand(nvir, generator=rng) * 0.5
+
+        # per-pair reference
+        e_ref = torch.zeros(())
+        for i in range(nocc):
+            for j in range(nocc):
+                e_ref = e_ref + nki_fused_gemm_energy(
+                    B[i], B[j], float(eps_occ[i]), float(eps_occ[j]), eps_vir
+                )
+
+        out = nki_batched_pair_energy(B, eps_occ, eps_vir)
+        torch.testing.assert_close(out, e_ref, atol=self.ATOL, rtol=self.RTOL)
+
+    def test_zero_B(self, nki_backend):
+        """B = 0 → all T = 0 → energy = 0."""
+        nocc, nvir, naux = 4, 128, 128
+        B = torch.zeros(nocc, nvir, naux)
+        eps_occ = torch.ones(nocc) * 2.0
+        eps_vir = torch.ones(nvir) * 0.5
+        out = nki_batched_pair_energy(B, eps_occ, eps_vir)
+        torch.testing.assert_close(out, torch.tensor(0.0), atol=0, rtol=0)
+
+    def test_dispatch_overhead(self, nki_backend, rng, capsys):
+        """Single dispatch covers all nocc² pairs; warm time << per-pair baseline.
+
+        Reports cold/warm times for the batched kernel and the per-pair loop
+        so the overhead reduction from #43 can be observed in CI output.
+        """
+        import time
+
+        nocc, nvir, naux = 4, 256, 256
+        B = torch.randn(nocc, nvir, naux, generator=rng) * 0.1
+        eps_occ = torch.rand(nocc, generator=rng) * 0.5 + 2.0
+        eps_vir = torch.rand(nvir, generator=rng) * 0.5
+
+        # batched: single dispatch
+        t0 = time.perf_counter()
+        nki_batched_pair_energy(B, eps_occ, eps_vir)
+        cold_batched = time.perf_counter() - t0
+
+        warm_times = []
+        for _ in range(4):
+            t = time.perf_counter()
+            nki_batched_pair_energy(B, eps_occ, eps_vir)
+            warm_times.append(time.perf_counter() - t)
+        warm_batched = min(warm_times)
+
+        # per-pair: nocc² dispatches (warm — NEFF cached from above run)
+        t0 = time.perf_counter()
+        for i in range(nocc):
+            for j in range(nocc):
+                nki_fused_gemm_energy(B[i], B[j], float(eps_occ[i]), float(eps_occ[j]), eps_vir)
+        t_per_pair = time.perf_counter() - t0
+
+        with capsys.disabled():
+            print(
+                f"\n[batched_pair nocc={nocc} nvir={nvir} naux={naux}] "
+                f"cold={cold_batched * 1000:7.1f}ms  "
+                f"warm={warm_batched * 1000:7.1f}ms  "
+                f"per-pair-loop={t_per_pair * 1000:7.1f}ms  "
+                f"speedup={t_per_pair / warm_batched:.1f}x"
             )
