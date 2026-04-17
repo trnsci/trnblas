@@ -1561,12 +1561,19 @@ if HAS_NKI:
 
         e_partial = nl.ndarray((TILE, NOCC), dtype=nl.float32, buffer=nl.shared_hbm)
 
+        # Load eps_occ_i into SBUF explicitly so nl.add operates on SBUF
+        # operands, not shared_hbm. Without this load the shared_hbm
+        # annotation propagates through the NKI compute graph and corrupts
+        # the PSUM allocation for psum_t, causing:
+        #   tensor_copy src must be SBUF or PSUM, got shared_hbm
+        eo_i = nl.load(eps_occ_i[0:1, 0:1])  # (1, 1), now SBUF-resident
+
         # Batch all NOCC j-partials before single HBM store.
         acc_j = nl.zeros((TILE, NOCC), dtype=nl.float32, buffer=nl.sbuf)
 
         for j in nl.affine_range(NOCC):
             eps_j = nl.load(eps_occ_row[0:1, j : j + 1])  # (1, 1)
-            eps_occ_sum = nl.add(eps_occ_i, eps_j)  # (1, 1)
+            eps_occ_sum = nl.add(eo_i, eps_j)  # (1, 1)
 
             acc_a = nl.zeros((TILE, N_A_TILES), dtype=nl.float32, buffer=nl.sbuf)
 
