@@ -40,12 +40,19 @@ AWS_PROFILE=aws terraform apply \
 ```bash
 cd infra/terraform-trn2
 AWS_PROFILE=aws terraform init
-AWS_PROFILE=aws terraform apply \
-  -var="vpc_id=vpc-xxxxxx" \
-  -var="subnet_id=subnet-xxxxxx"
+AWS_PROFILE=aws terraform apply
 ```
 
-You'll need a VPC and public subnet in the target region. User-data takes ~5 minutes to install the Neuron SDK and clone trnblas.
+The trn2 root is self-contained — it creates its own VPC, public subnet, internet gateway,
+and route table in sa-east-1. No `vpc_id` or `subnet_id` variables required.
+
+If `apply` fails with `InsufficientInstanceCapacity`, the default AZ is `sa-east-1a`.
+Retry with a different AZ:
+```bash
+AWS_PROFILE=aws terraform apply -var="az_suffix=b"   # or az_suffix=c
+```
+
+User-data takes ~5 minutes to install the Neuron SDK and clone trnblas.
 
 Stop the instance once ready:
 
@@ -60,7 +67,7 @@ AWS_PROFILE=aws aws ec2 stop-instances \
 cd infra/terraform-trn2
 AWS_PROFILE=aws aws ec2 stop-instances \
   --instance-ids $(AWS_PROFILE=aws terraform output -raw instance_id) \
-  --region sa-east-1
+  --region $(AWS_PROFILE=aws terraform output -raw aws_region)
 ```
 
 ## Running neuron tests
@@ -169,4 +176,6 @@ cd /home/ubuntu/trnblas && pip install -e '.[neuron,dev]'
 ```
 
 **`InsufficientInstanceCapacity` when starting the instance**
-— AWS may temporarily be out of Trainium in that AZ. Wait and retry, or re-provision in a different AZ.
+— AWS may temporarily be out of Trainium in that AZ. Wait and retry, or re-provision in a
+different AZ. For trn2, the terraform root accepts `-var="az_suffix=b"` or `=c` to move
+the subnet to a different AZ without destroying and recreating everything.
