@@ -136,12 +136,15 @@ trn1.2xlarge, warm NEFF cache, v0.5.2:**
 | fused-gemm (per-pair) | 9.174 s | 10.877 s | 1.11× slower |
 | batched-pair (fallback†) | 5.239 s | 7.111 s | 1.38× faster |
 
-† NEFF compile for medium-shape batched-pair kernel exceeded `/tmp` (tmpfs,
-RAM-backed). Compiler workdirs for nocc=64 × nvir=448 XLA graphs are >5 GB;
-`TMPDIR=/var/tmp` fix in v0.5.3 (scripts updated, Terraform user-data updated).
+† NEFF compile for medium-shape batched-pair kernel failed: `nl.affine_range`
+traces all 4096 pairs × ~192 inner tile operations eagerly at compile time,
+producing an 18 GB XLA graph IR. The trn1 root EBS volume had 16 GB free.
+Both `/tmp` and `/var/tmp` are on the same root volume (not separate tmpfs/EBS);
+there is no filesystem routing fix — the graph itself exceeds available disk.
 The `warm` row used the cached-failed-NEFF path → torch.matmul fallback on CPU,
 which happens to be competitive because NKI chunk-GEMM dispatch overhead
-dominates at medium scale.
+dominates at medium scale. Fix: chunked dispatch (~256 pairs/call, 16 calls for
+nocc=64), tracking in issue #47.
 
 Energies agree to FP32 noise across all three modes: -2.487220e+00 (torch),
 -2.487219e+00 (fused-gemm), -2.487221e+00 (batched-pair fallback).
@@ -154,8 +157,8 @@ warm (8 s) already reflects NKI GEMM for the half-transform; the energy
 step itself uses a Python nocc² loop of CPU einsum operations which dominates
 at this pair count (8.035 s energy / 4096 pairs = 1.96 ms/pair on CPU).
 
-Next step: re-run batched-pair with `TMPDIR=/var/tmp` (fix in v0.5.3) and
-record whether the compiled kernel beats torch baseline at medium scale.
+Next step: implement chunked dispatch (issue #47) and re-run to record whether
+the compiled chunked kernel beats torch baseline at medium scale.
 
 ## DF-MP2 end-to-end — Trainium1 vs NVIDIA A10G
 

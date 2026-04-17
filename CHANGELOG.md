@@ -9,24 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.5.3] — 2026-04-17
 
-### Fixed
-
-- **`TMPDIR=/var/tmp` in all SSM runners** (`run_df_mp2_bench.sh`,
-  `run_neuron_tests.sh`, `run_pyscf_tests.sh`). The neuronxcc compiler writes
-  XLA compile workdirs under `$TMPDIR`; for large NKI kernels (e.g.
-  batched-pair at nocc=64, nvir=448, naux=1536) these can exceed 5 GB.
-  `/tmp` on the trn1 instance is tmpfs (RAM-backed, ~16 GB) and ran out
-  mid-compile.  Redirecting to `/var/tmp` (EBS-backed, 100 GB) unblocks
-  medium-shape batched-pair NEFF compilation.  Terraform user-data updated to
-  set `TMPDIR=/var/tmp` in `/home/ubuntu/.profile` on new instances.
-
 ### Added
 
 - **Medium-shape bench numbers** (`docs/benchmarks.md`). 3-way comparison at
   nbasis=512, nocc=64, nvir=448, naux=1536 (4096 pairs). Torch warm total
-  9.795s; fused-gemm 10.877s (+11%); batched-pair 7.111s (fallback — NEFF
-  compile blocked by `/tmp` exhaustion, now fixed). See benchmarks.md for the
-  full table and interpretation notes.
+  9.795s; fused-gemm 10.877s (+11%); batched-pair 7.111s (CPU fallback — NEFF
+  compile blocked, see below). See benchmarks.md for the full table.
+
+### Investigation
+
+- **Medium-shape batched-pair NEFF compile fails: XLA graph is 18 GB.**
+  `nl.affine_range` traces all loop iterations eagerly into the XLA IR at
+  compile time. At nocc=64, nvir=448, naux=1536 (4096 pairs × ~192 inner tile
+  operations), the NKI source JSON reaches 18 GB. The trn1 root volume had
+  16 GB free — both `/tmp` and `/var/tmp` are on the same 96 GB EBS root
+  volume; there is no filesystem routing fix.
+
+  For context: small-shape (nocc=16, 256 pairs) produces a ~240 MB JSON and
+  compiles fine. Medium is 75× larger due to more pairs and larger nvir/naux.
+
+  **Fix (deferred, issue #47):** chunked dispatch — call the batched-pair
+  kernel with ~256 pairs per dispatch (16 calls for nocc=64). Each chunk's
+  XLA graph is ~240 MB; total dispatch overhead is ~1.6 s (vs 409 s per-pair).
+
+- **`TMPDIR=/var/tmp` added to SSM runners** (`run_df_mp2_bench.sh`,
+  `run_neuron_tests.sh`, `run_pyscf_tests.sh`) and Terraform user-data as a
+  defensive measure. Does not unblock medium-shape batched-pair compilation
+  (both paths share the same filesystem), but is correct hygiene for future
+  NKI kernels that produce large intermediate files.
 
 ## [0.5.2] — 2026-04-16
 
