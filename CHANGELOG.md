@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   For context: small-shape (nocc=16, 256 pairs) produces a ~240 MB JSON and
   compiles fine. Medium is 75× larger due to more pairs and larger nvir/naux.
 
-  **Fix (deferred, issue #47):** chunked dispatch — call the batched-pair
+  **Fix (deferred, issue #46):** chunked dispatch — call the batched-pair
   kernel with ~256 pairs per dispatch (16 calls for nocc=64). Each chunk's
   XLA graph is ~240 MB; total dispatch overhead is ~1.6 s (vs 409 s per-pair).
 

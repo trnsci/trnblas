@@ -144,7 +144,7 @@ there is no filesystem routing fix — the graph itself exceeds available disk.
 The `warm` row used the cached-failed-NEFF path → torch.matmul fallback on CPU,
 which happens to be competitive because NKI chunk-GEMM dispatch overhead
 dominates at medium scale. Fix: chunked dispatch (~256 pairs/call, 16 calls for
-nocc=64), tracking in issue #47.
+nocc=64), tracking in issue #46.
 
 Energies agree to FP32 noise across all three modes: -2.487220e+00 (torch),
 -2.487219e+00 (fused-gemm), -2.487221e+00 (batched-pair fallback).
@@ -157,7 +157,7 @@ warm (8 s) already reflects NKI GEMM for the half-transform; the energy
 step itself uses a Python nocc² loop of CPU einsum operations which dominates
 at this pair count (8.035 s energy / 4096 pairs = 1.96 ms/pair on CPU).
 
-Next step: implement chunked dispatch (issue #47) and re-run to record whether
+Next step: implement chunked dispatch (issue #46) and re-run to record whether
 the compiled chunked kernel beats torch baseline at medium scale.
 
 ## DF-MP2 end-to-end — Trainium1 vs NVIDIA A10G
