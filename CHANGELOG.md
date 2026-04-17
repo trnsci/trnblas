@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.4] — 2026-04-17
+
+### Added
+
+- **Chunked batched-pair dispatch (#46, `_j_batched_kernel`).** Extends
+  `nki_batched_pair_energy` to medium/large shapes where the full-batch XLA
+  graph exceeds available disk during neuronxcc compilation.
+
+  **Root cause recap:** `nl.affine_range` traces all loop iterations eagerly
+  into the XLA IR. At small shape (nocc=16, 256 pairs), this produces a ~240 MB
+  JSON that compiles fine. At medium shape (nocc=64, 4096 pairs, nvir=448,
+  naux=1536), the same tracing generates an 18 GB JSON — larger than the 16 GB
+  free space on the trn1 EBS root volume.
+
+  **Fix:** adaptive routing in `_nki_batched_pair_energy_impl` based on estimated
+  iteration count (`est_iters = nocc² × N_A² × N_K`). When
+  `est_iters > _BATCHED_PAIR_CHUNK_THRESHOLD` (4096), the implementation switches
+  to `_nki_batched_pair_energy_chunked_impl`: a Python `for i in range(nocc)` loop
+  over `_j_batched_kernel` — a 4-level `@nki.jit` (j → a → b → k) that processes
+  all `nocc` j-pairs for one i-row per dispatch.
+
+  **NEFF economics:** all NOCC i-calls share identical input shapes
+  (`(nvir_pad, naux_pad)`, `(nocc, nvir_pad, naux_pad)`, `(1,1)`, `(1,nocc)`,
+  `(nvir_pad,1)`, `(1,nvir_pad)`) → **one NEFF compile**, NOCC warm dispatches.
+  Per-call XLA graph at medium shape: ~1.4 GB (well within available disk).
+  Expected warm overhead for nocc=64: 64 × ~100 ms ≈ 6.4 s
+  (vs 4096 × ~100 ms ≈ 409 s for per-pair).
+
+  **Backward compatibility:** shapes with `est_iters ≤ 4096` (e.g. small bench,
+  nocc=16, small basis) continue to use `_batched_pair_kernel` (full-batch,
+  O(1) dispatch) — the 3.6× speedup at small shape is preserved.
+
+  **Public API:** unchanged — `nki_batched_pair_energy(B, eps_occ, eps_vir)`
+  routes automatically.
+
+  **Tests:** `test_correctness_chunked_path` (shapes above and below threshold),
+  `test_chunked_and_full_batch_agree` (threshold=0 forces chunked, validates
+  agreement with full-batch on small shape), `test_chunked_dispatch_overhead`
+  (`@pytest.mark.neuron`, timing report with nocc=16 chunked shape).
+
 ## [0.5.3] — 2026-04-17
 
 ### Added

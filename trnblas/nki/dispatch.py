@@ -79,6 +79,14 @@ _TILE_M = 128
 _TILE_K = 128
 _TILE_N = 512
 
+# Batched-pair energy kernel — full-batch vs chunked routing (#46).
+# nl.affine_range traces all iterations eagerly into the XLA graph IR.
+# Empirically: 768 iters (small bench, nocc=16) → ~240 MB JSON (fine);
+# 786,432 iters (medium, nocc=64) → 18 GB (exceeds available disk).
+# When est_iters = nocc² × N_A² × N_K exceeds this threshold, route to
+# the chunked impl (_j_batched_kernel, Python i-loop, NOCC dispatches).
+_BATCHED_PAIR_CHUNK_THRESHOLD = 4096
+
 # Autotuner — sweeps tile candidates on hardware once per shape bucket and
 # caches the winner to disk. Disabled in simulator mode and by TRNBLAS_AUTOTUNE=0.
 _AUTOTUNE_ENABLED: bool = os.environ.get("TRNBLAS_AUTOTUNE", "1") != "0"
@@ -626,6 +634,15 @@ def _nki_batched_pair_energy_impl(
         raise RuntimeError("NKI not available")
 
     nocc, nvir, naux = B.shape
+
+    # Route to chunked dispatch when the full-batch XLA graph would exceed disk.
+    # est_iters mirrors the nl.affine_range trace depth for _batched_pair_kernel.
+    _N_A = _round_up(nvir, 128) // 128
+    _N_K = _round_up(naux, 128) // 128
+    est_iters = (nocc * nocc) * _N_A * _N_A * _N_K
+    if est_iters > _BATCHED_PAIR_CHUNK_THRESHOLD:
+        return _nki_batched_pair_energy_chunked_impl(B, eps_occ, eps_vir)
+
     TILE = 128
     TILE_K = 128
 
@@ -669,6 +686,81 @@ def _nki_batched_pair_energy_impl(
         partial = _batched_pair_kernel(B_xla, eo_xla, evc_xla, evr_xla).to(orig)
 
     return partial.sum()
+
+
+def _nki_batched_pair_energy_chunked_impl(
+    B: torch.Tensor,
+    eps_occ: torch.Tensor,
+    eps_vir: torch.Tensor,
+) -> torch.Tensor:
+    """Chunked batched-pair dispatch: Python i-loop over _j_batched_kernel (#46).
+
+    Used when est_iters > _BATCHED_PAIR_CHUNK_THRESHOLD — i.e. the full-batch
+    XLA graph would be too large to compile. Processes all NOCC j-pairs for one
+    occupied orbital i per dispatch. All i-calls share the same input shapes, so
+    exactly ONE NEFF is compiled and reused for all NOCC iterations.
+
+    Overhead: NOCC × ~dispatch_cost vs O(1) for full-batch. For medium shape
+    (nocc=64), ~6.4 s warm overhead — much better than 409 s for per-pair.
+    """
+    nocc, nvir, naux = B.shape
+    TILE = 128
+    TILE_K = 128
+    nvir_pad = _round_up(nvir, TILE)
+    naux_pad = _round_up(naux, TILE_K)
+    needs_pad = (nvir_pad != nvir) or (naux_pad != naux)
+
+    eps_occ_row = eps_occ.reshape(1, nocc).contiguous()
+    ev_col = eps_vir.reshape(-1, 1).contiguous()
+    ev_row = eps_vir.reshape(1, -1).contiguous()
+
+    if needs_pad:
+        B_feed = torch.zeros(nocc, nvir_pad, naux_pad, dtype=B.dtype, device=B.device)
+        B_feed[:, :nvir, :naux] = B
+        if nvir_pad != nvir:
+            ev_col_feed = torch.zeros(nvir_pad, 1, dtype=eps_vir.dtype, device=eps_vir.device)
+            ev_col_feed[:nvir] = ev_col
+            ev_row_feed = torch.zeros(1, nvir_pad, dtype=eps_vir.dtype, device=eps_vir.device)
+            ev_row_feed[0, :nvir] = ev_row
+        else:
+            ev_col_feed, ev_row_feed = ev_col, ev_row
+    else:
+        B_feed = B.contiguous()
+        ev_col_feed, ev_row_feed = ev_col, ev_row
+
+    if _use_simulator():
+        e_total = torch.zeros((), dtype=B.dtype, device=B.device)
+        for i in range(nocc):
+            b_i_feed = B_feed[i].contiguous()
+            eo_i = eps_occ[i : i + 1].reshape(1, 1).contiguous()
+            partial_np = nki.simulate(_j_batched_kernel)(
+                b_i_feed.cpu().numpy(),
+                B_feed.cpu().numpy(),
+                eo_i.cpu().numpy(),
+                eps_occ_row.cpu().numpy(),
+                ev_col_feed.cpu().numpy(),
+                ev_row_feed.cpu().numpy(),
+            )
+            e_total = e_total + float(torch.from_numpy(np.asarray(partial_np)).sum())
+        return e_total
+
+    # Hardware: move fixed tensors to XLA once; slice b_i and eo_i per i.
+    # All i-calls have identical input shapes → ONE NEFF compile, cached for all.
+    (B_xla, eo_row_xla, evc_xla, evr_xla), orig = _to_xla(
+        B_feed,
+        eps_occ_row,
+        ev_col_feed.to(B.device),
+        ev_row_feed.to(B.device),
+    )
+    e_total = torch.zeros((), dtype=B.dtype, device=B.device)
+    for i in range(nocc):
+        b_i_xla = B_xla[i]  # (nvir_pad, naux_pad) — in-device view
+        eo_i_xla = eo_row_xla[0:1, i : i + 1]  # (1, 1) — in-device view
+        partial = _j_batched_kernel(b_i_xla, B_xla, eo_i_xla, eo_row_xla, evc_xla, evr_xla).to(
+            orig
+        )  # (TILE, nocc)
+        e_total = e_total + partial.sum()
+    return e_total
 
 
 def _torch_fused_pair_energy(
@@ -1430,4 +1522,112 @@ if HAS_NKI:
             # One HBM store for all NOCC j-partials in this i-row.
             nl.store(e_partial[0:TILE, i * NOCC : (i + 1) * NOCC], value=acc_j)
 
+        return e_partial
+
+    @nki.jit
+    def _j_batched_kernel(b_i, B, eps_occ_i, eps_occ_row, eps_vir_col, eps_vir_row):
+        """Chunked batched-pair kernel — one NEFF call per i-row (#46).
+
+        Processes all NOCC j-pairs for a single occupied orbital i.
+        The host Python loop iterates over i; all calls share the same
+        input shapes → ONE NEFF compile, NOCC warm dispatches.
+
+        b_i:         (NVIR_pad, NAUX_pad) — B[i] slice, 2D (stationary operand).
+        B:           (NOCC, NVIR_pad, NAUX_pad) — full matrix (j-indexing inside).
+        eps_occ_i:   (1, 1) — eo[i], pre-sliced on host.
+        eps_occ_row: (1, NOCC) — all eo[j] values.
+        eps_vir_col: (NVIR_pad, 1) — virtual energies, column layout.
+        eps_vir_row: (1, NVIR_pad) — virtual energies, row layout.
+        Returns: e_partial (TILE, NOCC) — host accumulates across i-rows.
+
+        Loop structure (4 levels of nl.affine_range):
+          j-loop → a-strip → b-strip → k-tile (GEMM)
+
+        Differences from _batched_pair_kernel:
+        - No outer i affine_range; i is resolved by the host.
+        - b_i is 2D — simpler load_transpose2d indexing.
+        - eps_occ_i is pre-sliced (1,1), not loaded from eps_occ_row inside kernel.
+        - Output (TILE, NOCC) vs (TILE, NOCC²).
+        - 3D indexing B[j, ...] with affine_range j — validated on trn1 (Spike A/B).
+        """
+        NOCC = B.shape[0]
+        NVIR = b_i.shape[0]  # NVIR_pad
+        NAUX = b_i.shape[1]  # NAUX_pad
+        TILE = 128
+        TILE_K = 128
+        N_A_TILES = NVIR // TILE
+        N_B_TILES = NVIR // TILE
+        N_K_TILES = NAUX // TILE_K
+
+        e_partial = nl.ndarray((TILE, NOCC), dtype=nl.float32, buffer=nl.shared_hbm)
+
+        # Batch all NOCC j-partials before single HBM store.
+        acc_j = nl.zeros((TILE, NOCC), dtype=nl.float32, buffer=nl.sbuf)
+
+        for j in nl.affine_range(NOCC):
+            eps_j = nl.load(eps_occ_row[0:1, j : j + 1])  # (1, 1)
+            eps_occ_sum = nl.add(eps_occ_i, eps_j)  # (1, 1)
+
+            acc_a = nl.zeros((TILE, N_A_TILES), dtype=nl.float32, buffer=nl.sbuf)
+
+            for a in nl.affine_range(N_A_TILES):
+                a_off = a * TILE
+                ev_col_a = nl.load(eps_vir_col[a_off : a_off + TILE, 0:1])  # (TILE, 1)
+                acc_b = nl.zeros((TILE, N_B_TILES), dtype=nl.float32, buffer=nl.sbuf)
+
+                for b in nl.affine_range(N_B_TILES):
+                    b_off = b * TILE
+                    ev_row_b = nl.load(eps_vir_row[0:1, b_off : b_off + TILE])  # (1, TILE)
+
+                    # GEMM 1: T[a,b] = b_i[a_strip,:] @ B[j][b_strip,:].T
+                    psum_t = nl.zeros((TILE, TILE), dtype=nl.float32, buffer=nl.psum)
+                    for k in nl.affine_range(N_K_TILES):
+                        k_off = k * TILE_K
+                        bi_stat = nl.load_transpose2d(
+                            b_i[a_off : a_off + TILE, k_off : k_off + TILE_K]
+                        )  # (TILE_K, TILE) — 2D indexing
+                        bj_mov = nl.load_transpose2d(
+                            B[j, b_off : b_off + TILE, k_off : k_off + TILE_K]
+                        )  # (TILE_K, TILE) — 3D with affine_range j
+                        nisa.nc_matmul(
+                            dst=psum_t, stationary=bi_stat, moving=bj_mov, accumulate=True
+                        )
+                    t_sbuf = nl.ndarray((TILE, TILE), dtype=nl.float32, buffer=nl.sbuf)
+                    nisa.tensor_copy(src=psum_t, dst=t_sbuf)
+
+                    # GEMM 2: T_T[a,b] = B[j][a_strip,:] @ b_i[b_strip,:].T
+                    psum_tt = nl.zeros((TILE, TILE), dtype=nl.float32, buffer=nl.psum)
+                    for k in nl.affine_range(N_K_TILES):
+                        k_off = k * TILE_K
+                        bj_stat = nl.load_transpose2d(
+                            B[j, a_off : a_off + TILE, k_off : k_off + TILE_K]
+                        )  # (TILE_K, TILE) — 3D with affine_range j
+                        bi_mov = nl.load_transpose2d(
+                            b_i[b_off : b_off + TILE, k_off : k_off + TILE_K]
+                        )  # (TILE_K, TILE) — 2D indexing
+                        nisa.nc_matmul(
+                            dst=psum_tt, stationary=bj_stat, moving=bi_mov, accumulate=True
+                        )
+                    t_t_sbuf = nl.ndarray((TILE, TILE), dtype=nl.float32, buffer=nl.sbuf)
+                    nisa.tensor_copy(src=psum_tt, dst=t_t_sbuf)
+
+                    # VE energy expression (identical to _batched_pair_kernel).
+                    eo_bc = nl.broadcast_to(eps_occ_sum, (TILE, TILE))
+                    evc_bc = nl.broadcast_to(ev_col_a, (TILE, TILE))
+                    evr_bc = nl.broadcast_to(ev_row_b, (TILE, TILE))
+                    denom = nl.subtract(nl.subtract(eo_bc, evc_bc), evr_bc)
+                    two_t = nl.multiply(t_sbuf, 2.0)
+                    diff = nl.subtract(two_t, t_t_sbuf)
+                    numer = nl.multiply(t_sbuf, diff)
+                    energy_tile = nl.multiply(numer, nl.reciprocal(denom))
+                    b_partial = nl.sum(energy_tile, axis=1, keepdims=True)
+                    acc_b[0:TILE, b : b + 1] = b_partial
+
+                e_a = nl.sum(acc_b, axis=1, keepdims=True)
+                acc_a[0:TILE, a : a + 1] = e_a
+
+            pair_energy = nl.sum(acc_a, axis=1, keepdims=True)
+            acc_j[0:TILE, j : j + 1] = pair_energy
+
+        nl.store(e_partial[0:TILE, 0:NOCC], value=acc_j)
         return e_partial

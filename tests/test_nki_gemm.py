@@ -571,3 +571,96 @@ class TestBatchedPairEnergy:
                 f"per-pair-loop={t_per_pair * 1000:7.1f}ms  "
                 f"speedup={t_per_pair / warm_batched:.1f}x"
             )
+
+    # --- Chunked dispatch tests (#46) ---
+
+    @pytest.mark.parametrize(
+        "nocc,nvir,naux",
+        [
+            # est_iters = nocc² × ceil(nvir/128)² × ceil(naux/128)
+            (16, 384, 512),  # 256 × 3 × 3 × 4 = 9216  > 4096 → chunked
+            (16, 256, 640),  # 256 × 2 × 2 × 5 = 5120  > 4096 → chunked
+            (16, 256, 384),  # 256 × 2 × 2 × 3 = 3072  ≤ 4096 → full-batch
+        ],
+    )
+    def test_correctness_chunked_path(self, nki_backend, nocc, nvir, naux, rng):
+        """Chunked dispatch matches torch reference for shapes above/below threshold."""
+        B = torch.randn(nocc, nvir, naux, generator=rng) * 0.1
+        eps_occ = torch.rand(nocc, generator=rng) * 0.5 + 2.0
+        eps_vir = torch.rand(nvir, generator=rng) * 0.5
+        ref = self._ref(B, eps_occ, eps_vir)
+        out = nki_batched_pair_energy(B, eps_occ, eps_vir)
+        torch.testing.assert_close(out, ref, atol=self.ATOL, rtol=self.RTOL)
+
+    def test_chunked_and_full_batch_agree(self, nki_backend, rng):
+        """Forcing chunked path on a small shape agrees with full-batch path."""
+        import trnblas.nki.dispatch as D
+
+        nocc, nvir, naux = 4, 256, 256  # est_iters = 16 × 2 × 2 × 2 = 128 (full-batch)
+        B = torch.randn(nocc, nvir, naux, generator=rng) * 0.1
+        eps_occ = torch.rand(nocc, generator=rng) * 0.5 + 2.0
+        eps_vir = torch.rand(nvir, generator=rng) * 0.5
+
+        # Default routing → full-batch kernel
+        out_full = nki_batched_pair_energy(B, eps_occ, eps_vir)
+
+        # Force chunked by setting threshold to 0
+        orig_thresh = D._BATCHED_PAIR_CHUNK_THRESHOLD
+        try:
+            D._BATCHED_PAIR_CHUNK_THRESHOLD = 0
+            out_chunked = nki_batched_pair_energy(B, eps_occ, eps_vir)
+        finally:
+            D._BATCHED_PAIR_CHUNK_THRESHOLD = orig_thresh
+
+        torch.testing.assert_close(out_chunked, out_full, atol=self.ATOL, rtol=self.RTOL)
+
+    def test_chunked_dispatch_overhead(self, nki_backend, rng, capsys):
+        """Chunked path timing: NOCC dispatches vs per-pair loop baseline.
+
+        Uses a shape that routes to the chunked path (est_iters > 4096).
+        Reports cold/warm times and compares against the per-pair loop.
+        """
+        import time
+
+        import trnblas.nki.dispatch as D
+
+        nocc, nvir, naux = 16, 384, 512  # est_iters = 9216 → chunked
+        B = torch.randn(nocc, nvir, naux, generator=rng) * 0.1
+        eps_occ = torch.rand(nocc, generator=rng) * 0.5 + 2.0
+        eps_vir = torch.rand(nvir, generator=rng) * 0.5
+
+        # Confirm routing: must use chunked impl
+        _N_A = D._round_up(nvir, 128) // 128
+        _N_K = D._round_up(naux, 128) // 128
+        est = (nocc * nocc) * _N_A * _N_A * _N_K
+        assert est > D._BATCHED_PAIR_CHUNK_THRESHOLD, (
+            f"Shape should route to chunked (est_iters={est})"
+        )
+
+        t0 = time.perf_counter()
+        nki_batched_pair_energy(B, eps_occ, eps_vir)
+        cold_chunked = time.perf_counter() - t0
+
+        warm_times = []
+        for _ in range(3):
+            t = time.perf_counter()
+            nki_batched_pair_energy(B, eps_occ, eps_vir)
+            warm_times.append(time.perf_counter() - t)
+        warm_chunked = min(warm_times)
+
+        # per-pair loop baseline (NEFF warm from above)
+        t0 = time.perf_counter()
+        for i in range(nocc):
+            for j in range(nocc):
+                nki_fused_gemm_energy(B[i], B[j], float(eps_occ[i]), float(eps_occ[j]), eps_vir)
+        t_per_pair = time.perf_counter() - t0
+
+        with capsys.disabled():
+            print(
+                f"\n[chunked nocc={nocc} nvir={nvir} naux={naux} "
+                f"dispatches={nocc}] "
+                f"cold={cold_chunked * 1000:7.1f}ms  "
+                f"warm={warm_chunked * 1000:7.1f}ms  "
+                f"per-pair-loop={t_per_pair * 1000:7.1f}ms  "
+                f"speedup={t_per_pair / warm_chunked:.1f}x"
+            )
