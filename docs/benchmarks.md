@@ -128,37 +128,37 @@ Energies agree to FP32 noise: torch / fused-gemm = -1.619250e-04,
 batched-pair = -1.619249e-04.
 
 **Medium shape (nbasis=512, nocc=64, nvir=448, naux=1536 — 4096 pairs),
-trn1.2xlarge, warm NEFF cache, v0.5.2:**
+trn1.2xlarge, warm NEFF cache:**
 
-| Energy path | Warm energy | Warm total | vs torch |
-|---|---:|---:|---:|
-| torch (chunk-GEMM baseline) | 8.035 s | 9.795 s | 1× |
-| fused-gemm (per-pair) | 9.174 s | 10.877 s | 1.11× slower |
-| batched-pair (fallback†) | 5.239 s | 7.111 s | 1.38× faster |
+| Energy path | Version | Warm energy | Warm total | vs torch |
+|---|---|---:|---:|---:|
+| torch (chunk-GEMM baseline) | v0.5.2 | 8.035 s | 9.795 s | 1× |
+| fused-gemm (per-pair) | v0.5.2 | 9.174 s | 10.877 s | 1.11× slower |
+| batched-pair (CPU fallback†) | v0.5.2 | 5.239 s | 7.111 s | 1.38× faster |
+| **batched-pair (chunked NKI‡)** | **v0.5.4** | **1.536 s** | **4.784 s** | **5.2× faster** |
 
-† NEFF compile for medium-shape batched-pair kernel failed: `nl.affine_range`
-traces all 4096 pairs × ~192 inner tile operations eagerly at compile time,
-producing an 18 GB XLA graph IR. The trn1 root EBS volume had 16 GB free.
-Both `/tmp` and `/var/tmp` are on the same root volume (not separate tmpfs/EBS);
-there is no filesystem routing fix — the graph itself exceeds available disk.
-The `warm` row used the cached-failed-NEFF path → torch.matmul fallback on CPU,
-which happens to be competitive because NKI chunk-GEMM dispatch overhead
-dominates at medium scale. Fix: chunked dispatch (~256 pairs/call, 16 calls for
-nocc=64), tracking in issue #46.
+† v0.5.2: NEFF compile for medium-shape batched-pair kernel failed — `nl.affine_range`
+traces all loop iterations eagerly at compile time, producing an 18 GB XLA graph IR that
+exceeded the trn1 root volume's 16 GB free space. The warm row used the
+cached-failed-NEFF path → torch.matmul fallback on CPU.
 
-Energies agree to FP32 noise across all three modes: -2.487220e+00 (torch),
--2.487219e+00 (fused-gemm), -2.487221e+00 (batched-pair fallback).
+‡ v0.5.4: Chunked dispatch (issue #46) — outer `i`-loop moved to Python; one
+`@nki.jit` call per i-row processes all `nocc` j-pairs. 64 i-dispatches × ~24 ms
+each = 1.536 s warm energy (XLA dispatch overhead dominates; Tensor Engine executes
+each kernel in ~1 ms). Cold energy = 34 min (77 NEFF compilations at ~27 s each;
+paid once per instance lifetime). Device HBM note: 64 loaded energy NEFFs ×
+244 MB DMA spill ≈ 15.6 GB fills the 16 GB device; a `Failed to allocate 1.5 GB`
+warning is logged during warm setup but computation succeeds.
 
-**Reading the medium numbers:** At 4096 pairs (vs 256 for small), the
-per-pair dispatch overhead that made fused-gemm 21× slower at small now
-only costs +11% — the actual compute per pair grows with matrix size while
-the ~1 ms dispatch overhead stays constant. The torch chunk-GEMM baseline
-warm (8 s) already reflects NKI GEMM for the half-transform; the energy
-step itself uses a Python nocc² loop of CPU einsum operations which dominates
-at this pair count (8.035 s energy / 4096 pairs = 1.96 ms/pair on CPU).
+Energies agree to FP32 noise: -2.487220e+00 (torch), -2.487219e+00 (fused-gemm),
+-2.487221e+00 (batched-pair fallback), -2.487218e+00 (chunked NKI).
 
-Next step: implement chunked dispatch (issue #46) and re-run to record whether
-the compiled chunked kernel beats torch baseline at medium scale.
+**Reading the medium numbers:** The chunked dispatch closes the medium-shape gap —
+5.2× faster than torch chunk-GEMM, 3.4× faster than the v0.5.2 CPU fallback.
+Each i-dispatch is ~24 ms (XLA overhead + ~1 ms Tensor Engine execution), so
+64 dispatches costs 1.536 s instead of the 409 s that a per-pair loop would require.
+The full-batch kernel's 18 GB XLA graph is replaced by 64 × ~1.4 GB graphs that
+compile and cache normally.
 
 ## DF-MP2 end-to-end — Trainium1 vs NVIDIA A10G
 
@@ -172,35 +172,36 @@ A10G via `g5.xlarge` (~$1/hr), trn1 via `trn1.2xlarge` (~$1.34/hr).
 | Shape                | Flops   | trn1 NKI warm | A10G warm | A10G vs trn1 |
 |----------------------|--------:|--------------:|----------:|-------------:|
 | small (128/16/384)   | 3.4 G   | 0.091 s       | 0.001 s   | 91×          |
-| medium (512/64/1536) | 2 757 G | 9.910 s       | 0.266 s   | **37×**      |
+| medium (512/64/1536) | 2 757 G | **4.784 s** (v0.5.4†) | 0.266 s | **18×** |
 | large (768/96/2304)  | 20 352 G | (not re-run) | 2.018 s   | —            |
 
+† v0.5.4 chunked dispatch (warm total 4.784 s). Prior v0.5.3 used CPU fallback
+(9.910 s). The 18× gap vs A10G is down from 37× in v0.5.3.
+
 **Energy bit-exact across platforms:** E_MP2 matches to fp32 noise for
-small (-1.619250e-04) and medium (-2.487220) under real NKI dispatch.
+small (-1.619250e-04) and medium (-2.487218) under real NKI dispatch.
 
 ### Reading this table
 
-At medium, **cuBLAS on A10G is ~37× faster than trnblas NKI GEMM on
-trn1** — the Ampere GPU is built for matmul-dominant workloads, while
-trn1's Tensor Engine has a higher per-call dispatch overhead. At small,
-the gap balloons to 91× because NKI dispatch overhead dominates the
-actual ~3 Gflops of compute.
+At medium with v0.5.4 chunked dispatch, **cuBLAS on A10G is ~18× faster than
+trnblas NKI on trn1** — down from 37× with the v0.5.3 CPU fallback. The chunked
+dispatch (64 NKI calls at ~25 ms each) produces 1.536 s warm energy vs 8.035 s
+torch baseline, bringing the end-to-end total to 4.784 s. At small, the gap
+balloons to 91× because NKI dispatch overhead dominates the actual ~3 GFlops of
+compute.
 
-**Uncomfortable honest comparison:** trn1's **host Xeon** (8 vCPU)
-running `torch.matmul` (the silent-fallback path that v0.4.x
-accidentally measured) produces roughly the same warm DF-MP2 numbers as
-real NKI dispatch on this workload — the CPU is competitive at
-512–1024 scale because NKI kernel launch is ~1-3 ms per call and
-trn1.2xlarge's Xeon is fast enough to do 512³ GEMM in the same time.
-Trainium's advantage here is a cost story
-(trn1.2xlarge at $1.34/hr vs g5.xlarge at $1.006/hr, with the difference
-being the 32 GB HBM and 2 NeuronCores that matter more at larger,
-memory-bandwidth-bound workloads than these benches touch).
+**The XLA dispatch overhead is the honest ceiling.** Each chunked i-call costs
+~24 ms (fixed XLA overhead) + ~1 ms (Tensor Engine execution). At medium shape,
+64 calls = 1.6 s of dispatch overhead out of the 1.536 s energy step — the
+hardware is effectively executing for 64 ms and idling for 1.472 s waiting for
+the host. Reducing dispatch count (larger chunks, fewer i-rows per call) requires
+solving the XLA graph size problem for larger batches — which is the remaining
+Phase 3 frontier.
 
-Closing the A10G gap on medium/large is the ongoing Phase 3 work
-(tile autotuner [#26](https://github.com/trnsci/trnblas/issues/26),
-energy kernel rewrite [#15](https://github.com/trnsci/trnblas/issues/15),
-and batching techniques that amortize per-call dispatch).
+Closing the A10G gap further requires either batching more pairs per dispatch
+(reduces dispatch count) or investing in trn2 (2× NeuronCores, lower per-call
+overhead). See [#25 — trn2 benchmarks](https://github.com/trnsci/trnblas/issues/25)
+and [#26 — tile autotuner](https://github.com/trnsci/trnblas/issues/26).
 
 ## NEFF cache warmup
 

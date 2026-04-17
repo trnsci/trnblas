@@ -47,6 +47,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   agreement with full-batch on small shape), `test_chunked_dispatch_overhead`
   (`@pytest.mark.neuron`, timing report with nocc=16 chunked shape).
 
+### Fixed
+
+- **`_j_batched_kernel` SBUF annotation error.** The pre-sliced `eps_occ_i`
+  argument (a `(1,1)` XLA tensor) carried a `shared_hbm` memory annotation.
+  Using it directly in `nl.add(eps_occ_i, eps_j)` without an explicit
+  `nl.load` propagated the `shared_hbm` annotation through the NKI compute
+  graph, corrupting the PSUM allocation for `psum_t` and causing neuronxcc
+  to fail with:
+  ```
+  tensor_copy src must be SBUF or PSUM, got shared_hbm
+  ```
+  Fix: `eo_i = nl.load(eps_occ_i[0:1, 0:1])` before the j-loop, matching the
+  pattern in `_batched_pair_kernel` where `eps_occ_i` is always loaded via
+  `nl.load` before arithmetic.
+
+### Hardware (v0.5.4, trn1.2xlarge, neuronxcc 2.24.5133)
+
+Chunked dispatch correctness and performance confirmed on hardware
+(67 neuron tests pass, 0 failures):
+
+- **`test_chunked_dispatch_overhead`** (nocc=16, nvir=384, naux=512, dispatches=16):
+  cold=49.4 ms, warm=38.7 ms per dispatch, per-pair-loop=2031.6 ms,
+  speedup=52.6× vs per-pair loop.
+
+- **Medium-shape DF-MP2 bench** (nbasis=512, nocc=64, nvir=448, naux=1536, 4096 pairs),
+  `--batched-pair-energy --shape medium`, SHA 2274dec:
+
+  | Step | Cold | Warm |
+  |---|---:|---:|
+  | chol | 36.475 s | 0.061 s |
+  | half-transform | 144.509 s | 2.814 s |
+  | metric | 2.747 s | 0.318 s |
+  | **energy (chunked NKI)** | **2049.166 s** | **1.536 s** |
+  | **total** | **2232.940 s** | **4.784 s** |
+
+  TFLOPS (warm): ~0.58. Energy: E = -2.487218e+00.
+
+  Cold energy = 34 min: 77 NEFF compilations at ~27 s each (paid once per
+  instance lifetime on the EBS-backed NEFF cache). Warm energy = 1.536 s
+  = 64 i-dispatches × ~24 ms each (XLA overhead dominates; Tensor Engine
+  executes each kernel in ~1 ms).
+
+  **vs v0.5.3 fallback:** warm energy 5.239 s → 1.536 s (**3.4× faster**).
+  **vs torch chunk-GEMM baseline:** warm energy 8.035 s → 1.536 s (**5.2× faster**).
+
+  Device HBM note: 64 loaded energy NEFFs × 244 MB DMA spill = ~15.6 GB,
+  filling the 16 GB device. A `Failed to allocate 1.500 GB` warning is logged
+  during warm setup; computation succeeds (Neuron runtime handles gracefully).
+
 ## [0.5.3] — 2026-04-17
 
 ### Added
