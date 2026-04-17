@@ -113,7 +113,7 @@ if [[ "$PING" != "Online" ]]; then
   exit 1
 fi
 
-_PY="sudo -u ubuntu env PATH=\$NEURON_VENV/bin:/usr/bin:/bin \$NEURON_VENV/bin/python /home/ubuntu/trnblas/examples/df_mp2.py --bench"
+_PY="sudo -u ubuntu env PATH=\$NEURON_VENV/bin:/usr/bin:/bin TMPDIR=/var/tmp \$NEURON_VENV/bin/python /home/ubuntu/trnblas/examples/df_mp2.py --bench"
 
 if [[ "$COMPARE_ALL" -eq 1 ]]; then
   # Full Phase 3 table: torch → fused-gemm → batched-pair in one SSM session.

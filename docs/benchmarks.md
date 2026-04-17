@@ -127,9 +127,35 @@ lifetime, amortised across all subsequent calls.
 Energies agree to FP32 noise: torch / fused-gemm = -1.619250e-04,
 batched-pair = -1.619249e-04.
 
-Medium shape (nbasis=512, nocc=64, nvir=448, naux=1536 — 4096 pairs):
-numbers pending next bench run — tracked in
-[#23](https://github.com/trnsci/trnblas/issues/23).
+**Medium shape (nbasis=512, nocc=64, nvir=448, naux=1536 — 4096 pairs),
+trn1.2xlarge, warm NEFF cache, v0.5.2:**
+
+| Energy path | Warm energy | Warm total | vs torch |
+|---|---:|---:|---:|
+| torch (chunk-GEMM baseline) | 8.035 s | 9.795 s | 1× |
+| fused-gemm (per-pair) | 9.174 s | 10.877 s | 1.11× slower |
+| batched-pair (fallback†) | 5.239 s | 7.111 s | 1.38× faster |
+
+† NEFF compile for medium-shape batched-pair kernel exceeded `/tmp` (tmpfs,
+RAM-backed). Compiler workdirs for nocc=64 × nvir=448 XLA graphs are >5 GB;
+`TMPDIR=/var/tmp` fix in v0.5.3 (scripts updated, Terraform user-data updated).
+The `warm` row used the cached-failed-NEFF path → torch.matmul fallback on CPU,
+which happens to be competitive because NKI chunk-GEMM dispatch overhead
+dominates at medium scale.
+
+Energies agree to FP32 noise across all three modes: -2.487220e+00 (torch),
+-2.487219e+00 (fused-gemm), -2.487221e+00 (batched-pair fallback).
+
+**Reading the medium numbers:** At 4096 pairs (vs 256 for small), the
+per-pair dispatch overhead that made fused-gemm 21× slower at small now
+only costs +11% — the actual compute per pair grows with matrix size while
+the ~1 ms dispatch overhead stays constant. The torch chunk-GEMM baseline
+warm (8 s) already reflects NKI GEMM for the half-transform; the energy
+step itself uses a Python nocc² loop of CPU einsum operations which dominates
+at this pair count (8.035 s energy / 4096 pairs = 1.96 ms/pair on CPU).
+
+Next step: re-run batched-pair with `TMPDIR=/var/tmp` (fix in v0.5.3) and
+record whether the compiled kernel beats torch baseline at medium scale.
 
 ## DF-MP2 end-to-end — Trainium1 vs NVIDIA A10G
 

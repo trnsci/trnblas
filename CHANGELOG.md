@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.3] — 2026-04-17
+
+### Fixed
+
+- **`TMPDIR=/var/tmp` in all SSM runners** (`run_df_mp2_bench.sh`,
+  `run_neuron_tests.sh`, `run_pyscf_tests.sh`). The neuronxcc compiler writes
+  XLA compile workdirs under `$TMPDIR`; for large NKI kernels (e.g.
+  batched-pair at nocc=64, nvir=448, naux=1536) these can exceed 5 GB.
+  `/tmp` on the trn1 instance is tmpfs (RAM-backed, ~16 GB) and ran out
+  mid-compile.  Redirecting to `/var/tmp` (EBS-backed, 100 GB) unblocks
+  medium-shape batched-pair NEFF compilation.  Terraform user-data updated to
+  set `TMPDIR=/var/tmp` in `/home/ubuntu/.profile` on new instances.
+
+### Added
+
+- **Medium-shape bench numbers** (`docs/benchmarks.md`). 3-way comparison at
+  nbasis=512, nocc=64, nvir=448, naux=1536 (4096 pairs). Torch warm total
+  9.795s; fused-gemm 10.877s (+11%); batched-pair 7.111s (fallback — NEFF
+  compile blocked by `/tmp` exhaustion, now fixed). See benchmarks.md for the
+  full table and interpretation notes.
+
 ## [0.5.2] — 2026-04-16
 
 ### Added

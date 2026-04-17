@@ -107,7 +107,7 @@ CMD_ID=$(aws ssm send-command \
   --document-name "AWS-RunShellScript" \
   --comment "trnblas pyscf tests @ $SHA" \
   --parameters "commands=[
-    \"bash -c 'set -euo pipefail; cd /home/ubuntu/trnblas && sudo -u ubuntu git fetch --all && sudo -u ubuntu git checkout $SHA && NEURON_VENV=\$(ls -d /opt/aws_neuronx_venv_pytorch_* | head -1) && sudo -u ubuntu \$NEURON_VENV/bin/pip install -e /home/ubuntu/trnblas[dev,pyscf] --quiet && sudo -u ubuntu env PATH=\$NEURON_VENV/bin:/usr/bin:/bin TRNBLAS_REQUIRE_NKI=1 \$NEURON_VENV/bin/pytest /home/ubuntu/trnblas/tests/test_df_mp2_pyscf.py -v -s -m \"$MARKER_EXPR\" --tb=short'\"
+    \"bash -c 'set -euo pipefail; cd /home/ubuntu/trnblas && sudo -u ubuntu git fetch --all && sudo -u ubuntu git checkout $SHA && NEURON_VENV=\$(ls -d /opt/aws_neuronx_venv_pytorch_* | head -1) && sudo -u ubuntu \$NEURON_VENV/bin/pip install -e /home/ubuntu/trnblas[dev,pyscf] --quiet && sudo -u ubuntu env PATH=\$NEURON_VENV/bin:/usr/bin:/bin TMPDIR=/var/tmp TRNBLAS_REQUIRE_NKI=1 \$NEURON_VENV/bin/pytest /home/ubuntu/trnblas/tests/test_df_mp2_pyscf.py -v -s -m \"$MARKER_EXPR\" --tb=short'\"
   ]" \
   --region "$REGION" \
   --output text --query 'Command.CommandId')

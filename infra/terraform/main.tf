@@ -124,6 +124,10 @@ resource "aws_instance" "ci" {
     # Use [dev] only — [neuron] would try to fetch neuronxcc from PyPI where it doesn't exist.
     NEURON_VENV=$(ls -d /opt/aws_neuronx_venv_pytorch_* | head -1)
     sudo -u ubuntu $NEURON_VENV/bin/pip install -e '/home/ubuntu/trnblas[dev]'
+    # neuronxcc compile workdirs can be >5 GB for large NKI kernels.  /tmp is
+    # tmpfs (RAM-backed, ~16 GB on trn1.2xlarge) and runs out.  Redirect the
+    # compiler to /var/tmp (EBS-backed, 100 GB) for all ubuntu-user sessions.
+    echo 'export TMPDIR=/var/tmp' >> /home/ubuntu/.profile
   EOF
 
   tags = {
