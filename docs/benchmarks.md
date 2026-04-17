@@ -206,9 +206,36 @@ Hardware sweep timings are recorded after the first DF-MP2 bench run with v0.5.0
 Numbers will be added here once the hardware run completes
 ([#26](https://github.com/trnsci/trnblas/issues/26) tracking).
 
+## Fused GEMM+energy kernel (v0.5.1)
+
+`nki_fused_gemm_energy(b_i, b_j, eps_occ_i, eps_occ_j, eps_vir)` fuses the
+two GEMMs (T and T_T) and the VE energy expression into a single `@nki.jit`.
+Eliminates the `(nvir, nvir)` T_flat HBM round-trip.
+
+**Measured on trn1 (small shape: nocc=16, 256 pairs):**
+
+| Path | Warm energy step |
+|---|---|
+| Chunk-GEMM baseline | 0.13 s |
+| Per-pair fused (#41, v0.5.1) | 27.8 s |
+
+The per-pair kernel is correct (energies match to 6 significant figures) but
+**215× slower** — root cause is Neuron XLA's ~100ms per-NEFF-dispatch
+overhead multiplied by 256 pairs. Fixed in v0.5.2 below.
+
+## Batched-pair energy kernel (v0.5.2, #43)
+
+`nki_batched_pair_energy(B, eps_occ, eps_vir)` computes all NOCC² pair
+energies in a single `@nki.jit` dispatch, reducing overhead from O(nocc²) to
+O(1). Spike B measured 2ms warm time for NOCC=4 (16 pairs) vs ~1.6s per-pair
+loop — 800× reduction in dispatch overhead.
+
+Hardware benchmark numbers (trn1, `--batched-pair-energy`): pending first run
+after [PR #44](https://github.com/trnsci/trnblas/pull/44) merges.
+
 ## Out of scope
 
-- **`syrk` / `trsm` NKI numbers:** those ops are PyTorch-only in v0.4.x;
-  v0.5.0 will add NKI kernels and a dedicated row here.
-- **cuBLAS head-to-head:** requires GPU access; tracked under
-  [#4](https://github.com/trnsci/trnblas/issues/4).
+- **cuBLAS head-to-head at batched-pair scale:** planned once PR #44 merges
+  and trn1 numbers are available.
+- **trn2 benchmarks:** infrastructure provisioned (`infra/terraform-trn2/`),
+  hardware investigation deferred ([#25](https://github.com/trnsci/trnblas/issues/25)).

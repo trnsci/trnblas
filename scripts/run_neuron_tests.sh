@@ -113,20 +113,25 @@ CMD_ID=$(aws ssm send-command \
   --output text --query 'Command.CommandId')
 
 echo "Command ID: $CMD_ID"
-echo "Waiting for command to complete (this may take several minutes)..."
+echo "Waiting for tests to complete (NEFF compiles can take 10-30 min for fresh cache)..."
 
-# aws ssm wait command-executed exits 255 if the command fails. We want to
-# capture output even on failure, so don't fail-fast here.
-aws ssm wait command-executed \
-  --command-id "$CMD_ID" \
-  --instance-id "$INSTANCE_ID" \
-  --region "$REGION" || true
-
-STATUS=$(aws ssm get-command-invocation \
-  --command-id "$CMD_ID" \
-  --instance-id "$INSTANCE_ID" \
-  --region "$REGION" \
-  --query 'Status' --output text)
+# `aws ssm wait command-executed` has a ~5-minute hard timeout — too short for
+# a full test suite that compiles several NEFFs cold. Poll manually instead,
+# same pattern as run_spike_batched_pair.sh. 60 × 30s = 30 min ceiling.
+STATUS=InProgress
+for _ in $(seq 1 60); do
+  STATUS=$(aws ssm get-command-invocation \
+    --command-id "$CMD_ID" \
+    --instance-id "$INSTANCE_ID" \
+    --region "$REGION" \
+    --query 'Status' --output text 2>/dev/null || echo Pending)
+  case "$STATUS" in
+    Success|Failed|Cancelled|TimedOut|DeliveryTimedOut|ExecutionTimedOut)
+      break ;;
+  esac
+  echo "  Status: $STATUS — waiting..."
+  sleep 30
+done
 
 echo ""
 echo "=== STDOUT ==="
