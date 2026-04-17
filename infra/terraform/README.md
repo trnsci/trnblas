@@ -36,8 +36,8 @@ AWS_PROFILE=aws aws ec2 stop-instances \
 
 | Variable | Default | Notes |
 |----------|---------|-------|
-| `aws_region` | `us-east-1` | Trainium: us-east-1, us-west-2, eu-west-1 |
-| `instance_type` | `trn1.2xlarge` | Also: `trn2.8xlarge`, `inf2.xlarge` |
+| `aws_region` | `us-east-1` | trn1: us-east-1, us-west-2, eu-west-1 · trn2.3xlarge: sa-east-1 · trn2.48xlarge: us-east-2 |
+| `instance_type` | `trn1.2xlarge` | Also: `trn2.3xlarge` (sa-east-1), `trn2.48xlarge` (us-east-2), `inf2.xlarge` |
 | `instance_tag` | `trnblas-ci-trn1` | Must match `scripts/run_neuron_tests.sh [type]` arg |
 | `vpc_id` | (required) | |
 | `subnet_id` | (required) | Must be in an AZ with capacity for `instance_type` |

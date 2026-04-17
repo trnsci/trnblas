@@ -1,40 +1,36 @@
 #!/usr/bin/env bash
 #
-# Run neuron-marked pytest tests on the trnblas CI instance.
+# Run the batched-pair kernel spike (#43) on the trnblas CI trn1 instance.
 #
 # Usage:
-#   AWS_PROFILE=aws ./scripts/run_neuron_tests.sh [instance_type]
+#   AWS_PROFILE=aws ./scripts/run_spike_batched_pair.sh [--spike A|B|C|all]
 #
-# Default instance_type is trn1 (looks for Name=trnblas-ci-trn1).
-# Provision the instance with:
-#   cd infra/terraform && terraform apply -var=vpc_id=... -var=subnet_id=...
+# Default: --spike all  (runs all three spike kernels in sequence).
 #
 # This script:
-#   1. Starts the tagged instance (if stopped)
+#   1. Starts the tagged instance (if stopped/stopping)
 #   2. Waits for SSM agent
-#   3. Runs `pytest tests/ -v -m neuron` via SSM send-command
+#   3. Sends the spike script via SSM (installs trnblas, runs spike)
 #   4. Prints stdout/stderr
 #   5. Stops the instance (always, even on failure)
 
 set -euo pipefail
 
-WARM=0
-if [[ "${1:-}" == "--warm" ]]; then
-  WARM=1
-  shift
+SPIKE="${1:-all}"
+if [[ "$SPIKE" == "--spike" ]]; then
+    SPIKE="${2:-all}"
 fi
 
-INSTANCE_TYPE="${1:-trn1}"
+INSTANCE_TYPE="${INSTANCE_TYPE:-trn1}"
 TAG="trnblas-ci-${INSTANCE_TYPE}"
 # Default region by instance family; AWS_REGION overrides.
-# trn2.3xlarge is only available in sa-east-1 (as of 2026-04-16).
 case "$INSTANCE_TYPE" in
   trn2*) REGION="${AWS_REGION:-sa-east-1}" ;;
   *)     REGION="${AWS_REGION:-us-east-1}" ;;
 esac
 SHA="$(git rev-parse HEAD)"
 
-: "${AWS_PROFILE:?Set AWS_PROFILE, e.g. AWS_PROFILE=aws ./scripts/run_neuron_tests.sh}"
+: "${AWS_PROFILE:?Set AWS_PROFILE, e.g. AWS_PROFILE=aws ./scripts/run_spike_batched_pair.sh}"
 
 echo "Looking up instance with Name=$TAG in $REGION..."
 INSTANCE_ID=$(aws ec2 describe-instances \
@@ -77,8 +73,6 @@ fi
 echo "Waiting for instance-running..."
 aws ec2 wait instance-running --instance-ids "$INSTANCE_ID" --region "$REGION"
 echo "Waiting for SSM agent..."
-# `aws ssm wait instance-information` isn't available in all CLI versions —
-# poll describe-instance-information instead.
 for _ in $(seq 1 60); do
   PING=$(aws ssm describe-instance-information \
     --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
@@ -92,34 +86,22 @@ if [[ "$PING" != "Online" ]]; then
   exit 1
 fi
 
-# --warm: run the suite twice to expose the NEFF cache delta — the second
-# pass gets warm /var/tmp/neuron-compile-cache/. -s surfaces the perf
-# prints from TestPerformance.
-if [[ "$WARM" == "1" ]]; then
-  PYTEST_INVOCATION="\$NEURON_VENV/bin/pytest /home/ubuntu/trnblas/tests/ -v -s -m neuron --tb=short && echo === WARM PASS === && \$NEURON_VENV/bin/pytest /home/ubuntu/trnblas/tests/ -v -s -m neuron --tb=short"
-else
-  PYTEST_INVOCATION="\$NEURON_VENV/bin/pytest /home/ubuntu/trnblas/tests/ -v -m neuron --tb=short"
-fi
-
-echo "Sending test command (SHA=$SHA, warm=$WARM)..."
+echo "Sending spike command (SHA=$SHA, spike=$SPIKE)..."
 CMD_ID=$(aws ssm send-command \
   --instance-ids "$INSTANCE_ID" \
   --document-name "AWS-RunShellScript" \
-  --comment "trnblas neuron tests @ $SHA" \
+  --comment "trnblas spike_batched_pair @ $SHA" \
   --parameters "commands=[
-    \"bash -c 'set -euo pipefail; cd /home/ubuntu/trnblas && sudo -u ubuntu git fetch --all && sudo -u ubuntu git checkout $SHA && NEURON_VENV=\$(ls -d /opt/aws_neuronx_venv_pytorch_* | head -1) && sudo -u ubuntu \$NEURON_VENV/bin/pip install -e /home/ubuntu/trnblas[dev] --quiet && sudo -u ubuntu env PATH=\$NEURON_VENV/bin:/usr/bin:/bin TRNBLAS_REQUIRE_NKI=1 $PYTEST_INVOCATION'\"
+    \"bash -c 'set -euo pipefail; cd /home/ubuntu/trnblas && sudo -u ubuntu git fetch --all && sudo -u ubuntu git checkout $SHA && NEURON_VENV=\$(ls -d /opt/aws_neuronx_venv_pytorch_* | head -1) && sudo -u ubuntu \$NEURON_VENV/bin/pip install -e /home/ubuntu/trnblas[dev] --quiet && sudo -u ubuntu env PATH=\$NEURON_VENV/bin:/usr/bin:/bin TRNBLAS_REQUIRE_NKI=1 \$NEURON_VENV/bin/python /home/ubuntu/trnblas/scripts/spike_batched_pair.py --spike $SPIKE'\"
   ]" \
   --region "$REGION" \
   --output text --query 'Command.CommandId')
 
 echo "Command ID: $CMD_ID"
-echo "Waiting for tests to complete (NEFF compiles can take 10-30 min for fresh cache)..."
+echo "Waiting for spike to complete (spikes A+B each compile 1-2 NEFFs; ~5-10 min)..."
 
-# `aws ssm wait command-executed` has a ~5-minute hard timeout — too short for
-# a full test suite that compiles several NEFFs cold. Poll manually instead,
-# same pattern as run_spike_batched_pair.sh. 60 × 30s = 30 min ceiling.
-STATUS=InProgress
-for _ in $(seq 1 60); do
+# Poll every 30s for up to 20 min.
+for _ in $(seq 1 40); do
   STATUS=$(aws ssm get-command-invocation \
     --command-id "$CMD_ID" \
     --instance-id "$INSTANCE_ID" \

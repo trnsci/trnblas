@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "trnblas"
-version = "0.5.1"
+version = "0.5.2"
 description = "BLAS operations for AWS Trainium via NKI"
 readme = "README.md"
 license = "Apache-2.0"
@@ -55,6 +55,16 @@ Issues = "https://github.com/trnsci/trnblas/issues"
 [tool.setuptools.packages.find]
 include = ["trnblas*"]
 
+[tool.uv]
+# neuronxcc / torch-neuronx are only available on Trainium instances.
+# Exclude the [neuron] extra from local uv resolution so `uv run` / `uv sync`
+# works on dev machines without hardware (CI installs it on-instance manually).
+exclude-dependencies = [
+    "neuronxcc",
+    "torch-neuronx",
+    "nki",
+]
+
 [tool.ruff]
 # Match the rest of the trnsci suite. Line length 100 is a compromise
 # between black's 88 and the wider tables common in scientific code.
@@ -89,5 +99,7 @@ indent-style = "space"
 [tool.pytest.ini_options]
 markers = [
     "neuron: requires Neuron hardware (trn1/trn2 instance)",
+    "pyscf: requires PySCF (pip install trnblas[pyscf])",
+    "slow: long-running tests skipped by default (run with -m slow)",
 ]
 testpaths = ["tests"]

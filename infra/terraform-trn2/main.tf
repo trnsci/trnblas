@@ -1,0 +1,156 @@
+terraform {
+  required_version = ">= 1.5"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+# trn2.3xlarge is available in sa-east-1 (a, b, c) as of 2026-04-16.
+# trn2.xlarge does not exist; trn2.3xlarge is the smallest trn2 instance.
+variable "aws_region" {
+  description = "AWS region for the CI instance (trn2.3xlarge available in sa-east-1)"
+  type        = string
+  default     = "sa-east-1"
+}
+
+variable "instance_type" {
+  description = "EC2 instance type"
+  type        = string
+  default     = "trn2.3xlarge"
+}
+
+variable "instance_tag" {
+  description = "Name tag used by run_neuron_tests.sh to find the instance"
+  type        = string
+  default     = "trnblas-ci-trn2"
+}
+
+variable "vpc_id" {
+  description = "VPC to place the instance in (must be in aws_region)"
+  type        = string
+}
+
+variable "subnet_id" {
+  description = "Subnet for the instance (public or private with NAT)"
+  type        = string
+}
+
+provider "aws" {
+  region = var.aws_region
+}
+
+# ---------------------------------------------------------------------------
+# Deep Learning AMI with Neuron SDK pre-installed
+# ---------------------------------------------------------------------------
+
+data "aws_ami" "neuron" {
+  most_recent = true
+  owners      = ["amazon"]
+
+  filter {
+    name   = "name"
+    values = ["Deep Learning AMI Neuron PyTorch 2.9*Ubuntu 24.04*"]
+  }
+}
+
+# ---------------------------------------------------------------------------
+# IAM role for the EC2 instance (SSM access)
+# ---------------------------------------------------------------------------
+
+resource "aws_iam_role" "instance" {
+  name = "${var.instance_tag}-role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "ec2.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "ssm" {
+  role       = aws_iam_role.instance.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_instance_profile" "instance" {
+  name = "${var.instance_tag}-profile"
+  role = aws_iam_role.instance.name
+}
+
+# ---------------------------------------------------------------------------
+# Security group (SSM only, no inbound)
+# ---------------------------------------------------------------------------
+
+resource "aws_security_group" "instance" {
+  name        = "${var.instance_tag}-sg"
+  description = "SSM-only access for trnblas CI (trn2)"
+  vpc_id      = var.vpc_id
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+# ---------------------------------------------------------------------------
+# EC2 instance
+# ---------------------------------------------------------------------------
+
+resource "aws_instance" "ci" {
+  ami                         = data.aws_ami.neuron.id
+  instance_type               = var.instance_type
+  subnet_id                   = var.subnet_id
+  iam_instance_profile        = aws_iam_instance_profile.instance.name
+  vpc_security_group_ids      = [aws_security_group.instance.id]
+  associate_public_ip_address = true # Needed for SSM agent to reach regional endpoint
+
+  root_block_device {
+    volume_size = 200 # trn2 NEFF caches grow larger; extra headroom
+    volume_type = "gp3"
+  }
+
+  user_data = <<-EOF
+    #!/bin/bash
+    set -euxo pipefail
+    cd /home/ubuntu
+    sudo -u ubuntu git clone https://github.com/trnsci/trnblas.git trnblas
+    # Install into the AMI's pre-built Neuron venv (has neuronxcc preinstalled).
+    # Use [dev] only — [neuron] would try to fetch neuronxcc from PyPI where it doesn't exist.
+    NEURON_VENV=$(ls -d /opt/aws_neuronx_venv_pytorch_* | head -1)
+    sudo -u ubuntu $NEURON_VENV/bin/pip install -e '/home/ubuntu/trnblas[dev]'
+  EOF
+
+  tags = {
+    Name = var.instance_tag
+  }
+}
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+
+output "instance_id" {
+  value = aws_instance.ci.id
+}
+
+output "instance_tag" {
+  value       = var.instance_tag
+  description = "Name tag used by scripts/run_neuron_tests.sh"
+}
+
+output "aws_region" {
+  value       = var.aws_region
+  description = "Pass to AWS CLI: AWS_REGION=$(terraform output -raw aws_region)"
+}
+
+output "ami_id" {
+  value       = data.aws_ami.neuron.id
+  description = "Neuron Deep Learning AMI resolved at apply time"
+}
