@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.2] — 2026-04-16
+
+### Added
+
+- **Batched-pair energy kernel (#43, `nki_batched_pair_energy`).** A single
+  `@nki.jit` dispatch computes the full DF-MP2 pair energy for all NOCC²
+  orbital pairs, eliminating the ~100ms × nocc² Neuron XLA per-dispatch
+  overhead that made `nki_fused_gemm_energy` impractical (215× slower than
+  chunk-GEMM at NOCC=16 / 256 pairs).
+
+  **Design:** The kernel has five levels of `nl.affine_range` (i → j → a-strip
+  → b-strip → k-tile). For each (i, j, a, b) combination, two GEMMs are
+  computed as in `_fused_gemm_energy_kernel`:
+  - GEMM 1: `T[a,b] = B[i][a_strip,:] @ B[j][b_strip,:].T`
+  - GEMM 2: `T_T[a,b] = B[j][a_strip,:] @ B[i][b_strip,:].T`
+  Both land in SBUF via `tensor_copy`; the VE energy expression and free-dim
+  reductions all run in SBUF/PSUM. Output is `(TILE, NOCC²)` — host calls
+  `.sum()` for the scalar energy. No partition-axis (axis=0) reductions inside
+  the kernel.
+
+  **3D NKI indexing validated on trn1 (2026-04-17):** `nl.load_transpose2d(
+  B[i, a_off:a_off+T, k_off:k_off+K])` with `i` as a `nl.affine_range` loop
+  variable compiles correctly and produces accurate results (both `nl.load` and
+  `nl.load_transpose2d` confirmed via Spike A / Spike B scripts).
+
+  **Spike B warm time:** 2ms for NOCC=4 (16 pairs), vs ~1.6s for the per-pair
+  loop — 800× reduction in dispatch overhead at the same NOCC.
+
+  **Public API:** `trnblas.nki.nki_batched_pair_energy(B, eps_occ, eps_vir)` →
+  0-d scalar. `B: (nocc, nvir, naux)`, `eps_occ: (nocc,)`, `eps_vir: (nvir,)`.
+
+  **Example integration:** `examples/df_mp2.py --batched-pair-energy` routes
+  the energy step through the new kernel.
+
+  **Tests:** `TestBatchedPairEnergy` in `tests/test_nki_gemm.py`: aligned and
+  unaligned correctness (atol=1e-2 over the full NOCC² sum),
+  `test_matches_fused_gemm_energy` (against the per-pair sum),
+  zero-B, and `test_dispatch_overhead` (cold/warm/per-pair-loop timing).
+
+- **`[tool.uv]` dev-machine support.** Added `exclude-dependencies` for
+  `neuronxcc`, `torch-neuronx`, and `nki` so `uv run` / `uv sync` resolves
+  on machines without Trainium hardware.
+
 ## [0.5.1] — 2026-04-15
 
 ### Added
