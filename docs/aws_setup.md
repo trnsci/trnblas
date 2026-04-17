@@ -95,12 +95,29 @@ Same instance, same SSM mechanism, runs `examples/df_mp2.py --bench` to
 capture per-step timing across small / medium / large synthetic shapes:
 
 ```bash
-AWS_PROFILE=aws ./scripts/run_df_mp2_bench.sh                 # all 3 shapes
+AWS_PROFILE=aws ./scripts/run_df_mp2_bench.sh                 # all 3 shapes, torch energy
 AWS_PROFILE=aws ./scripts/run_df_mp2_bench.sh --shape medium  # one shape
+AWS_PROFILE=aws ./scripts/run_df_mp2_bench.sh --compare-all   # 3-way: torch vs fused-gemm vs batched-pair
 ```
 
 Each shape runs cold then warm in the same Python process, so NEFF cache
-effects are visible in the reported numbers.
+effects are visible in the reported numbers. `--compare-all` runs all three
+energy paths in one SSM session — the full Phase 3 table.
+
+## Running PySCF precision tests
+
+PySCF is not in the trn1 user-data by default. `run_pyscf_tests.sh`
+installs `trnblas[pyscf]` in the Neuron venv before running, so there
+is no permanent instance change needed:
+
+```bash
+AWS_PROFILE=aws ./scripts/run_pyscf_tests.sh         # fast: h2o/ch4/nh3 at sto-3g / cc-pVDZ
+AWS_PROFILE=aws ./scripts/run_pyscf_tests.sh --slow  # + glycine/cc-pVDZ, h2o_trimer, h2o/cc-pVTZ
+```
+
+These are the FP32 precision envelope tests (#20). The `--slow` set
+populates the TBD rows in `docs/architecture.md` and determines whether
+double-double (#22) is needed.
 
 ## GPU (A10G) companion instance
 
