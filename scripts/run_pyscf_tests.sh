@@ -105,7 +105,7 @@ echo "Sending PySCF test command (SHA=$SHA, marker='$MARKER_EXPR', slow=$SLOW)..
 # Generate SSM parameters via Python to avoid shell quoting issues with
 # compound marker expressions like "pyscf and slow" (embedded spaces/quotes
 # break the AWS CLI --parameters string parser).
-PARAMS_FILE=$(mktemp --suffix=.json)
+PARAMS_FILE=$(mktemp /tmp/trnblas-pyscf-XXXXXX.json)
 python3 - <<PYEOF > "$PARAMS_FILE"
 import json
 sha = "$SHA"
