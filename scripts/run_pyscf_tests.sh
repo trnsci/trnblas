@@ -102,24 +102,42 @@ if [[ "$PING" != "Online" ]]; then
 fi
 
 echo "Sending PySCF test command (SHA=$SHA, marker='$MARKER_EXPR', slow=$SLOW)..."
-# Generate SSM parameters via Python to avoid shell quoting issues with
-# compound marker expressions like "pyscf and slow" (embedded spaces/quotes
-# break the AWS CLI --parameters string parser).
+# Build SSM parameters via Python with a base64-encoded bash script.
+#
+# Why this approach:
+#   1. "pyscf and slow" contains spaces — breaks AWS CLI --parameters string
+#      parser when embedded in nested quotes (any --parameters "commands=[...]"
+#      approach fails).
+#   2. <<'PYEOF' (quoted heredoc) prevents local shell expansion of $(...)
+#      and $VAR patterns inside the Python source.
+#   3. Base64-encoding the bash script eliminates all quoting layers: the SSM
+#      command is a single safe alphanumeric echo|base64 -d|bash pipeline.
+#   4. SHA and MARKER are injected via env vars (expanded by the outer shell
+#      before the quoted heredoc, then read by Python via os.environ).
 PARAMS_FILE=$(mktemp /tmp/trnblas-pyscf-XXXXXX.json)
-python3 - <<PYEOF > "$PARAMS_FILE"
-import json
-sha = "$SHA"
-marker = "$MARKER_EXPR"
-commands = [
-    "set -euo pipefail",
-    "cd /home/ubuntu/trnblas",
-    "sudo -u ubuntu git fetch --all",
-    f"sudo -u ubuntu git checkout {sha}",
-    r"NEURON_VENV=$(ls -d /opt/aws_neuronx_venv_pytorch_* | head -1)",
-    r"sudo -u ubuntu \$NEURON_VENV/bin/pip install -e /home/ubuntu/trnblas[dev,pyscf] --quiet",
-    f"sudo -u ubuntu env PATH=\$NEURON_VENV/bin:/usr/bin:/bin TMPDIR=/var/tmp TRNBLAS_REQUIRE_NKI=1 \$NEURON_VENV/bin/pytest /home/ubuntu/trnblas/tests/test_df_mp2_pyscf.py -v -s -m '{marker}' --tb=short",
-]
-print(json.dumps({"commands": commands}))
+SHA_VAL="$SHA" MARKER_VAL="$MARKER_EXPR" python3 - <<'PYEOF' > "$PARAMS_FILE"
+import base64, json, os
+
+sha    = os.environ["SHA_VAL"]
+marker = os.environ["MARKER_VAL"]
+
+# This bash script runs on the remote trn1 instance.
+# $NEURON_VENV and $(...) are literal here; bash expands them on the remote.
+script = (
+    "#!/bin/bash\n"
+    "set -euo pipefail\n"
+    "cd /home/ubuntu/trnblas\n"
+    "sudo -u ubuntu git fetch --all\n"
+    f"sudo -u ubuntu git checkout {sha}\n"
+    "NEURON_VENV=$(ls -d /opt/aws_neuronx_venv_pytorch_* | head -1)\n"
+    "sudo -u ubuntu $NEURON_VENV/bin/pip install -e '/home/ubuntu/trnblas[dev,pyscf]' --quiet\n"
+    "sudo -u ubuntu env PATH=$NEURON_VENV/bin:/usr/bin:/bin TMPDIR=/var/tmp"
+    " TRNBLAS_REQUIRE_NKI=1"
+    f" $NEURON_VENV/bin/pytest /home/ubuntu/trnblas/tests/test_df_mp2_pyscf.py"
+    f" -v -s -m '{marker}' --tb=short\n"
+)
+encoded = base64.b64encode(script.encode()).decode()
+print(json.dumps({"commands": [f"echo '{encoded}' | base64 -d | bash"]}))
 PYEOF
 CMD_ID=$(aws ssm send-command \
   --instance-ids "$INSTANCE_ID" \
