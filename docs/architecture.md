@@ -67,30 +67,35 @@ Trainium's Tensor Engine is FP32-only. trnblas uses FP32 throughout. The
 question for chemistry workloads is when FP32 accumulation error becomes
 visible relative to a FP64 reference (PySCF).
 
-### Measured |E_trnblas − E_pyscf| (v0.5.x, CPU torch.matmul fallback)
+### Measured |E_trnblas − E_pyscf| (v0.5.4, trn1.2xlarge, neuronxcc 2.24.5133)
 
-| Molecule | Basis   | nocc | nvir | Pair-energy terms | |ΔE| Ha |
-|----------|---------|-----:|-----:|------------------:|-------:|
-| H₂O      | sto-3g  |    5 |    2 |           100     | < 1e-6 |
-| H₂O      | cc-pVDZ |    5 |   19 |         ~9000     | < 1e-5 |
-| CH₄      | cc-pVDZ |    5 |   29 |        ~21000     | < 1e-5 |
-| NH₃      | cc-pVDZ |    5 |   21 |        ~11000     | < 1e-5 |
-| glycine  | sto-3g  |   20 |   10 |       ~160000     | *TBD*  |
-| glycine  | cc-pVDZ |   20 |   75 |      ~9000000     | *TBD*  |
-| (H₂O)₃  | sto-3g  |   15 |   12 |       ~324000     | *TBD*  |
-| H₂O      | cc-pVTZ |    5 |   53 |        ~70000     | *TBD*  |
+All values from `pytest -m "pyscf and slow"` on hardware (2026-04-18, [#20](https://github.com/trnsci/trnblas/issues/20)).
 
-TBD rows are tracked in [#20](https://github.com/trnsci/trnblas/issues/20).
-The `test_precision_envelope` test class in `tests/test_df_mp2_pyscf.py`
-populates these when run with `pytest -m "pyscf and slow"`.
+| Molecule | Basis   | nocc | nvir | Pair-energy terms | |ΔE| Ha   |
+|----------|---------|-----:|-----:|------------------:|----------:|
+| H₂O      | sto-3g  |    5 |    2 |           100     | < 1e-6    |
+| H₂O      | cc-pVDZ |    5 |   19 |         ~9000     | < 1e-5    |
+| CH₄      | cc-pVDZ |    5 |   29 |        ~21000     | < 1e-5    |
+| NH₃      | cc-pVDZ |    5 |   21 |        ~11000     | < 1e-5    |
+| glycine  | sto-3g  |   20 |   10 |       ~160000     | 1.71e-08  |
+| glycine  | cc-pVDZ |   20 |   75 |      ~9000000     | **3.51e-07** |
+| (H₂O)₃  | sto-3g  |   15 |   12 |       ~324000     | 4.17e-08  |
+| H₂O      | cc-pVTZ |    5 |   53 |        ~70000     | **1.99e-07** |
+
+All 8 cases pass their tolerances. The `test_precision_envelope` test class in
+`tests/test_df_mp2_pyscf.py` covers all rows.
 
 ### Decision gate for double-double (#10, #22)
 
-- If |ΔE| < 1 µHartree at cc-pVTZ and glycine/cc-pVDZ: FP32 is sufficient,
-  close [#10](https://github.com/trnsci/trnblas/issues/10) as "not needed".
-- If |ΔE| > 10 µHartree: double-double emulation (four FP32 GEMMs per
-  effective FP64 GEMM) is warranted. See
-  [#22](https://github.com/trnsci/trnblas/issues/22).
+**Decision (2026-04-18):** FP32 is sufficient. Both gate cases are well below
+the 1 µHartree threshold: glycine/cc-pVDZ = 3.51e-07 Ha and h2o/cc-pVTZ =
+1.99e-07 Ha. [#10](https://github.com/trnsci/trnblas/issues/10) is closed as
+"not needed". [#22](https://github.com/trnsci/trnblas/issues/22) (double-double
+emulation) is deferred indefinitely.
+
+For reference, the original gate:
+- |ΔE| < 1 µHartree at cc-pVTZ and glycine/cc-pVDZ → FP32 sufficient (this outcome)
+- |ΔE| > 10 µHartree → double-double emulation warranted
 
 The FP32 precision floor for a single GEMM (M×K×N) is approximately
 `sqrt(K) × machine_epsilon ≈ sqrt(K) × 6e-8`. For DF-MP2, the dominant

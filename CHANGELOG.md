@@ -96,6 +96,27 @@ Chunked dispatch correctness and performance confirmed on hardware
   filling the 16 GB device. A `Failed to allocate 1.500 GB` warning is logged
   during warm setup; computation succeeds (Neuron runtime handles gracefully).
 
+- **PySCF FP32 precision envelope (#20).** All 8 `test_precision_envelope` cases
+  pass on hardware (2026-04-18, `pytest -m "pyscf and slow"`):
+
+  | Molecule    | Basis   | |ΔE| Ha    | Tol    |
+  |-------------|---------|----------:|-------:|
+  | H₂O         | sto-3g  | < 1e-6    | 1e-6   |
+  | H₂O         | cc-pVDZ | < 1e-5    | 1e-5   |
+  | CH₄         | cc-pVDZ | < 1e-5    | 1e-5   |
+  | NH₃         | cc-pVDZ | < 1e-5    | 1e-5   |
+  | glycine     | sto-3g  | 1.71e-08  | 1e-5   |
+  | glycine     | cc-pVDZ | 3.51e-07  | 5e-5   |
+  | (H₂O)₃     | sto-3g  | 4.17e-08  | 1e-5   |
+  | H₂O         | cc-pVTZ | 1.99e-07  | 1e-4   |
+
+  **Double-double decision:** both gate cases (glycine/cc-pVDZ = 3.51e-07 Ha,
+  h2o/cc-pVTZ = 1.99e-07 Ha) are well below the 1 µHartree threshold.
+  FP32 is sufficient for DF-MP2 at these molecule/basis combinations.
+  [#10](https://github.com/trnsci/trnblas/issues/10) closed as "not needed";
+  [#22](https://github.com/trnsci/trnblas/issues/22) (double-double emulation)
+  deferred indefinitely.
+
 ## [0.5.3] — 2026-04-17
 
 ### Added
