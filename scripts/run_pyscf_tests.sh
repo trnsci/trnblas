@@ -102,15 +102,33 @@ if [[ "$PING" != "Online" ]]; then
 fi
 
 echo "Sending PySCF test command (SHA=$SHA, marker='$MARKER_EXPR', slow=$SLOW)..."
+# Generate SSM parameters via Python to avoid shell quoting issues with
+# compound marker expressions like "pyscf and slow" (embedded spaces/quotes
+# break the AWS CLI --parameters string parser).
+PARAMS_FILE=$(mktemp --suffix=.json)
+python3 - <<PYEOF > "$PARAMS_FILE"
+import json
+sha = "$SHA"
+marker = "$MARKER_EXPR"
+commands = [
+    "set -euo pipefail",
+    "cd /home/ubuntu/trnblas",
+    "sudo -u ubuntu git fetch --all",
+    f"sudo -u ubuntu git checkout {sha}",
+    r"NEURON_VENV=$(ls -d /opt/aws_neuronx_venv_pytorch_* | head -1)",
+    r"sudo -u ubuntu \$NEURON_VENV/bin/pip install -e /home/ubuntu/trnblas[dev,pyscf] --quiet",
+    f"sudo -u ubuntu env PATH=\$NEURON_VENV/bin:/usr/bin:/bin TMPDIR=/var/tmp TRNBLAS_REQUIRE_NKI=1 \$NEURON_VENV/bin/pytest /home/ubuntu/trnblas/tests/test_df_mp2_pyscf.py -v -s -m '{marker}' --tb=short",
+]
+print(json.dumps({"commands": commands}))
+PYEOF
 CMD_ID=$(aws ssm send-command \
   --instance-ids "$INSTANCE_ID" \
   --document-name "AWS-RunShellScript" \
   --comment "trnblas pyscf tests @ $SHA" \
-  --parameters "commands=[
-    \"bash -c 'set -euo pipefail; cd /home/ubuntu/trnblas && sudo -u ubuntu git fetch --all && sudo -u ubuntu git checkout $SHA && NEURON_VENV=\$(ls -d /opt/aws_neuronx_venv_pytorch_* | head -1) && sudo -u ubuntu \$NEURON_VENV/bin/pip install -e /home/ubuntu/trnblas[dev,pyscf] --quiet && sudo -u ubuntu env PATH=\$NEURON_VENV/bin:/usr/bin:/bin TMPDIR=/var/tmp TRNBLAS_REQUIRE_NKI=1 \$NEURON_VENV/bin/pytest /home/ubuntu/trnblas/tests/test_df_mp2_pyscf.py -v -s -m \"$MARKER_EXPR\" --tb=short'\"
-  ]" \
+  --parameters "file://$PARAMS_FILE" \
   --region "$REGION" \
   --output text --query 'Command.CommandId')
+rm -f "$PARAMS_FILE"
 
 echo "Command ID: $CMD_ID"
 echo "Waiting for PySCF tests (slow tests take 2-5 min each; --slow adds ~20 min)..."
