@@ -119,15 +119,22 @@ shapes = os.environ["SHAPES_VAL"].split()
 
 # Each shape: cold pass first (compiles + caches NEFFs), then warm pass
 # in a fresh process (loads from EBS cache).
+#
+# NEURON_RT_LOG_LEVEL=WARNING suppresses the per-NEFF "[INFO]: Using a
+# cached neff" messages that would otherwise flood SSM's 24 KB stdout
+# limit and truncate the timing output.
 bench_cmds = ""
 for shape in shapes:
     run = (
         f"sudo -u ubuntu env PATH=$NEURON_VENV/bin:/usr/bin:/bin TMPDIR=/var/tmp"
         f" TRNBLAS_REQUIRE_NKI=1"
+        f" NEURON_RT_LOG_LEVEL=WARNING"
         f" $NEURON_VENV/bin/python /home/ubuntu/trnblas/examples/df_mp2.py"
         f" --bench --shape {shape} --batched-pair-energy"
     )
     bench_cmds += (
+        f"echo '--- shape={shape} cold (df -h /var/tmp) ---'\n"
+        f"df -h /var/tmp\n"
         f"echo '--- shape={shape} cold ---'\n"
         f"{run} --passes cold\n"
         f"echo '--- shape={shape} warm ---'\n"

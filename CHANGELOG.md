@@ -22,24 +22,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Hardware (2026-04-21, trn1.2xlarge, neuronxcc 2.24.5133)
 
-**Medium-shape cold timing** (`nbasis=512, nocc=64, nvir=448, naux=1536`):
+**Medium-shape timing** (`nbasis=512, nocc=64, nvir=448, naux=1536`):
 
-| Step | Cold |
-|---|---:|
-| Cholesky | 29.7 s |
-| Half-transform | 103.5 s |
-| Metric contraction | 4.0 s |
-| Energy (64 i-dispatches) | 101.3 s |
-| **Total** | **238.5 s** |
+| Step | Compile-cold | EBS-warm |
+|---|---:|---:|
+| Cholesky | 29.7 s | 30.5 s |
+| Half-transform | 103.5 s | 5.1 s |
+| Metric contraction | 4.0 s | 0.6 s |
+| Energy (64 i-dispatches) | 101.3 s | 101.0 s |
+| **Total** | **238.5 s** | **137.2 s** |
 
-Measured from a partially-warm EBS cache (GEMM/SYRK/TRSM NEFFs cached from prior
-test-suite runs; energy kernel compiled fresh). E = −2.487218×10⁰ Ha.
+Compile-cold: energy kernel compiled fresh; GEMM/SYRK/TRSM NEFFs hit EBS cache from
+prior test-suite runs.
+EBS-warm: all NEFFs loaded from EBS cache (no compilation), but not yet in device HBM.
+Half-transform NEFF load drops 20× (5.1 s vs 103.5 s); energy remains ~101 s because
+64 energy NEFFs still load serially at ~1.3 s/NEFF ≈ 83 s DMA + kernel time.
+E = −2.487218×10⁰ Ha (both passes).
 
 **HBM constraint confirmed:** after the medium cold pass, 64 energy NEFFs + GEMM/SYRK/TRSM
 NEFFs fill 15.9 GB of the 16 GB device. A subsequent in-process warm pass fails with
-`Failed to allocate 1.500GB (usage: tensors)`. Warm timing from prior benchmarks (1.536 s
-energy, 4.784 s total) was measured via a separate process loading from EBS NEFF cache —
-that remains the correct production number. Large-shape warm pending `run_bench.sh` rerun.
+`Failed to allocate 1.500GB (usage: tensors)`. The prior 4.784 s warm figure (1.536 s
+energy) is in-process HBM-warm; it cannot be reproduced via separate-process EBS loading
+(that takes ~137 s as shown above).
+
+**Large-shape cold:** failed with `LLVM ERROR: IO failure on output stream: No space left
+on device` during neuronxcc compilation of large-shape kernels. EBS disk was full after
+medium NEFF cache + compilation artifacts. Needs disk investigation before large can run.
 
 ## [0.5.4] — 2026-04-17
 
