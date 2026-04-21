@@ -120,30 +120,49 @@ shapes = os.environ["SHAPES_VAL"].split()
 # Each shape: cold pass first (compiles + caches NEFFs), then warm pass
 # in a fresh process (loads from EBS cache).
 #
-# NEURON_RT_LOG_LEVEL=WARNING suppresses the per-NEFF "[INFO]: Using a
-# cached neff" messages that would otherwise flood SSM's 24 KB stdout
-# limit and truncate the timing output.
+# Output filtering: bench output is redirected to a temp file; only the
+# timing line and errors are echoed to stdout.  This avoids the SSM 24 KB
+# stdout limit being consumed by per-NEFF "[INFO]: Using a cached neff"
+# lines that NEURON_RT_LOG_LEVEL cannot suppress (they come from libnrt.so
+# before the Python runtime log level is applied).
 bench_cmds = ""
 for shape in shapes:
     run = (
         f"sudo -u ubuntu env PATH=$NEURON_VENV/bin:/usr/bin:/bin TMPDIR=/var/tmp"
         f" TRNBLAS_REQUIRE_NKI=1"
-        f" NEURON_RT_LOG_LEVEL=WARNING"
         f" $NEURON_VENV/bin/python /home/ubuntu/trnblas/examples/df_mp2.py"
         f" --bench --shape {shape} --batched-pair-energy"
     )
-    bench_cmds += (
-        f"echo '--- shape={shape} cold (df -h /var/tmp) ---'\n"
-        f"df -h /var/tmp\n"
-        f"echo '--- shape={shape} cold ---'\n"
-        f"{run} --passes cold\n"
-        f"echo '--- shape={shape} warm ---'\n"
-        f"{run} --passes warm\n"
-    )
+    for pass_name in ("cold", "warm"):
+        log = f"/tmp/bench_{shape}_{pass_name}.log"
+        bench_cmds += (
+            f"echo '--- shape={shape} {pass_name} (disk) ---'\n"
+            f"df -h / | tail -1\n"
+            f"echo '--- shape={shape} {pass_name} ---'\n"
+            f"set +e\n"
+            f"{run} --passes {pass_name} > {log} 2>&1\n"
+            f"BENCH_EXIT=$?\n"
+            f"set -e\n"
+            f"grep -E '^  {pass_name}:' {log} || true\n"
+            f"if [[ $BENCH_EXIT -ne 0 ]]; then\n"
+            f"  echo 'BENCH FAILED (exit=$BENCH_EXIT):'\n"
+            f"  tail -10 {log}\n"
+            f"  false\n"
+            f"fi\n"
+        )
 
 script = (
     "#!/bin/bash\n"
     "set -euo pipefail\n"
+    # Expand filesystem if the EBS volume was resized via terraform.
+    # growpart/resize2fs are idempotent: they no-op if already at full size.
+    "ROOT_DEV=$(df / --output=source | tail -1)\n"
+    "PARENT=$(lsblk -no PKNAME \"$ROOT_DEV\" 2>/dev/null | head -1 || true)\n"
+    "if [[ -n \"$PARENT\" ]]; then\n"
+    "  sudo growpart \"/dev/$PARENT\" 1 2>/dev/null || true\n"
+    "fi\n"
+    "sudo resize2fs \"$ROOT_DEV\" 2>/dev/null || true\n"
+    "echo \"disk after grow: $(df -h / | tail -1)\"\n"
     "cd /home/ubuntu/trnblas\n"
     "sudo -u ubuntu git fetch --all\n"
     f"sudo -u ubuntu git checkout {sha}\n"
