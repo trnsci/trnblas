@@ -98,7 +98,13 @@ if [[ "$PING" != "Online" ]]; then
 fi
 
 # Build the remote bench command: run df_mp2.py --bench for each shape.
-# Large shape cold compile can take 30-90 min (chunked NEFF compilations).
+# Cold and warm are run as SEPARATE process invocations to avoid HBM OOM.
+#
+# At medium/large shapes, the Neuron runtime keeps all loaded NEFFs resident
+# in HBM after the cold pass (~15.9 GB at medium, nocc=64). A second in-process
+# warm pass then fails to allocate tensor workspace (needs 1.5 GB, HBM full).
+# Solution: cold pass populates the EBS NEFF cache; a fresh process for the
+# warm pass loads NEFFs from EBS (fast) without carrying the cold residue.
 SHAPES_ARG="${SHAPES[*]}"
 echo "Sending bench command (SHA=$SHA, shapes=${SHAPES_ARG})..."
 
@@ -111,15 +117,21 @@ import base64, json, os
 sha    = os.environ["SHA_VAL"]
 shapes = os.environ["SHAPES_VAL"].split()
 
-# Build the bench commands: one python invocation per shape.
+# Each shape: cold pass first (compiles + caches NEFFs), then warm pass
+# in a fresh process (loads from EBS cache).
 bench_cmds = ""
 for shape in shapes:
-    bench_cmds += (
-        f"echo '--- shape={shape} ---'\n"
+    run = (
         f"sudo -u ubuntu env PATH=$NEURON_VENV/bin:/usr/bin:/bin TMPDIR=/var/tmp"
         f" TRNBLAS_REQUIRE_NKI=1"
         f" $NEURON_VENV/bin/python /home/ubuntu/trnblas/examples/df_mp2.py"
-        f" --bench --shape {shape} --batched-pair-energy\n"
+        f" --bench --shape {shape} --batched-pair-energy"
+    )
+    bench_cmds += (
+        f"echo '--- shape={shape} cold ---'\n"
+        f"{run} --passes cold\n"
+        f"echo '--- shape={shape} warm ---'\n"
+        f"{run} --passes warm\n"
     )
 
 script = (

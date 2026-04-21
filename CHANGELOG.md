@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`--passes` flag for `df_mp2.py --bench`** (`cold`/`warm`/`both`, default `both`).
+  On Trainium at medium/large shapes, running both passes in the same process OOMs:
+  after the cold pass, all loaded NEFFs remain resident in HBM (64 × 244 MB = 15.6 GB
+  DMA spill at medium shape), leaving no headroom for tensor allocation in the warm pass.
+  The fix is two separate process invocations; `run_bench.sh` now does this automatically.
+
+- **`scripts/run_bench.sh`** — runs `df_mp2.py --bench --batched-pair-energy` on the
+  trn1 CI instance via SSM, cold and warm as separate processes. Supports
+  `--shape medium|large` (default: both). Follows the base64-SSM pattern from
+  `run_pyscf_tests.sh`.
+
+### Hardware (2026-04-21, trn1.2xlarge, neuronxcc 2.24.5133)
+
+**Medium-shape cold timing** (`nbasis=512, nocc=64, nvir=448, naux=1536`):
+
+| Step | Cold |
+|---|---:|
+| Cholesky | 29.7 s |
+| Half-transform | 103.5 s |
+| Metric contraction | 4.0 s |
+| Energy (64 i-dispatches) | 101.3 s |
+| **Total** | **238.5 s** |
+
+Measured from a partially-warm EBS cache (GEMM/SYRK/TRSM NEFFs cached from prior
+test-suite runs; energy kernel compiled fresh). E = −2.487218×10⁰ Ha.
+
+**HBM constraint confirmed:** after the medium cold pass, 64 energy NEFFs + GEMM/SYRK/TRSM
+NEFFs fill 15.9 GB of the 16 GB device. A subsequent in-process warm pass fails with
+`Failed to allocate 1.500GB (usage: tensors)`. Warm timing from prior benchmarks (1.536 s
+energy, 4.784 s total) was measured via a separate process loading from EBS NEFF cache —
+that remains the correct production number. Large-shape warm pending `run_bench.sh` rerun.
+
 ## [0.5.4] — 2026-04-17
 
 ### Added

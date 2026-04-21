@@ -146,9 +146,12 @@ cached-failed-NEFF path → torch.matmul fallback on CPU.
 `@nki.jit` call per i-row processes all `nocc` j-pairs. 64 i-dispatches × ~24 ms
 each = 1.536 s warm energy (XLA dispatch overhead dominates; Tensor Engine executes
 each kernel in ~1 ms). Cold energy = 34 min (77 NEFF compilations at ~27 s each;
-paid once per instance lifetime). Device HBM note: 64 loaded energy NEFFs ×
-244 MB DMA spill ≈ 15.6 GB fills the 16 GB device; a `Failed to allocate 1.5 GB`
-warning is logged during warm setup but computation succeeds.
+paid once per instance lifetime). **Device HBM note (confirmed 2026-04-21):** at
+medium shape, all 64 loaded energy NEFFs remain resident after the cold pass —
+12.6 GB DMA spill + 900 MB model code = 15.9 GB total. A warm pass in the same
+process fails with `Failed to allocate 1.500GB (usage: tensors)` — no headroom
+remains. Warm timing must be measured in a separate process that loads from the
+EBS NEFF cache; `run_bench.sh` does this via `--passes cold` then `--passes warm`.
 
 Energies agree to FP32 noise: -2.487220e+00 (torch), -2.487219e+00 (fused-gemm),
 -2.487221e+00 (batched-pair fallback), -2.487218e+00 (chunked NKI).
@@ -169,11 +172,18 @@ Energy matches bit-for-bit within fp32 reduction-order noise.
 (GA102 Ampere) launched Apr 2021 — closest single-GPU match on AWS.
 A10G via `g5.xlarge` (~$1/hr), trn1 via `trn1.2xlarge` (~$1.34/hr).
 
-| Shape                | Flops   | trn1 NKI warm | A10G warm | A10G vs trn1 |
-|----------------------|--------:|--------------:|----------:|-------------:|
-| small (128/16/384)   | 3.4 G   | 0.091 s       | 0.001 s   | 91×          |
-| medium (512/64/1536) | 2 757 G | **4.784 s** (v0.5.4†) | 0.266 s | **18×** |
-| large (768/96/2304)  | 20 352 G | (not re-run) | 2.018 s   | —            |
+| Shape                | Flops   | trn1 NKI cold | trn1 NKI warm | A10G warm | A10G vs trn1 |
+|----------------------|--------:|--------------:|--------------:|----------:|-------------:|
+| small (128/16/384)   | 3.4 G   | —             | 0.091 s       | 0.001 s   | 91×          |
+| medium (512/64/1536) | 2 757 G | **238.5 s**†† | **4.784 s** (v0.5.4†) | 0.266 s | **18×** |
+| large (768/96/2304)  | 20 352 G | —            | —             | 2.018 s   | —            |
+
+†† Medium cold (2026-04-21, `run_bench.sh --shape medium`): chol 29.7 s, half 103.5 s,
+metric 4.0 s, energy 101.3 s = 238.5 s total. Measured from a partially-warm EBS cache
+(GEMM/SYRK/TRSM NEFFs hit cache; energy kernel compiled fresh). A fully cold start
+(empty cache) would take longer. Cold is paid once per instance lifetime; warm numbers
+are the production-relevant metric. Large shape: in-process warm OOMs at medium (HBM
+saturated); separate-process cold pending.
 
 † v0.5.4 chunked dispatch (warm total 4.784 s). Prior v0.5.3 used CPU fallback
 (9.910 s). The 18× gap vs A10G is down from 37× in v0.5.3.
