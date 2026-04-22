@@ -133,6 +133,13 @@ resource "aws_instance" "ci" {
   tags = {
     Name = var.instance_tag
   }
+
+  lifecycle {
+    # Prevent instance replacement when only user_data comments change.
+    # The EBS NEFF cache (100s of GB of compiled kernels) is attached to
+    # this instance; replacement destroys it and forces a full recompile.
+    ignore_changes = [user_data, associate_public_ip_address]
+  }
 }
 
 # ---------------------------------------------------------------------------
