@@ -171,7 +171,13 @@ script = (
     + bench_cmds
 )
 encoded = base64.b64encode(script.encode()).decode()
-print(json.dumps({"commands": [f"echo '{encoded}' | base64 -d | bash"]}))
+# executionTimeout overrides the AWS-RunShellScript default of 3600s.
+# --timeout-seconds on send-command controls delivery only; this param
+# controls how long the script is allowed to run on the instance.
+print(json.dumps({
+    "commands": [f"echo '{encoded}' | base64 -d | bash"],
+    "executionTimeout": ["14400"],
+}))
 PYEOF
 
 CMD_ID=$(aws ssm send-command \
@@ -179,17 +185,18 @@ CMD_ID=$(aws ssm send-command \
   --document-name "AWS-RunShellScript" \
   --comment "trnblas bench @ $SHA shapes=${SHAPES_ARG}" \
   --parameters "file://$PARAMS_FILE" \
-  --timeout-seconds 7200 \
+  --timeout-seconds 14400 \
   --region "$REGION" \
   --output text --query 'Command.CommandId')
 rm -f "$PARAMS_FILE"
 
 echo "Command ID: $CMD_ID"
-echo "Waiting for bench to complete (cold compile for large shape: 30-90 min)..."
+echo "Waiting for bench to complete (cold compile for large shape: 2-4 hr)..."
 
-# Poll every 30s, up to 120 min.
+# Poll every 30s, up to 4 hr (480 polls).
+# Large-shape cold compile observed to take >2 hr (>120 NEFF compilations).
 STATUS=InProgress
-for _ in $(seq 1 240); do
+for _ in $(seq 1 480); do
   STATUS=$(aws ssm get-command-invocation \
     --command-id "$CMD_ID" \
     --instance-id "$INSTANCE_ID" \
