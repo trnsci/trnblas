@@ -95,6 +95,15 @@ _BATCHED_PAIR_CHUNK_THRESHOLD = 4096
 # within the ~256 MB range that compiles cleanly (medium B ≈ 251 MB is fine).
 _J_CHUNK_MAX_B_BYTES = 256 * 1024 * 1024
 
+# NRT instruction/DMA complexity cap: j_chunk × N_A × N_B × N_K total tile ops
+# per kernel call.  Even after the B-size split produces a compilable NEFF,
+# the NeuronCore runtime rejects kernels with too many tile operations at load
+# time (NRT_RESOURCE).  Empirically: medium (_j_batched_kernel NOCC=64,
+# N_A=4, N_B=4, N_K=15 → 15,360 ops) loads cleanly; large j_chunk=32
+# (N_A=6, N_B=6, N_K=18 → 20,736 ops) fails.  Cap at 12,288 (j_chunk=16
+# for large: 10,368 ops — well under the working ceiling).
+_J_CHUNK_MAX_OPS = 12288
+
 # Autotuner — sweeps tile candidates on hardware once per shape bucket and
 # caches the winner to disk. Disabled in simulator mode and by TRNBLAS_AUTOTUNE=0.
 _AUTOTUNE_ENABLED: bool = os.environ.get("TRNBLAS_AUTOTUNE", "1") != "0"
@@ -741,15 +750,27 @@ def _nki_batched_pair_energy_chunked_impl(
         ev_col_feed, ev_row_feed = ev_col, ev_row
 
     # ---- j-sub-chunking ---------------------------------------------------
-    # Compute j_chunk_size: largest power-of-2 ≤ _J_CHUNK_MAX_B_BYTES // bytes_per_j.
-    # Medium (B ≈ 251 MB < 256 MB): j_chunk_size = nocc → no sub-chunking;
-    #   existing call signature is preserved so the medium NEFF cache stays valid.
-    # Large  (B ≈ 680 MB > 256 MB): j_chunk_size = 32 → 3 j-sub-chunks/i-call;
-    #   B_j:(32, nvir_pad, naux_pad) ≈ 226 MB keeps neuronx-cc within RAM budget.
+    # Two constraints must both be satisfied for each kernel call to succeed:
+    #   1. B-size: B_j:(j_chunk, nvir_pad, naux_pad) ≤ 256 MB — prevents
+    #      neuronx-cc compiler RAM OOM during NEFF compilation.
+    #   2. Ops count: j_chunk × N_A × N_B × N_K ≤ _J_CHUNK_MAX_OPS — prevents
+    #      NeuronCore NRT_RESOURCE error at kernel load time (instruction/DMA
+    #      capacity exceeded even after compilation succeeds).
+    # Medium (B ≈ 251 MB, ops = 64×4×4×15 = 15,360): neither limit hit →
+    #   j_chunk_size = nocc, original call signature, NEFF cache preserved.
+    # Large  (B ≈ 680 MB, ops constraint → j_chunk = 16):
+    #   j_chunk=32 compiles (B=226 MB) but hits NRT_RESOURCE (20,736 ops);
+    #   j_chunk=16 gives 10,368 ops — below the 15,360 working ceiling.
     bytes_per_j = nvir_pad * naux_pad * 4  # float32
     if bytes_per_j * nocc > _J_CHUNK_MAX_B_BYTES:
         _raw = max(1, _J_CHUNK_MAX_B_BYTES // bytes_per_j)
         j_chunk_size = 1 << (_raw.bit_length() - 1)  # floor to power-of-2
+        # Apply ops cap: further reduce j_chunk if N_A × N_B × N_K is large.
+        _n_a = nvir_pad // TILE
+        _n_k = naux_pad // TILE_K
+        _ops_per_j = _n_a * _n_a * _n_k  # N_A × N_B × N_K per j-iteration
+        _raw_ops = max(1, _J_CHUNK_MAX_OPS // _ops_per_j)
+        j_chunk_size = min(j_chunk_size, 1 << (_raw_ops.bit_length() - 1))
     else:
         j_chunk_size = nocc  # no sub-chunking
     nocc_padded = ((nocc + j_chunk_size - 1) // j_chunk_size) * j_chunk_size
