@@ -20,34 +20,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--shape medium|large` (default: both). Follows the base64-SSM pattern from
   `run_pyscf_tests.sh`.
 
-### Hardware (2026-04-21, trn1.2xlarge, neuronxcc 2.24.5133)
+### Hardware (2026-04-21 / 2026-04-22, trn1.2xlarge, neuronxcc 2.24.5133)
 
 **Medium-shape timing** (`nbasis=512, nocc=64, nvir=448, naux=1536`):
 
-| Step | Compile-cold | EBS-warm |
-|---|---:|---:|
-| Cholesky | 29.7 s | 30.5 s |
-| Half-transform | 103.5 s | 5.1 s |
-| Metric contraction | 4.0 s | 0.6 s |
-| Energy (64 i-dispatches) | 101.3 s | 101.0 s |
-| **Total** | **238.5 s** | **137.2 s** |
+| Step | True compile-cold† | Partial-warm cold†† | EBS-warm‡ |
+|---|---:|---:|---:|
+| Cholesky | 32.4 s | 29.7 s | 11.5 s |
+| Half-transform | 24.6 s | 103.5 s | 9.1 s |
+| Metric contraction | 2.0 s | 4.0 s | 0.5 s |
+| Energy (64 i-dispatches) | 2041.3 s | 101.3 s | 98.7 s |
+| **Total** | **2100.4 s** | **238.5 s** | **119.8 s** |
 
-Compile-cold: energy kernel compiled fresh; GEMM/SYRK/TRSM NEFFs hit EBS cache from
-prior test-suite runs.
-EBS-warm: all NEFFs loaded from EBS cache (no compilation), but not yet in device HBM.
-Half-transform NEFF load drops 20× (5.1 s vs 103.5 s); energy remains ~101 s because
-64 energy NEFFs still load serially at ~1.3 s/NEFF ≈ 83 s DMA + kernel time.
-E = −2.487218×10⁰ Ha (both passes).
+† True compile-cold (2026-04-22): empty cache (`rm -rf /var/tmp/neuron-compile-cache/`).
+All 77 unique NEFFs compiled from scratch — energy dominates at 2041 s (77 compilations
+× ~27 s each). `E = −2.487218×10⁰ Ha`.
+
+†† Partial-warm cold (2026-04-21): GEMM/SYRK/TRSM NEFFs hit EBS cache from prior
+test-suite runs; only the energy kernel compiled fresh. The 8.8× difference (238 s vs
+2100 s) reflects this cache state.
+
+‡ EBS-warm (2026-04-22, fresh compilation): all NEFFs loaded from `/var/tmp/neuron-compile-cache/`
+(EBS, no compilation). Half-transform NEFF loads in 9 s (vs 24.6 s compile). Energy
+remains ~99 s: 64 energy NEFFs still load serially from EBS at ~1.5 s/NEFF.
 
 **HBM constraint confirmed:** after the medium cold pass, 64 energy NEFFs + GEMM/SYRK/TRSM
 NEFFs fill 15.9 GB of the 16 GB device. A subsequent in-process warm pass fails with
 `Failed to allocate 1.500GB (usage: tensors)`. The prior 4.784 s warm figure (1.536 s
 energy) is in-process HBM-warm; it cannot be reproduced via separate-process EBS loading
-(that takes ~137 s as shown above).
+(takes ~120 s as shown above).
 
-**Large-shape cold:** failed with `LLVM ERROR: IO failure on output stream: No space left
-on device` during neuronxcc compilation of large-shape kernels. EBS disk was full after
-medium NEFF cache + compilation artifacts. Needs disk investigation before large can run.
+**Large-shape cold: neuronx-cc compiler OOM.** `_j_batched_kernel` for large shape
+passes `B: (nocc=96, nvir_pad≈768, naux_pad=2304)` (~680 MB) to neuronx-cc, which
+exhausts the trn1.2xlarge 32 GB system RAM during XLA IR generation:
+`neuronx-cc was forcibly killed - This most commonly occurs due to insufficient system
+memory.` Disk (200 GB EBS, 131 GB free) is not the issue. Fix: sub-chunk the j-loop
+inside `_j_batched_kernel` so `B` has shape `(j_chunk ≤ 32, nvir_pad, naux_pad)`
+(~170 MB) — comparable to medium's compile-OK size.
 
 ## [0.5.4] — 2026-04-17
 
