@@ -198,12 +198,18 @@ cold pass, 64 energy NEFFs + GEMM/SYRK/TRSM NEFFs fill 15.9 GB of the 16 GB HBM,
 no headroom for tensor allocation in a second pass. The 4.784 s warm figure is from an
 earlier tracing run; current architecture cannot re-measure it without HBM OOM.
 
-††† Large compile-cold: **neuronx-cc compiler OOM** (2026-04-22, 200 GB EBS with 131 GB
-free — disk is not the issue). `_j_batched_kernel` with `B: (nocc=96, nvir_pad≈768,
-naux_pad=2304)` (~680 MB FP32) exhausts trn1.2xlarge's 32 GB system RAM during XLA IR
-generation: `neuronx-cc was forcibly killed - insufficient system memory`. Fix: sub-chunk
-the j-loop to `B: (j_chunk ≤ 32, nvir_pad, naux_pad)` (~170 MB), bringing compiler RAM
-requirement in line with medium's compile-OK size.
+††† Large cold hits **two hardware limits** (2026-04-22):
+
+**Limit 1 (compiler RAM, fixed):** `B: (96, 768, 2304)` ~680 MB exhausted neuronx-cc's
+32 GB RAM. Fixed by j-sub-chunking (`_J_CHUNK_MAX_B_BYTES`). Compiler now succeeds.
+
+**Limit 2 (NRT kernel load, unfixed — hardware ceiling):** Even with the compiler fix,
+the NeuronCore runtime rejects the compiled NEFF at load time:
+`RuntimeError: Load: error condition NRT_RESOURCE`. Root cause: the inner loop tile count
+`N_A × N_B × N_K = 6 × 6 × 18 = 648` exceeds what trn1 NRT can schedule. Medium's
+`4 × 4 × 12 = 192` loads cleanly; this limit is hit for any j_chunk size (confirmed
+j_chunk = 32, 16, 1 all fail). Fix requires kernel redesign: reduce N_A×N_B by moving
+the b-strip loop to Python, or increase tile width to TILE=256 to halve N_A and N_B.
 
 † v0.5.4 chunked dispatch. Prior v0.5.3 used CPU fallback (9.910 s). The 18× gap vs A10G
 is down from 37× in v0.5.3.
