@@ -50,13 +50,33 @@ NEFFs fill 15.9 GB of the 16 GB device. A subsequent in-process warm pass fails 
 energy) is in-process HBM-warm; it cannot be reproduced via separate-process EBS loading
 (takes ~120 s as shown above).
 
-**Large-shape cold: neuronx-cc compiler OOM.** `_j_batched_kernel` for large shape
-passes `B: (nocc=96, nvir_pad≈768, naux_pad=2304)` (~680 MB) to neuronx-cc, which
-exhausts the trn1.2xlarge 32 GB system RAM during XLA IR generation:
-`neuronx-cc was forcibly killed - This most commonly occurs due to insufficient system
-memory.` Disk (200 GB EBS, 131 GB free) is not the issue. Fix: sub-chunk the j-loop
-inside `_j_batched_kernel` so `B` has shape `(j_chunk ≤ 32, nvir_pad, naux_pad)`
-(~170 MB) — comparable to medium's compile-OK size.
+**Large-shape cold: two distinct hardware limits (2026-04-22).**
+
+*Limit 1 — neuronx-cc compiler RAM OOM (fixed):* `_j_batched_kernel` with full
+`B: (96, 768, 2304)` (~680 MB) exhausted the compiler's 32 GB RAM.  Fixed by
+j-sub-chunking (`_J_CHUNK_MAX_B_BYTES = 256 MB`), reducing B to
+`(j_chunk, 768, 2304)`.  neuronx-cc now compiles cleanly.
+
+*Limit 2 — NRT kernel load failure (unfixed, hardware limit):* Even with the
+compiler fix, the compiled NEFF for `_j_batched_kernel` with
+`N_A=6, N_B=6, N_K=18` (inner loop complexity = 648 tiles per j-iteration)
+fails to load into the NeuronCore at runtime:
+`RuntimeError: Load: error condition NRT_RESOURCE == rt_status`.
+This is a hardware NRT limit — **not** a compiler issue.
+
+Confirmed via bisection across j_chunk values:
+  - j_chunk=32 (inner=648, total_ops=20,736) → NRT_RESOURCE
+  - j_chunk=16 (inner=648, total_ops=10,368) → NRT_RESOURCE
+  - j_chunk=1  (inner=648, total_ops=648)   → NRT_RESOURCE
+
+The NRT limit is on the inner loop tile count `N_A × N_B × N_K` — independent
+of j_chunk (NOCC).  Medium's `4 × 4 × 12 = 192` tiles loads cleanly; large's
+`6 × 6 × 18 = 648` does not, regardless of how j is split.
+
+**Fix required:** kernel redesign to keep inner tile count ≤ ~200.  Options:
+(a) process fewer (a,b) strips per call (move b-loop to Python), or (b) use
+larger a/b tile size (TILE=256) to reduce N_A/N_B from 6 to 3.
+Tracked under the j-sub-chunk follow-up item.
 
 ## [0.5.4] — 2026-04-17
 
