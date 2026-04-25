@@ -50,33 +50,30 @@ NEFFs fill 15.9 GB of the 16 GB device. A subsequent in-process warm pass fails 
 energy) is in-process HBM-warm; it cannot be reproduced via separate-process EBS loading
 (takes ~120 s as shown above).
 
-**Large-shape cold: two distinct hardware limits (2026-04-22).**
+**Large-shape cold: NRT hardware limit on energy; PyTorch fallback (2026-04-22/24).**
 
-*Limit 1 — neuronx-cc compiler RAM OOM (fixed):* `_j_batched_kernel` with full
-`B: (96, 768, 2304)` (~680 MB) exhausted the compiler's 32 GB RAM.  Fixed by
-j-sub-chunking (`_J_CHUNK_MAX_B_BYTES = 256 MB`), reducing B to
-`(j_chunk, 768, 2304)`.  neuronx-cc now compiles cleanly.
+`_j_batched_kernel` inner loop tile count `N_A × N_B × N_K = 6 × 6 × 18 = 648`
+exceeds the NeuronCore NRT load capacity regardless of j_chunk size (confirmed via
+j_chunk = 1, 16, 32 — all fail with `NRT_RESOURCE`).  Fix: proactive PyTorch fallback
+in `_nki_batched_pair_energy_chunked_impl` when `inner_ops > _NRT_INNER_OP_LIMIT (300)`.
 
-*Limit 2 — NRT kernel load failure (unfixed, hardware limit):* Even with the
-compiler fix, the compiled NEFF for `_j_batched_kernel` with
-`N_A=6, N_B=6, N_K=18` (inner loop complexity = 648 tiles per j-iteration)
-fails to load into the NeuronCore at runtime:
-`RuntimeError: Load: error condition NRT_RESOURCE == rt_status`.
-This is a hardware NRT limit — **not** a compiler issue.
+**Large-shape timing (2026-04-24, trn1.2xlarge, neuronxcc 2.24.5133):**
 
-Confirmed via bisection across j_chunk values:
-  - j_chunk=32 (inner=648, total_ops=20,736) → NRT_RESOURCE
-  - j_chunk=16 (inner=648, total_ops=10,368) → NRT_RESOURCE
-  - j_chunk=1  (inner=648, total_ops=648)   → NRT_RESOURCE
+| Step | Cold | Warm |
+|---|---:|---:|
+| Cholesky | 38.5 s (NKI) | 12.5 s (NKI) |
+| Half-transform | 96.5 s (NKI compile) | 30.4 s (NKI EBS-warm) |
+| Metric contraction | 3.8 s (NKI) | 2.0 s (NKI) |
+| **Energy (PyTorch CPU fallback)** | **35.6 s** | **35.5 s** |
+| **Total** | **174.5 s** | **80.5 s** |
 
-The NRT limit is on the inner loop tile count `N_A × N_B × N_K` — independent
-of j_chunk (NOCC).  Medium's `4 × 4 × 12 = 192` tiles loads cleanly; large's
-`6 × 6 × 18 = 648` does not, regardless of how j is split.
+`~0.12 TFLOPS cold, ~0.25 TFLOPS warm. E = −4.351185×10¹ Ha.`
 
-**Fix required:** kernel redesign to keep inner tile count ≤ ~200.  Options:
-(a) process fewer (a,b) strips per call (move b-loop to Python), or (b) use
-larger a/b tile size (TILE=256) to reduce N_A/N_B from 6 to 3.
-Tracked under the j-sub-chunk follow-up item.
+Energy cold ≈ warm (35.5 s both) — confirming PyTorch CPU (no NKI caching benefit).
+Half-transform cold 96.5 s reflects GEMM NEFF compilation for large-matrix shapes.
+NKI is used for chol, half-transform, and metric; energy falls back to trn1 CPUs.
+NRT fix required for energy NKI: redesign to keep inner tile count ≤ ~200 (options:
+move b-strip loop to Python, or use TILE=256 to reduce N_A/N_B from 6 to 3).
 
 ## [0.5.4] — 2026-04-17
 

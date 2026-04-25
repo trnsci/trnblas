@@ -176,7 +176,7 @@ A10G via `g5.xlarge` (~$1/hr), trn1 via `trn1.2xlarge` (~$1.34/hr).
 |----------------------|--------:|------------------:|---------------:|--------------:|----------:|-------------:|
 | small (128/16/384)   | 3.4 G   | —                 | —              | 0.091 s       | 0.001 s   | 91×          |
 | medium (512/64/1536) | 2 757 G | **2100.4 s**††    | **119.8 s**‡‡  | **4.784 s**†  | 0.266 s   | **18×**      |
-| large (768/96/2304)  | 20 352 G | OOM†††           | —              | —             | 2.018 s   | —            |
+| large (768/96/2304)  | 20 352 G | **174.5 s**†††   | **80.5 s**§    | —             | 2.018 s   | **40×**      |
 
 †† Medium compile-cold (2026-04-22, empty cache): chol 32.4 s, half 24.6 s, metric 2.0 s,
 energy 2041.3 s = **2100.4 s total** (77 unique NEFF compilations at ~27 s each). Prior
@@ -198,18 +198,20 @@ cold pass, 64 energy NEFFs + GEMM/SYRK/TRSM NEFFs fill 15.9 GB of the 16 GB HBM,
 no headroom for tensor allocation in a second pass. The 4.784 s warm figure is from an
 earlier tracing run; current architecture cannot re-measure it without HBM OOM.
 
-††† Large cold hits **two hardware limits** (2026-04-22):
+††† Large compile-cold (2026-04-24, empty energy cache): chol 38.5 s, half 96.5 s,
+metric 3.8 s, **energy 35.6 s (PyTorch CPU fallback†††‡)**, total 174.5 s. Half-transform
+96.5 s reflects GEMM NEFF compilation for large matrices. E = −4.351185×10¹ Ha.
 
-**Limit 1 (compiler RAM, fixed):** `B: (96, 768, 2304)` ~680 MB exhausted neuronx-cc's
-32 GB RAM. Fixed by j-sub-chunking (`_J_CHUNK_MAX_B_BYTES`). Compiler now succeeds.
+†††‡ **Large energy uses PyTorch CPU fallback, not NKI.** `_j_batched_kernel` inner loop
+tile count `N_A × N_B × N_K = 6 × 6 × 18 = 648` exceeds the NeuronCore NRT hardware
+load limit (~192; medium's `4 × 4 × 12 = 192` loads cleanly). Confirmed: j_chunk = 32,
+16, 1 all fail with `NRT_RESOURCE`. The dispatch proactively detects this and returns
+`_torch_batched_pair_energy` immediately (avoids ~30 min of wasted NEFF compilation).
+Chol, half-transform, and metric steps use NKI; energy alone falls back to trn1 CPUs.
 
-**Limit 2 (NRT kernel load, unfixed — hardware ceiling):** Even with the compiler fix,
-the NeuronCore runtime rejects the compiled NEFF at load time:
-`RuntimeError: Load: error condition NRT_RESOURCE`. Root cause: the inner loop tile count
-`N_A × N_B × N_K = 6 × 6 × 18 = 648` exceeds what trn1 NRT can schedule. Medium's
-`4 × 4 × 12 = 192` loads cleanly; this limit is hit for any j_chunk size (confirmed
-j_chunk = 32, 16, 1 all fail). Fix requires kernel redesign: reduce N_A×N_B by moving
-the b-strip loop to Python, or increase tile width to TILE=256 to halve N_A and N_B.
+§ Large EBS-warm (2026-04-24): chol 12.5 s (NKI), half 30.4 s (NKI EBS load),
+metric 2.0 s (NKI), energy 35.5 s (PyTorch CPU, same as cold — no cache benefit), total
+80.5 s. The 40× A10G gap reflects the energy step running on trn1 CPUs vs A10G cuBLAS.
 
 † v0.5.4 chunked dispatch. Prior v0.5.3 used CPU fallback (9.910 s). The 18× gap vs A10G
 is down from 37× in v0.5.3.
