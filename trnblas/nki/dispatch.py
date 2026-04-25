@@ -95,22 +95,15 @@ _BATCHED_PAIR_CHUNK_THRESHOLD = 4096
 # within the ~256 MB range that compiles cleanly (medium B ≈ 251 MB is fine).
 _J_CHUNK_MAX_B_BYTES = 256 * 1024 * 1024
 
-# NRT DMA/instruction cap per kernel call.
-# Root cause: `_j_batched_kernel` uses 3D DMA (`B[j, a:, k:]` inside
-# nl.affine_range(j)) whose stride along j = nvir_pad × naux_pad × 4.
-# At large shape (stride ≈ 7.1 MB) the stride exceeds a hardware DMA
-# limit; NRT rejects the kernel at load time with NRT_RESOURCE.
-# Reducing j_chunk to 1 makes the j-loop run exactly once: B[0, a:, k:]
-# degenerates to a 2D access, eliminating the 3D DMA stride problem.
-#
-# Empirically (trn1.2xlarge, 2026-04-22):
-#   Medium: NOCC=64, N_A=4, N_B=4, N_K=12, stride≈3 MB → loads OK.
-#   Large:  N_A=6, N_B=6, N_K=18, stride≈7.1 MB → NRT_RESOURCE for any
-#   j_chunk ≥ 2 (j_chunk=32 and j_chunk=16 both failed).  j_chunk=1
-#   (stride reduces to a single 2D access) is expected to work.
-# Cap = N_A×N_B×N_K of the inner loop for "safe" shapes (≤ medium ≈ 192);
-# large inner_ops = 648 → j_chunk_from_ops = floor_pow2(400//648) = 1.
-_J_CHUNK_MAX_OPS = 400
+# NRT hardware inner tile count limit: N_A × N_B × N_K per j-iteration.
+# When this exceeds ~192 the compiled NEFF cannot be loaded by the NeuronCore
+# NRT regardless of j_chunk size.  Confirmed empirically (2026-04-22, trn1):
+#   Medium: 4 × 4 × 12 = 192  → NRT load OK
+#   Large:  6 × 6 × 18 = 648  → NRT_RESOURCE for j_chunk = 1, 16, 32
+# Conservative threshold: 300 (safely above 192, safely below 648).
+# When inner_ops > this value, proactively fall back to torch to avoid
+# ~30 min of wasted NEFF compilation before a guaranteed NRT failure.
+_NRT_INNER_OP_LIMIT = 300
 
 # Autotuner — sweeps tile candidates on hardware once per shape bucket and
 # caches the winner to disk. Disabled in simulator mode and by TRNBLAS_AUTOTUNE=0.
@@ -721,16 +714,17 @@ def _nki_batched_pair_energy_chunked_impl(
     """Chunked batched-pair dispatch: Python i-loop over _j_batched_kernel (#46).
 
     Used when est_iters > _BATCHED_PAIR_CHUNK_THRESHOLD — i.e. the full-batch
-    XLA graph would be too large to compile. Processes NOCC j-pairs for one
-    occupied orbital i per dispatch.
+    XLA graph would be too large to compile.
 
-    J-sub-chunking: if B:(nocc × nvir_pad × naux_pad) exceeds _J_CHUNK_MAX_B_BYTES
-    (256 MB), the j-loop is further split into sub-chunks so each kernel call
-    receives B:(j_chunk × nvir_pad × naux_pad) ≤ 256 MB.  This prevents
-    neuronx-cc from OOMing during XLA IR generation on trn1.2xlarge (32 GB).
+    NRT fallback: if N_A × N_B × N_K > _NRT_INNER_OP_LIMIT, the compiled NEFF
+    cannot be loaded by the NeuronCore NRT on trn1 regardless of j_chunk size.
+    Falls back to `_torch_batched_pair_energy` immediately (skips ~30 min of
+    wasted compilation).  Large shape (inner_ops=648) hits this path; medium
+    (inner_ops=192) does not.
 
-    Medium (B ≈ 251 MB): j_chunk_size = nocc → no sub-chunking, one NEFF compile.
-    Large  (B ≈ 680 MB): j_chunk_size = 32 → 3 j-sub-chunks per i-call, one NEFF.
+    J-sub-chunking: if B:(nocc × nvir_pad × naux_pad) exceeds _J_CHUNK_MAX_B_BYTES,
+    the j-loop is split so each call gets B:(j_chunk × nvir_pad × naux_pad) ≤ 256 MB.
+    Medium (B ≈ 201 MB): j_chunk_size = nocc, original call signature preserved.
     """
     nocc, nvir, naux = B.shape
     TILE = 128
@@ -738,6 +732,26 @@ def _nki_batched_pair_energy_chunked_impl(
     nvir_pad = _round_up(nvir, TILE)
     naux_pad = _round_up(naux, TILE_K)
     needs_pad = (nvir_pad != nvir) or (naux_pad != naux)
+
+    # ---- NRT hardware inner-complexity check ----------------------------------
+    # _j_batched_kernel is rejected by the NeuronCore NRT when the inner loop
+    # tile count N_A × N_B × N_K exceeds the hardware limit (~192 on trn1).
+    # Proactively fall back to avoid ~30 min of wasted NEFF compilation followed
+    # by guaranteed NRT_RESOURCE.  j_chunk=1,16,32 all confirmed failing for
+    # large shape (inner_ops=648); the limit is on inner_ops, not j_chunk×inner_ops.
+    _n_a = nvir_pad // TILE
+    _n_k = naux_pad // TILE_K
+    _inner_ops = _n_a * _n_a * _n_k  # N_A × N_B × N_K
+    if _inner_ops > _NRT_INNER_OP_LIMIT:
+        _warn_fallback(
+            RuntimeError(
+                f"_j_batched_kernel inner tile count {_inner_ops} "
+                f"(N_A×N_B×N_K = {_n_a}×{_n_a}×{_n_k}) "
+                f"exceeds trn1 NRT hardware limit (~{_NRT_INNER_OP_LIMIT}). "
+                f"j_chunk=1,16,32 all confirmed NRT_RESOURCE. Falling back to torch."
+            )
+        )
+        return _torch_batched_pair_energy(B, eps_occ, eps_vir)
 
     eps_occ_row = eps_occ.reshape(1, nocc).contiguous()
     ev_col = eps_vir.reshape(-1, 1).contiguous()
@@ -758,28 +772,15 @@ def _nki_batched_pair_energy_chunked_impl(
         ev_col_feed, ev_row_feed = ev_col, ev_row
 
     # ---- j-sub-chunking ---------------------------------------------------
-    # Two constraints must both be satisfied for each kernel call to succeed:
-    #   1. B-size: B_j:(j_chunk, nvir_pad, naux_pad) ≤ 256 MB — prevents
-    #      neuronx-cc compiler RAM OOM during NEFF compilation.
-    #   2. 3D-DMA: j_chunk × N_A × N_B × N_K ≤ _J_CHUNK_MAX_OPS — prevents
-    #      NRT_RESOURCE at load time caused by excessive 3D DMA stride.
-    #      At large shape (stride per j ≈ 7.1 MB), the hardware rejects
-    #      the kernel for any j_chunk ≥ 2.  j_chunk=1 makes B[j=0,...] a
-    #      2D access, eliminating the stride violation.
-    # Medium (B ≈ 201 MB, inner_ops = 4×4×12 = 192): neither limit hit →
-    #   j_chunk_size = nocc = 64, original call signature preserved.
-    # Large  (B ≈ 680 MB, inner_ops = 6×6×18 = 648 > 400/j threshold):
-    #   j_chunk = 1 → 9216 total kernel calls, each 2D DMA.
+    # When B:(nocc × nvir_pad × naux_pad) > 256 MB, neuronx-cc OOMs during
+    # NEFF compilation.  Split the j-loop so each call gets ≤ 256 MB.
+    # Medium (B ≈ 201 MB < 256 MB): j_chunk_size = nocc, no sub-chunking.
+    # Large shapes with inner_ops > _NRT_INNER_OP_LIMIT are caught above and
+    # returned to torch before reaching this code.
     bytes_per_j = nvir_pad * naux_pad * 4  # float32
     if bytes_per_j * nocc > _J_CHUNK_MAX_B_BYTES:
         _raw = max(1, _J_CHUNK_MAX_B_BYTES // bytes_per_j)
         j_chunk_size = 1 << (_raw.bit_length() - 1)  # floor to power-of-2
-        # Apply ops cap: further reduce j_chunk if N_A × N_B × N_K is large.
-        _n_a = nvir_pad // TILE
-        _n_k = naux_pad // TILE_K
-        _ops_per_j = _n_a * _n_a * _n_k  # N_A × N_B × N_K per j-iteration
-        _raw_ops = max(1, _J_CHUNK_MAX_OPS // _ops_per_j)
-        j_chunk_size = min(j_chunk_size, 1 << (_raw_ops.bit_length() - 1))
     else:
         j_chunk_size = nocc  # no sub-chunking
     nocc_padded = ((nocc + j_chunk_size - 1) // j_chunk_size) * j_chunk_size
