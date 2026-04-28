@@ -175,22 +175,21 @@ A10G via `g5.xlarge` (~$1/hr), trn1 via `trn1.2xlarge` (~$1.34/hr).
 | Shape                | Flops   | trn1 compile-cold | trn1 EBS-warm‡ | trn1 HBM-warm | A10G warm | A10G vs trn1 |
 |----------------------|--------:|------------------:|---------------:|--------------:|----------:|-------------:|
 | small (128/16/384)   | 3.4 G   | —                 | —              | 0.091 s       | 0.001 s   | 91×          |
-| medium (512/64/1536) | 2 757 G | **238.5 s**††     | **137.2 s**‡‡  | **4.784 s**†  | 0.266 s   | **18×**      |
-| large (768/96/2304)  | 20 352 G | —                | —              | —             | 2.018 s   | —            |
+| medium (512/64/1536) | 2 757 G | **2100.4 s**††    | **119.8 s**‡‡  | **4.784 s**†  | 0.266 s   | **18×**      |
+| large (768/96/2304)  | 20 352 G | **174.5 s**†††   | **80.5 s**§    | —             | 2.018 s   | **40×**      |
 
-†† Medium compile-cold (2026-04-21, `run_bench.sh --shape medium`): chol 29.7 s, half 103.5 s,
-metric 4.0 s, energy 101.3 s = 238.5 s total. Measured from a partially-warm EBS cache
-(GEMM/SYRK/TRSM NEFFs hit cache; energy kernel compiled fresh). A fully cold start
-(empty cache) would take longer.
+†† Medium compile-cold (2026-04-22, empty cache): chol 32.4 s, half 24.6 s, metric 2.0 s,
+energy 2041.3 s = **2100.4 s total** (77 unique NEFF compilations at ~27 s each). Prior
+measurement of 238.5 s (2026-04-21) was from a partially-warm EBS cache where GEMM/SYRK/TRSM
+NEFFs hit cache and only the energy kernel compiled fresh.
 
 ‡ **EBS-warm** = fresh process, all NEFFs loaded from EBS NEFF cache (no compilation),
 but not yet resident in device HBM. This is the timing experienced by any fresh process
 after the instance has been used at least once at this shape.
 
-‡‡ Medium EBS-warm (2026-04-21, second `run_bench.sh --shape medium`): chol 30.5 s,
-half 5.1 s, metric 0.6 s, energy 101.0 s = 137.2 s total. Half-transform NEFF load from
-EBS is now 5.1 s (was 103.5 s when compiled; 20× faster). Energy remains ~101 s because
-the 64 energy NEFFs still load serially from EBS at ~1.3 s/NEFF ≈ 83 s DMA + 17 s execution.
+‡‡ Medium EBS-warm (2026-04-22, fresh compilation): chol 11.5 s, half 9.1 s, metric 0.5 s,
+energy 98.7 s = 119.8 s total. Energy still ~99 s because 64 NEFFs load serially at
+~1.5 s/NEFF ≈ 96 s DMA + kernel time.
 
 † HBM-warm = NEFFs already resident in device HBM (in-process second pass). Energy step
 costs only the kernel dispatch: 64 i-dispatches × ~24 ms = 1.536 s. v0.5.4 chunked
@@ -199,8 +198,20 @@ cold pass, 64 energy NEFFs + GEMM/SYRK/TRSM NEFFs fill 15.9 GB of the 16 GB HBM,
 no headroom for tensor allocation in a second pass. The 4.784 s warm figure is from an
 earlier tracing run; current architecture cannot re-measure it without HBM OOM.
 
-Large cold: failed with `No space left on device` during LLVM compilation (EBS disk full
-after medium NEFF cache + compilation artifacts). Needs investigation before large can run.
+††† Large compile-cold (2026-04-24, empty energy cache): chol 38.5 s, half 96.5 s,
+metric 3.8 s, **energy 35.6 s (PyTorch CPU fallback†††‡)**, total 174.5 s. Half-transform
+96.5 s reflects GEMM NEFF compilation for large matrices. E = −4.351185×10¹ Ha.
+
+†††‡ **Large energy uses PyTorch CPU fallback, not NKI.** `_j_batched_kernel` inner loop
+tile count `N_A × N_B × N_K = 6 × 6 × 18 = 648` exceeds the NeuronCore NRT hardware
+load limit (~192; medium's `4 × 4 × 12 = 192` loads cleanly). Confirmed: j_chunk = 32,
+16, 1 all fail with `NRT_RESOURCE`. The dispatch proactively detects this and returns
+`_torch_batched_pair_energy` immediately (avoids ~30 min of wasted NEFF compilation).
+Chol, half-transform, and metric steps use NKI; energy alone falls back to trn1 CPUs.
+
+§ Large EBS-warm (2026-04-24): chol 12.5 s (NKI), half 30.4 s (NKI EBS load),
+metric 2.0 s (NKI), energy 35.5 s (PyTorch CPU, same as cold — no cache benefit), total
+80.5 s. The 40× A10G gap reflects the energy step running on trn1 CPUs vs A10G cuBLAS.
 
 † v0.5.4 chunked dispatch. Prior v0.5.3 used CPU fallback (9.910 s). The 18× gap vs A10G
 is down from 37× in v0.5.3.

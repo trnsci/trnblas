@@ -133,6 +133,14 @@ for shape in shapes:
         f" $NEURON_VENV/bin/python /home/ubuntu/trnblas/examples/df_mp2.py"
         f" --bench --shape {shape} --batched-pair-energy"
     )
+    bench_cmds += (
+        f"echo '--- shape={shape} cache before cold ---'\n"
+        f"du -sh /var/tmp/neuron-compile-cache/ 2>/dev/null"
+        f" || echo 'no /var/tmp/neuron-compile-cache'\n"
+        f"du -sh /tmp/neuron-compile-cache/ 2>/dev/null"
+        f" || echo 'no /tmp/neuron-compile-cache'\n"
+        f"df -h / | tail -1\n"
+    )
     for pass_name in ("cold", "warm"):
         log = f"/tmp/bench_{shape}_{pass_name}.log"
         bench_cmds += (
@@ -168,6 +176,14 @@ script = (
     f"sudo -u ubuntu git checkout {sha}\n"
     "NEURON_VENV=$(ls -d /opt/aws_neuronx_venv_pytorch_* | head -1)\n"
     "sudo -u ubuntu $NEURON_VENV/bin/pip install -e '/home/ubuntu/trnblas[dev]' --quiet\n"
+    # Purge the NEFF cache before every bench run.
+    # The previous run (with mistaken NEURON_COMPILE_CACHE_URL) may have left
+    # partial/corrupt entries.  The cache rebuilds automatically; medium cold
+    # ~4 min, large cold 6-8 hr.  TMPDIR=/var/tmp (set in the run env below)
+    # directs neuronx-cc's compile workdir to EBS, and the final NEFF cache
+    # ends up in /var/tmp/neuron-compile-cache/ via the same mechanism.
+    "rm -rf /var/tmp/neuron-compile-cache/\n"
+    "echo 'NEFF cache purged — starting cold compilation'\n"
     + bench_cmds
 )
 encoded = base64.b64encode(script.encode()).decode()
@@ -176,7 +192,8 @@ encoded = base64.b64encode(script.encode()).decode()
 # controls how long the script is allowed to run on the instance.
 print(json.dumps({
     "commands": [f"echo '{encoded}' | base64 -d | bash"],
-    "executionTimeout": ["14400"],
+    # 8 hr — large cold compile observed to take >4 hr (96 unique NEFFs).
+    "executionTimeout": ["28800"],
 }))
 PYEOF
 
@@ -185,18 +202,18 @@ CMD_ID=$(aws ssm send-command \
   --document-name "AWS-RunShellScript" \
   --comment "trnblas bench @ $SHA shapes=${SHAPES_ARG}" \
   --parameters "file://$PARAMS_FILE" \
-  --timeout-seconds 14400 \
+  --timeout-seconds 28800 \
   --region "$REGION" \
   --output text --query 'Command.CommandId')
 rm -f "$PARAMS_FILE"
 
 echo "Command ID: $CMD_ID"
-echo "Waiting for bench to complete (cold compile for large shape: 2-4 hr)..."
+echo "Waiting for bench to complete (cold compile for large shape: up to 8 hr)..."
 
-# Poll every 30s, up to 4 hr (480 polls).
-# Large-shape cold compile observed to take >2 hr (>120 NEFF compilations).
+# Poll every 30s, up to 8 hr (960 polls).
+# Large cold: 96 unique NEFFs × ~4 min each → up to ~6 hr observed.
 STATUS=InProgress
-for _ in $(seq 1 480); do
+for _ in $(seq 1 960); do
   STATUS=$(aws ssm get-command-invocation \
     --command-id "$CMD_ID" \
     --instance-id "$INSTANCE_ID" \

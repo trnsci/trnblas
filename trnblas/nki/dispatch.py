@@ -87,6 +87,24 @@ _TILE_N = 512
 # the chunked impl (_j_batched_kernel, Python i-loop, NOCC dispatches).
 _BATCHED_PAIR_CHUNK_THRESHOLD = 4096
 
+# J-sub-chunking: within the chunked impl, `_j_batched_kernel` receives the full
+# B:(nocc × nvir_pad × naux_pad) tensor.  At large shapes (nocc=96, nvir_pad≈768,
+# naux_pad=2304, ≈680 MB FP32) this exhausts neuronx-cc's compiler RAM on
+# trn1.2xlarge (32 GB).  When the total B size exceeds this threshold, the j-loop
+# is split into sub-chunks so each call receives B:(j_chunk × nvir_pad × naux_pad)
+# within the ~256 MB range that compiles cleanly (medium B ≈ 251 MB is fine).
+_J_CHUNK_MAX_B_BYTES = 256 * 1024 * 1024
+
+# NRT hardware inner tile count limit: N_A × N_B × N_K per j-iteration.
+# When this exceeds ~192 the compiled NEFF cannot be loaded by the NeuronCore
+# NRT regardless of j_chunk size.  Confirmed empirically (2026-04-22, trn1):
+#   Medium: 4 × 4 × 12 = 192  → NRT load OK
+#   Large:  6 × 6 × 18 = 648  → NRT_RESOURCE for j_chunk = 1, 16, 32
+# Conservative threshold: 300 (safely above 192, safely below 648).
+# When inner_ops > this value, proactively fall back to torch to avoid
+# ~30 min of wasted NEFF compilation before a guaranteed NRT failure.
+_NRT_INNER_OP_LIMIT = 300
+
 # Autotuner — sweeps tile candidates on hardware once per shape bucket and
 # caches the winner to disk. Disabled in simulator mode and by TRNBLAS_AUTOTUNE=0.
 _AUTOTUNE_ENABLED: bool = os.environ.get("TRNBLAS_AUTOTUNE", "1") != "0"
@@ -696,12 +714,17 @@ def _nki_batched_pair_energy_chunked_impl(
     """Chunked batched-pair dispatch: Python i-loop over _j_batched_kernel (#46).
 
     Used when est_iters > _BATCHED_PAIR_CHUNK_THRESHOLD — i.e. the full-batch
-    XLA graph would be too large to compile. Processes all NOCC j-pairs for one
-    occupied orbital i per dispatch. All i-calls share the same input shapes, so
-    exactly ONE NEFF is compiled and reused for all NOCC iterations.
+    XLA graph would be too large to compile.
 
-    Overhead: NOCC × ~dispatch_cost vs O(1) for full-batch. For medium shape
-    (nocc=64), ~6.4 s warm overhead — much better than 409 s for per-pair.
+    NRT fallback: if N_A × N_B × N_K > _NRT_INNER_OP_LIMIT, the compiled NEFF
+    cannot be loaded by the NeuronCore NRT on trn1 regardless of j_chunk size.
+    Falls back to `_torch_batched_pair_energy` immediately (skips ~30 min of
+    wasted compilation).  Large shape (inner_ops=648) hits this path; medium
+    (inner_ops=192) does not.
+
+    J-sub-chunking: if B:(nocc × nvir_pad × naux_pad) exceeds _J_CHUNK_MAX_B_BYTES,
+    the j-loop is split so each call gets B:(j_chunk × nvir_pad × naux_pad) ≤ 256 MB.
+    Medium (B ≈ 201 MB): j_chunk_size = nocc, original call signature preserved.
     """
     nocc, nvir, naux = B.shape
     TILE = 128
@@ -709,6 +732,26 @@ def _nki_batched_pair_energy_chunked_impl(
     nvir_pad = _round_up(nvir, TILE)
     naux_pad = _round_up(naux, TILE_K)
     needs_pad = (nvir_pad != nvir) or (naux_pad != naux)
+
+    # ---- NRT hardware inner-complexity check ----------------------------------
+    # _j_batched_kernel is rejected by the NeuronCore NRT when the inner loop
+    # tile count N_A × N_B × N_K exceeds the hardware limit (~192 on trn1).
+    # Proactively fall back to avoid ~30 min of wasted NEFF compilation followed
+    # by guaranteed NRT_RESOURCE.  j_chunk=1,16,32 all confirmed failing for
+    # large shape (inner_ops=648); the limit is on inner_ops, not j_chunk×inner_ops.
+    _n_a = nvir_pad // TILE
+    _n_k = naux_pad // TILE_K
+    _inner_ops = _n_a * _n_a * _n_k  # N_A × N_B × N_K
+    if _inner_ops > _NRT_INNER_OP_LIMIT:
+        _warn_fallback(
+            RuntimeError(
+                f"_j_batched_kernel inner tile count {_inner_ops} "
+                f"(N_A×N_B×N_K = {_n_a}×{_n_a}×{_n_k}) "
+                f"exceeds trn1 NRT hardware limit (~{_NRT_INNER_OP_LIMIT}). "
+                f"j_chunk=1,16,32 all confirmed NRT_RESOURCE. Falling back to torch."
+            )
+        )
+        return _torch_batched_pair_energy(B, eps_occ, eps_vir)
 
     eps_occ_row = eps_occ.reshape(1, nocc).contiguous()
     ev_col = eps_vir.reshape(-1, 1).contiguous()
@@ -728,24 +771,65 @@ def _nki_batched_pair_energy_chunked_impl(
         B_feed = B.contiguous()
         ev_col_feed, ev_row_feed = ev_col, ev_row
 
+    # ---- j-sub-chunking ---------------------------------------------------
+    # When B:(nocc × nvir_pad × naux_pad) > 256 MB, neuronx-cc OOMs during
+    # NEFF compilation.  Split the j-loop so each call gets ≤ 256 MB.
+    # Medium (B ≈ 201 MB < 256 MB): j_chunk_size = nocc, no sub-chunking.
+    # Large shapes with inner_ops > _NRT_INNER_OP_LIMIT are caught above and
+    # returned to torch before reaching this code.
+    bytes_per_j = nvir_pad * naux_pad * 4  # float32
+    if bytes_per_j * nocc > _J_CHUNK_MAX_B_BYTES:
+        _raw = max(1, _J_CHUNK_MAX_B_BYTES // bytes_per_j)
+        j_chunk_size = 1 << (_raw.bit_length() - 1)  # floor to power-of-2
+    else:
+        j_chunk_size = nocc  # no sub-chunking
+    nocc_padded = ((nocc + j_chunk_size - 1) // j_chunk_size) * j_chunk_size
+    if nocc_padded > nocc:
+        _jpad = nocc_padded - nocc
+        # Zero B rows → T = B_i @ 0.T = 0 → energy contribution = 0 (safe).
+        B_feed = torch.cat(
+            [B_feed, torch.zeros(_jpad, nvir_pad, naux_pad, dtype=B.dtype, device=B_feed.device)],
+            dim=0,
+        )
+        eps_occ_row = torch.cat(
+            [eps_occ_row, torch.zeros(1, _jpad, dtype=eps_occ.dtype, device=eps_occ_row.device)],
+            dim=1,
+        )
+
     if _use_simulator():
         e_total = torch.zeros((), dtype=B.dtype, device=B.device)
         for i in range(nocc):
             b_i_feed = B_feed[i].contiguous()
             eo_i = eps_occ[i : i + 1].reshape(1, 1).contiguous()
-            partial_np = nki.simulate(_j_batched_kernel)(
-                b_i_feed.cpu().numpy(),
-                B_feed.cpu().numpy(),
-                eo_i.cpu().numpy(),
-                eps_occ_row.cpu().numpy(),
-                ev_col_feed.cpu().numpy(),
-                ev_row_feed.cpu().numpy(),
-            )
-            e_total = e_total + float(torch.from_numpy(np.asarray(partial_np)).sum())
+            if j_chunk_size == nocc:
+                partial_np = nki.simulate(_j_batched_kernel)(
+                    b_i_feed.cpu().numpy(),
+                    B_feed.cpu().numpy(),
+                    eo_i.cpu().numpy(),
+                    eps_occ_row.cpu().numpy(),
+                    ev_col_feed.cpu().numpy(),
+                    ev_row_feed.cpu().numpy(),
+                )
+                e_total = e_total + float(torch.from_numpy(np.asarray(partial_np)).sum())
+            else:
+                for j_start in range(0, nocc_padded, j_chunk_size):
+                    B_j = B_feed[j_start : j_start + j_chunk_size].contiguous()
+                    eo_j = eps_occ_row[0:1, j_start : j_start + j_chunk_size]
+                    partial_np = nki.simulate(_j_batched_kernel)(
+                        b_i_feed.cpu().numpy(),
+                        B_j.cpu().numpy(),
+                        eo_i.cpu().numpy(),
+                        eo_j.cpu().numpy(),
+                        ev_col_feed.cpu().numpy(),
+                        ev_row_feed.cpu().numpy(),
+                    )
+                    e_total = e_total + float(torch.from_numpy(np.asarray(partial_np)).sum())
         return e_total
 
-    # Hardware: move fixed tensors to XLA once; slice b_i and eo_i per i.
-    # All i-calls have identical input shapes → ONE NEFF compile, cached for all.
+    # Hardware: move fixed tensors to XLA once; slice b_i, eo_i, and j-chunks per i.
+    # When j_chunk_size == nocc: original single-call path (preserves NEFF cache).
+    # When j_chunk_size < nocc: j-sub-chunked path; all j-chunks share the same
+    # B_j shape → ONE NEFF compile, nocc × (nocc_padded/j_chunk_size) warm dispatches.
     (B_xla, eo_row_xla, evc_xla, evr_xla), orig = _to_xla(
         B_feed,
         eps_occ_row,
@@ -754,12 +838,20 @@ def _nki_batched_pair_energy_chunked_impl(
     )
     e_total = torch.zeros((), dtype=B.dtype, device=B.device)
     for i in range(nocc):
-        b_i_xla = B_xla[i]  # (nvir_pad, naux_pad) — in-device view
-        eo_i_xla = eo_row_xla[0:1, i : i + 1]  # (1, 1) — in-device view
-        partial = _j_batched_kernel(b_i_xla, B_xla, eo_i_xla, eo_row_xla, evc_xla, evr_xla).to(
-            orig
-        )  # (TILE, nocc)
-        e_total = e_total + partial.sum()
+        b_i_xla = B_xla[i]  # (nvir_pad, naux_pad)
+        eo_i_xla = eo_row_xla[0:1, i : i + 1]  # (1, 1)
+        if j_chunk_size == nocc:
+            # Original call signature — no slice, preserves existing NEFF cache.
+            partial = _j_batched_kernel(b_i_xla, B_xla, eo_i_xla, eo_row_xla, evc_xla, evr_xla).to(
+                orig
+            )
+            e_total = e_total + partial.sum()
+        else:
+            for j_start in range(0, nocc_padded, j_chunk_size):
+                B_j = B_xla[j_start : j_start + j_chunk_size]
+                eo_j = eo_row_xla[0:1, j_start : j_start + j_chunk_size]
+                partial = _j_batched_kernel(b_i_xla, B_j, eo_i_xla, eo_j, evc_xla, evr_xla).to(orig)
+                e_total = e_total + partial.sum()
     return e_total
 
 

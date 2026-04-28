@@ -664,3 +664,66 @@ class TestBatchedPairEnergy:
                 f"per-pair-loop={t_per_pair * 1000:7.1f}ms  "
                 f"speedup={t_per_pair / warm_chunked:.1f}x"
             )
+
+    def test_j_sub_chunked_agrees_with_full_j(self, nki_backend, rng):
+        """J-sub-chunking produces the same result as the full-j path.
+
+        Forces j-sub-chunking by setting _J_CHUNK_MAX_B_BYTES = 0 (any B triggers
+        the sub-chunk path).  Verifies the two paths agree to FP32 noise.
+        """
+        import trnblas.nki.dispatch as D
+
+        nocc, nvir, naux = 8, 256, 256
+        B = torch.randn(nocc, nvir, naux, generator=rng) * 0.1
+        eps_occ = torch.rand(nocc, generator=rng) * 0.5 + 2.0
+        eps_vir = torch.rand(nvir, generator=rng) * 0.5
+
+        # Must be on the chunked i-path for j-sub-chunking to engage.
+        # Force it by zeroing _BATCHED_PAIR_CHUNK_THRESHOLD as well.
+        orig_i_thresh = D._BATCHED_PAIR_CHUNK_THRESHOLD
+        orig_j_thresh = D._J_CHUNK_MAX_B_BYTES
+        try:
+            D._BATCHED_PAIR_CHUNK_THRESHOLD = 0  # route to chunked impl
+            D._J_CHUNK_MAX_B_BYTES = 0  # force j-sub-chunking with j_chunk=1
+            out_j_chunked = nki_batched_pair_energy(B, eps_occ, eps_vir)
+        finally:
+            D._BATCHED_PAIR_CHUNK_THRESHOLD = orig_i_thresh
+            D._J_CHUNK_MAX_B_BYTES = orig_j_thresh
+
+        # Reference: full-j chunked path (normal thresholds, but still on chunked impl)
+        orig_i_thresh2 = D._BATCHED_PAIR_CHUNK_THRESHOLD
+        try:
+            D._BATCHED_PAIR_CHUNK_THRESHOLD = 0  # keep on chunked impl, j full
+            out_full_j = nki_batched_pair_energy(B, eps_occ, eps_vir)
+        finally:
+            D._BATCHED_PAIR_CHUNK_THRESHOLD = orig_i_thresh2
+
+        torch.testing.assert_close(out_j_chunked, out_full_j, atol=self.ATOL, rtol=self.RTOL)
+
+    def test_j_sub_chunked_matches_torch_ref(self, nki_backend, rng):
+        """J-sub-chunking with nocc padding matches the PyTorch reference.
+
+        nocc=7 with j_chunk_size=2 → nocc_padded=8 (1 zero-pad row),
+        exercising the nocc_padded > nocc branch.  Padded row has B=0,
+        so energy contribution is 0 and the result must match the 7-pair ref.
+        """
+        import trnblas.nki.dispatch as D
+
+        nocc, nvir, naux = 7, 128, 128
+        B = torch.randn(nocc, nvir, naux, generator=rng) * 0.1
+        eps_occ = torch.rand(nocc, generator=rng) * 0.5 + 2.0
+        eps_vir = torch.rand(nvir, generator=rng) * 0.5
+        ref = self._ref(B, eps_occ, eps_vir)
+
+        orig_i_thresh = D._BATCHED_PAIR_CHUNK_THRESHOLD
+        orig_j_thresh = D._J_CHUNK_MAX_B_BYTES
+        try:
+            D._BATCHED_PAIR_CHUNK_THRESHOLD = 0
+            # threshold = 2 rows → j_chunk_size=2; nocc=7 → nocc_padded=8 (1 padding row)
+            D._J_CHUNK_MAX_B_BYTES = nvir * naux * 4 * 2
+            out = nki_batched_pair_energy(B, eps_occ, eps_vir)
+        finally:
+            D._BATCHED_PAIR_CHUNK_THRESHOLD = orig_i_thresh
+            D._J_CHUNK_MAX_B_BYTES = orig_j_thresh
+
+        torch.testing.assert_close(out, ref, atol=self.ATOL, rtol=self.RTOL)
