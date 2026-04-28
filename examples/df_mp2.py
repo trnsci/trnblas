@@ -262,7 +262,16 @@ def bench(
     use_fused: bool = False,
     use_fused_gemm: bool = False,
     use_batched_pair: bool = False,
+    passes: str = "both",
 ):
+    """Run cold and/or warm timing for a single bench shape.
+
+    On Trainium, all loaded NEFFs stay resident in HBM after the cold pass.
+    At medium/large shapes (nocc≥64), this saturates the 16 GB device and
+    leaves no room for tensor allocations in the warm pass.  The correct
+    way to measure warm timing is to run this script twice in separate
+    processes (run_bench.sh does this automatically via --passes cold/warm).
+    """
     nbasis, nocc, naux = _BENCH_SHAPES[shape_name]
     nvir = nbasis - nocc
     flops = _flops(nbasis, nocc, naux)
@@ -282,7 +291,8 @@ def bench(
         f"device: {device}  energy_mode: {energy_mode}"
     )
 
-    for label in ("cold", "warm"):
+    labels = {"cold": ["cold"], "warm": ["warm"], "both": ["cold", "warm"]}[passes]
+    for label in labels:
         t = {}
         t0 = time.perf_counter()
         e = df_mp2_energy(
@@ -341,6 +351,16 @@ def main():
         help="Route the energy step through nki_batched_pair_energy (single dispatch "
         "for all nocc² pairs, #43 v0.5.2 — eliminates ~100ms × nocc² overhead).",
     )
+    parser.add_argument(
+        "--passes",
+        choices=["cold", "warm", "both"],
+        default="both",
+        help="Which timing pass(es) to run (default: both). On Trainium at medium/large "
+        "shapes, running 'both' in-process OOMs because all loaded NEFFs stay resident "
+        "in HBM after the cold pass. Use 'cold' for the first invocation and 'warm' for "
+        "a second invocation after the EBS NEFF cache is populated. run_bench.sh does "
+        "this automatically.",
+    )
     args = parser.parse_args()
 
     if args.bench:
@@ -352,6 +372,7 @@ def main():
                 use_fused=args.fused_energy,
                 use_fused_gemm=args.fused_gemm_energy,
                 use_batched_pair=args.batched_pair_energy,
+                passes=args.passes,
             )
         return
 

@@ -111,7 +111,7 @@ resource "aws_instance" "ci" {
   associate_public_ip_address = true  # Needed for SSM agent to reach regional endpoint without VPC endpoints
 
   root_block_device {
-    volume_size = 100
+    volume_size = 200  # 100G filled up: Neuron SDK (~70G) + medium NEFF cache leaves <2G for large compilation
     volume_type = "gp3"
   }
 
@@ -126,12 +126,19 @@ resource "aws_instance" "ci" {
     sudo -u ubuntu $NEURON_VENV/bin/pip install -e '/home/ubuntu/trnblas[dev]'
     # neuronxcc compile workdirs can be >5 GB for large NKI kernels.  /tmp is
     # tmpfs (RAM-backed, ~16 GB on trn1.2xlarge) and runs out.  Redirect the
-    # compiler to /var/tmp (EBS-backed, 100 GB) for all ubuntu-user sessions.
+    # compiler to /var/tmp (EBS-backed, 200 GB) for all ubuntu-user sessions.
     echo 'export TMPDIR=/var/tmp' >> /home/ubuntu/.profile
   EOF
 
   tags = {
     Name = var.instance_tag
+  }
+
+  lifecycle {
+    # Prevent instance replacement when only user_data comments change.
+    # The EBS NEFF cache (100s of GB of compiled kernels) is attached to
+    # this instance; replacement destroys it and forces a full recompile.
+    ignore_changes = [user_data, associate_public_ip_address]
   }
 }
 

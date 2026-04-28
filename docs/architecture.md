@@ -44,20 +44,22 @@ since it's reused across all auxiliary basis indices `P`.
 
 ## Known gaps
 
-- **Level 3 NKI coverage is partial.** As of v0.4.0, `gemm`, `batched_gemm`,
-  and the custom `nki_mp2_energy` reduction have NKI kernels. `symm`, `syrk`,
-  `trsm`, `trmm` still dispatch straight to PyTorch — these are the next
-  targets (tracked for v0.5.0). `syrk` and `trsm` appear in the DF-MP2 hot
-  path (metric construction, Cholesky-based metric inversion).
-- **`nki_mp2_energy` matches torch at medium, doesn't beat it.** Kernel is
-  correct; perf is gated by per-(i, j) dispatch/load overhead. Phase 2
-  restructuring (batch multiple (i, j) per dispatch) is open under
-  [#15](https://github.com/trnsci/trnblas/issues/15).
-- **No FP64.** Trainium's Tensor Engine maxes out at FP32. See
-  [Precision envelope](#precision-envelope) below for the measured FP32 vs
-  PySCF-FP64 picture. Double-double emulation is gated on whether cc-pVTZ or
-  larger basis sets exceed µHartree
-  ([#10](https://github.com/trnsci/trnblas/issues/10)).
+- **Level 3 NKI coverage is partial.** `gemm`, `batched_gemm`, `syrk`, and
+  `trsm` (left-side blocked) have NKI kernels. `symm` and `trmm` still
+  dispatch straight to PyTorch. Neither is in the DF-MP2 hot path.
+- **Batched-pair energy (v0.5.2–v0.5.4) solved the dispatch overhead.**
+  `nki_batched_pair_energy`
+  ([#43](https://github.com/trnsci/trnblas/issues/43),
+  [#46](https://github.com/trnsci/trnblas/issues/46)) replaces the nocc²-loop
+  dispatch with a single `@nki.jit` call (small shape) or chunked i-loop
+  (medium/large). Warm: **3.6× faster than torch at small shape, 5.2× at
+  medium shape.**
+- **No FP64.** Trainium's Tensor Engine maxes out at FP32.
+  **Decision (2026-04-18):** FP32 is sufficient — both gate cases are well
+  below 1 µHartree.
+  [#10](https://github.com/trnsci/trnblas/issues/10) closed "not needed";
+  [#22](https://github.com/trnsci/trnblas/issues/22) (double-double) deferred
+  indefinitely. See [Precision envelope](#precision-envelope) below.
 - **Level 1/2 are PyTorch-only.** The Tensor Engine is wasted on vector ops;
   Level 3 is where NKI acceleration pays off. Not planned to change.
 

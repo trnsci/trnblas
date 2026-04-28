@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`--passes` flag for `df_mp2.py --bench`** (`cold`/`warm`/`both`, default `both`).
+  On Trainium at medium/large shapes, running both passes in the same process OOMs:
+  after the cold pass, all loaded NEFFs remain resident in HBM (64 × 244 MB = 15.6 GB
+  DMA spill at medium shape), leaving no headroom for tensor allocation in the warm pass.
+  The fix is two separate process invocations; `run_bench.sh` now does this automatically.
+
+- **`scripts/run_bench.sh`** — runs `df_mp2.py --bench --batched-pair-energy` on the
+  trn1 CI instance via SSM, cold and warm as separate processes. Supports
+  `--shape medium|large` (default: both). Follows the base64-SSM pattern from
+  `run_pyscf_tests.sh`.
+
+### Hardware (2026-04-21, trn1.2xlarge, neuronxcc 2.24.5133)
+
+**Medium-shape timing** (`nbasis=512, nocc=64, nvir=448, naux=1536`):
+
+| Step | Compile-cold | EBS-warm |
+|---|---:|---:|
+| Cholesky | 29.7 s | 30.5 s |
+| Half-transform | 103.5 s | 5.1 s |
+| Metric contraction | 4.0 s | 0.6 s |
+| Energy (64 i-dispatches) | 101.3 s | 101.0 s |
+| **Total** | **238.5 s** | **137.2 s** |
+
+Compile-cold: energy kernel compiled fresh; GEMM/SYRK/TRSM NEFFs hit EBS cache from
+prior test-suite runs.
+EBS-warm: all NEFFs loaded from EBS cache (no compilation), but not yet in device HBM.
+Half-transform NEFF load drops 20× (5.1 s vs 103.5 s); energy remains ~101 s because
+64 energy NEFFs still load serially at ~1.3 s/NEFF ≈ 83 s DMA + kernel time.
+E = −2.487218×10⁰ Ha (both passes).
+
+**HBM constraint confirmed:** after the medium cold pass, 64 energy NEFFs + GEMM/SYRK/TRSM
+NEFFs fill 15.9 GB of the 16 GB device. A subsequent in-process warm pass fails with
+`Failed to allocate 1.500GB (usage: tensors)`. The prior 4.784 s warm figure (1.536 s
+energy) is in-process HBM-warm; it cannot be reproduced via separate-process EBS loading
+(that takes ~137 s as shown above).
+
+**Large-shape cold:** failed with `LLVM ERROR: IO failure on output stream: No space left
+on device` during neuronxcc compilation of large-shape kernels. EBS disk was full after
+medium NEFF cache + compilation artifacts. Needs disk investigation before large can run.
+
 ## [0.5.4] — 2026-04-17
 
 ### Added
