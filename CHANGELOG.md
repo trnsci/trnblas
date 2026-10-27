@@ -28,20 +28,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   remainder tile. The K remainder is a shorter matmul (stationary and moving
   operands both start at partition 0) accumulated into the same PSUM tile. M and
   N remainders are narrower PSUM/SBUF tiles. This removes the torch-level
-  pad/slice on the device, which cost about 10× on the first call (every new shape
-  compiled its own pad/slice graphs) and about 2× warm (extra copies):
+  pad/slice and its extra copies, halving warm time on odd shapes on Trn2:
 
-  | case (autotune off) | first call | warm |
+  | case (autotune off) | torch pad, warm | ragged kernel, warm |
   |---|---:|---:|
-  | 2047³, torch pad | 41.3 s | 14.9 ms |
-  | 4095³, torch pad | 153.9 s | 69.3 ms |
+  | 2047³ | 14.9 ms | 7.1 ms |
+  | 4095³ | 68.9 ms | 32.0 ms |
+
+  A roughly 10× first-call penalty seen on odd shapes during this work was not
+  the pad path. It came from the benchmark's own lazy
+  `torch.randn(..., device="neuron")`, which is shape-sensitive
+  (aws-neuron/aws-neuron-sdk#1439). With host-created inputs, cold first calls
+  cost the same at odd and aligned sizes (4095³ 16.1 s, 4096³ 15.3 s).
 
   Aligned shapes still use the unchanged default kernel. `TRNBLAS_GEMM_RAGGED=0`
   restores the torch pad path. If the ragged kernel raises, dispatch warns
   (`NkiFallbackWarning`) and falls back to the padded NKI path, or re-raises
   under `TRNBLAS_REQUIRE_NKI=1`. Checked with `nki.simulate` and
   `nki.compiler.frontend.source_to_mlir(...).verify()` (parser and tracer
-  frontends, trn2). Hardware timing is pending.
+  frontends, trn2) and on Trn2 hardware (neuron suite, awkward-size sweep).
 
 - **GEMM pad-to-tile / slice-back factored into `_run_padded_gemm` (#50).** The
   NKI GEMM kernels have no remainder handling, so `nki_gemm` / `gemm` /
