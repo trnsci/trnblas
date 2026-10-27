@@ -513,15 +513,74 @@ def _sweep_on_default_pad(
     M: int, K: int, N: int, A: torch.Tensor, B: torch.Tensor
 ) -> tuple[int, int, int]:
     """Pad with default tile sizes to produce aligned sweep inputs, then sweep."""
-    M_p = _round_up(M, _TILE_M)
-    K_p = _round_up(K, _TILE_K)
-    N_p = N if N <= _TILE_N else _round_up(N, _TILE_N)
-    A_p = torch.zeros(M_p, K_p, dtype=A.dtype, device=A.device)
-    A_p[:M, :K] = A
-    B_p = torch.zeros(K_p, N_p, dtype=B.dtype, device=B.device)
-    B_p[:K, :N] = B
+    A_p, B_p, _ = _pad_gemm_operands(A, B, _TILE_M, _TILE_K, _TILE_N)
     (a, b), _ = _to_xla(A_p, B_p)
-    return _sweep_tile_configs(M_p, K_p, N_p, a, b)
+    return _sweep_tile_configs(A_p.shape[0], A_p.shape[1], B_p.shape[1], a, b)
+
+
+def _gemm_padded_shape(
+    M: int, K: int, N: int, tile_m: int, tile_k: int, tile_n: int
+) -> tuple[int, int, int]:
+    """Padded (M, K, N) the GEMM kernels accept for a given tile config.
+
+    The kernels loop ``M // tile_m``, ``K // tile_k`` and ``N // TILE_N`` with
+    no remainder handling, so M and K must be exact tile multiples. Along N the
+    kernel clamps ``TILE_N = N`` when ``N <= tile_n`` (single N-tile), so N is
+    left alone in that case and rounded up to ``tile_n`` otherwise.
+    """
+    M_pad = _round_up(M, tile_m)
+    K_pad = _round_up(K, tile_k)
+    N_pad = N if tile_n >= N else _round_up(N, tile_n)
+    return M_pad, K_pad, N_pad
+
+
+def _pad_gemm_operands(
+    A: torch.Tensor, B: torch.Tensor, tile_m: int, tile_k: int, tile_n: int
+) -> tuple[torch.Tensor, torch.Tensor, bool]:
+    """Zero-pad A:(M, K) and B:(K, N) to the kernel's tile multiples (#50).
+
+    Zero padding along K is exact (padded terms contribute 0 to every dot
+    product); padded M rows / N columns only produce output that the caller
+    slices off. When the shape is already aligned no padded copy is made:
+    the operands are returned as-is (``.contiguous()`` is a no-op for
+    contiguous inputs; transposed views get one dense copy, which the kernel
+    needs anyway).
+    """
+    M, K = A.shape
+    K2, N = B.shape
+    if K != K2:
+        raise ValueError(
+            f"GEMM inner dimensions differ: A is {tuple(A.shape)}, B is {tuple(B.shape)}"
+        )
+    M_pad, K_pad, N_pad = _gemm_padded_shape(M, K, N, tile_m, tile_k, tile_n)
+    if (M_pad, K_pad, N_pad) == (M, K, N):
+        return A.contiguous(), B.contiguous(), False
+    A_p = torch.zeros(M_pad, K_pad, dtype=A.dtype, device=A.device)
+    A_p[:M, :K] = A
+    B_p = torch.zeros(K_pad, N_pad, dtype=B.dtype, device=B.device)
+    B_p[:K, :N] = B
+    return A_p, B_p, True
+
+
+def _run_padded_gemm(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    kernel_fn,
+    tile_m: int = _TILE_M,
+    tile_k: int = _TILE_K,
+    tile_n: int = _TILE_N,
+) -> torch.Tensor:
+    """Pad A/B to tile multiples, run ``kernel_fn(A_feed, B_feed)``, slice to (M, N).
+
+    ``kernel_fn`` takes the padded torch operands and returns a torch tensor of
+    shape (M_pad, N_pad). Keeping the device hop (XLA / simulator) inside
+    ``kernel_fn`` lets CPU tests drive this wrapper with a stand-in kernel.
+    """
+    M = A.shape[0]
+    N = B.shape[1]
+    A_feed, B_feed, needs_pad = _pad_gemm_operands(A, B, tile_m, tile_k, tile_n)
+    result = kernel_fn(A_feed, B_feed)
+    return result[:M, :N] if needs_pad else result
 
 
 def _nki_gemm_impl(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
@@ -556,31 +615,16 @@ def _nki_gemm_impl(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     else:
         tile_m, tile_k, tile_n = _TILE_M, _TILE_K, _TILE_N
 
-    # Pad to chosen tile sizes.
-    M_pad = _round_up(M, tile_m)
-    K_pad = _round_up(K, tile_k)
-    # When N ≤ tile_n the kernel uses a single N-tile (no remainder needed).
-    N_pad = N if tile_n >= N else _round_up(N, tile_n)
-    needs_pad = (M_pad != M) or (K_pad != K) or (N_pad != N)
-
-    try:
-        if needs_pad:
-            A_p = torch.zeros(M_pad, K_pad, dtype=A.dtype, device=A.device)
-            A_p[:M, :K] = A
-            B_p = torch.zeros(K_pad, N_pad, dtype=B.dtype, device=B.device)
-            B_p[:K, :N] = B
-            A_feed, B_feed = A_p.contiguous(), B_p.contiguous()
-        else:
-            A_feed, B_feed = A.contiguous(), B.contiguous()
-
+    def _launch(A_feed: torch.Tensor, B_feed: torch.Tensor) -> torch.Tensor:
         kernel = _get_gemm_kernel(tile_m, tile_k, tile_n)
         if _use_simulator():
             out_np = nki.simulate(kernel)(A_feed.cpu().numpy(), B_feed.cpu().numpy())
-            result = torch.from_numpy(np.asarray(out_np)).to(A.device)
-        else:
-            (a, b), orig_device = _to_xla(A_feed, B_feed)
-            result = kernel(a, b).to(orig_device)
-        return result[:M, :N] if needs_pad else result
+            return torch.from_numpy(np.asarray(out_np)).to(A.device)
+        (a, b), orig_device = _to_xla(A_feed, B_feed)
+        return kernel(a, b).to(orig_device)
+
+    try:
+        return _run_padded_gemm(A, B, _launch, tile_m, tile_k, tile_n)
     except Exception as exc:
         if _REQUIRE_NKI:
             raise

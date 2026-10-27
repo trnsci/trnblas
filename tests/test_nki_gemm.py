@@ -82,6 +82,21 @@ class TestNkiGemmKernel:
         out = nki_gemm(A, B)
         torch.testing.assert_close(out, torch.zeros(128, 128), atol=0, rtol=0)
 
+    def test_odd_1000_cubed_padded(self, nki_backend, rng, monkeypatch):
+        """#50: 1000^3 pads to 1024^3 at dispatch; must match torch.matmul
+        and must not silently fall back."""
+        from trnblas.nki import dispatch
+
+        monkeypatch.setattr(dispatch, "_REQUIRE_NKI", True)
+        A = torch.randn(1000, 1000, generator=rng)
+        B = torch.randn(1000, 1000, generator=rng)
+        out = nki_gemm(A, B)
+        assert out.shape == (1000, 1000)
+        ref = torch.matmul(A.double(), B.double())
+        rel = (out.double().cpu() - ref).norm() / ref.norm()
+        assert rel < 1e-5, f"rel_err={rel:.3e}"
+        torch.testing.assert_close(out.cpu(), torch.matmul(A, B), atol=1e-2, rtol=1e-4)
+
 
 class TestGemmDispatch:
     """Top-level `gemm()` BLAS call routes through the NKI kernel."""
