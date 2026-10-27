@@ -56,6 +56,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   configs at 8192³. The 8192³ run that followed reused both the cached winner
   (same pow2 bucket) and the NEFF. Hardware confirmation is pending.
 
+### Added
+
+- `scripts/probe_first_call.py N [--mode gemm|full|direct-jit|direct-op|hop|mlir] [--cpu]`:
+  prints one `PHASE <name> <seconds>` line for each phase of a cold first GEMM call,
+  to find where the odd-shape first-call cost goes (#50).
+
 ### Tests
 
 - `tests/test_gemm_padding.py`: CPU tests for the pad/slice wrapper with a
