@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **GEMM pad-to-tile / slice-back factored into `_run_padded_gemm` (#50).** The
+  NKI GEMM kernels have no remainder handling, so `nki_gemm` / `gemm` /
+  `batched_gemm` on the `nki` backend zero-pad M and K to the tile size (128)
+  and N to the N-tile (512) when N > 512, then slice the result back to (M, N).
+  Already-aligned contiguous operands are passed through with no copy. The
+  autotune sweep now uses the same helper. Behaviour is unchanged: dispatch
+  already padded this way, and 8191³ pads to exactly 8192³. The 1605 s first call
+  for 8191³ on Trn2 (#50) is therefore not a ragged-edge kernel path. The likely
+  cause is the first-call autotune sweep, which compiles and times up to six tile
+  configs at 8192³. The 8192³ run that followed reused both the cached winner
+  (same pow2 bucket) and the NEFF. Hardware confirmation is pending.
+
+### Tests
+
+- `tests/test_gemm_padding.py`: CPU tests for the pad/slice wrapper with a
+  stand-in kernel. They cover odd M/K/N, every autotune tile candidate,
+  transposed views, `gemm` alpha/beta/C with all transpose combinations,
+  `batched_gemm`, and the aligned no-copy case.
+- `tests/test_nki_gemm.py`: neuron-marked 1000³ check against `torch.matmul`
+  with `TRNBLAS_REQUIRE_NKI` semantics, so a silent fallback fails the test.
+
 ## [0.5.5] — 2026-04-27
 
 ### Added
