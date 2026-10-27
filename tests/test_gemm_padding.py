@@ -7,6 +7,8 @@ result back. These tests drive it with a stand-in kernel (torch.matmul plus
 alignment assertions) so they run without Neuron hardware.
 """
 
+import os
+
 import pytest
 import torch
 
@@ -184,3 +186,64 @@ def test_pytorch_backend_untouched():
         torch.testing.assert_close(gemm(1.0, A, B), A @ B)
     finally:
         trnblas.set_backend("auto")
+
+
+# --- #50 round 2: in-kernel edge-tile index math ---------------------------------
+
+
+@pytest.mark.parametrize("D", [1, 2, 31, 127, 128, 129, 255, 256, 511, 512, 513, 1000, 2047, 4095])
+@pytest.mark.parametrize("tile", [128, 512])
+def test_ragged_tiles_cover_exactly_once(D, tile):
+    T, n_full, rem = dispatch._ragged_dim_plan(D, tile)
+    assert min(tile, D) == T
+    assert n_full >= 1 and 0 <= rem < T
+    tiles = dispatch._ragged_tiles(D, tile)
+    covered = torch.zeros(D, dtype=torch.int64)
+    for off, sz in tiles:
+        assert 1 <= sz <= tile
+        covered[off : off + sz] += 1
+    assert torch.all(covered == 1)
+    assert tiles[-1][0] + tiles[-1][1] == D
+    # Only the last tile may be short, and only when D is not a multiple of T.
+    assert all(sz == T for _, sz in tiles[:-1])
+
+
+def test_ragged_plan_values():
+    assert dispatch._ragged_dim_plan(2047, 128) == (128, 15, 127)
+    assert dispatch._ragged_dim_plan(4095, 512) == (512, 7, 511)
+    assert dispatch._ragged_dim_plan(1000, 128) == (128, 7, 104)
+    assert dispatch._ragged_dim_plan(4096, 128) == (128, 32, 0)
+    assert dispatch._ragged_dim_plan(100, 128) == (100, 1, 0)  # clamped, single tile
+    assert dispatch._ragged_dim_plan(300, 512) == (300, 1, 0)
+    with pytest.raises(ValueError):
+        dispatch._ragged_dim_plan(0, 128)
+
+
+@pytest.mark.parametrize(
+    "M,K,N",
+    [
+        (1, 1, 1),
+        (127, 129, 513),
+        (1000, 1000, 1000),
+        (300, 1, 700),
+        (129, 257, 1025),
+        (64, 128, 512),
+    ],
+)
+def test_ragged_reference_matches_matmul(M, K, N):
+    torch.manual_seed(3)
+    A = torch.randn(M, K, dtype=torch.float64)
+    B = torch.randn(K, N, dtype=torch.float64)
+    torch.testing.assert_close(dispatch._ragged_gemm_reference(A, B), A @ B)
+
+
+@pytest.mark.skipif(
+    os.environ.get("TRNBLAS_AUTOTUNE") is not None, reason="TRNBLAS_AUTOTUNE set in env"
+)
+def test_autotune_off_by_default_and_toggle(monkeypatch):
+    assert dispatch.get_autotune() is False
+    monkeypatch.setattr(dispatch, "_AUTOTUNE_ENABLED", False)
+    trnblas.set_autotune(True)
+    assert dispatch.get_autotune() is True
+    trnblas.set_autotune(False)
+    assert dispatch.get_autotune() is False

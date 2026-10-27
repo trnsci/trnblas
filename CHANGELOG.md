@@ -9,12 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Behaviour change: the GEMM tile autotuner is now opt-in (#50).** By default,
+  `nki_gemm` / `gemm` / `batched_gemm` use the fixed heuristic tile (128, 128, 512),
+  which the kernel clamps per dimension for small shapes, and run no first-call
+  sweep. Opt in with `TRNBLAS_AUTOTUNE=1` or `trnblas.set_autotune(True)`. Why: on
+  trn2 (SDK 2.33, native device, fp32, cold caches per process) the sweep made the
+  first call 7–12× slower, and the tile it picked gave no warm benefit:
+
+  | case | first call | warm |
+  |---|---:|---:|
+  | 2048³ autotune on | 25.1 s | 7.5 ms |
+  | 2048³ autotune off | 3.4 s | 8.1 ms |
+  | 4096³ autotune on | 182.7 s | 36.3 ms |
+  | 4096³ autotune off | 15.6 s | 35.4 ms |
+
+- **Unaligned GEMM shapes handle their edge tiles in-kernel (#50).** The new
+  `_gemm_kernel_ragged` splits each of M/K/N into full tiles plus one static
+  remainder tile. The K remainder is a shorter matmul (stationary and moving
+  operands both start at partition 0) accumulated into the same PSUM tile. M and
+  N remainders are narrower PSUM/SBUF tiles. This removes the torch-level
+  pad/slice on the device, which cost about 10× on the first call (every new shape
+  compiled its own pad/slice graphs) and about 2× warm (extra copies):
+
+  | case (autotune off) | first call | warm |
+  |---|---:|---:|
+  | 2047³, torch pad | 41.3 s | 14.9 ms |
+  | 4095³, torch pad | 153.9 s | 69.3 ms |
+
+  Aligned shapes still use the unchanged default kernel. `TRNBLAS_GEMM_RAGGED=0`
+  restores the torch pad path. If the ragged kernel raises, dispatch warns
+  (`NkiFallbackWarning`) and falls back to the padded NKI path, or re-raises
+  under `TRNBLAS_REQUIRE_NKI=1`. Checked with `nki.simulate` and
+  `nki.compiler.frontend.source_to_mlir(...).verify()` (parser and tracer
+  frontends, trn2). Hardware timing is pending.
+
 - **GEMM pad-to-tile / slice-back factored into `_run_padded_gemm` (#50).** The
   NKI GEMM kernels have no remainder handling, so `nki_gemm` / `gemm` /
   `batched_gemm` on the `nki` backend zero-pad M and K to the tile size (128)
   and N to the N-tile (512) when N > 512, then slice the result back to (M, N).
   Already-aligned contiguous operands are passed through with no copy. The
-  autotune sweep now uses the same helper. Behaviour is unchanged: dispatch
+  autotune sweep now uses the same helper. In this refactor alone the behaviour
+  was unchanged: dispatch
   already padded this way, and 8191³ pads to exactly 8192³. The 1605 s first call
   for 8191³ on Trn2 (#50) is therefore not a ragged-edge kernel path. The likely
   cause is the first-call autotune sweep, which compiles and times up to six tile
@@ -27,6 +62,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stand-in kernel. They cover odd M/K/N, every autotune tile candidate,
   transposed views, `gemm` alpha/beta/C with all transpose combinations,
   `batched_gemm`, and the aligned no-copy case.
+- `tests/test_gemm_padding.py`: edge-tile index math (`_ragged_dim_plan` /
+  `_ragged_tiles` cover every index exactly once; a torch emulation of the ragged
+  kernel's tile walk matches `torch.matmul`) and the autotune-off default.
+- `tests/test_nki_gemm.py`: neuron-marked `TestRaggedKernel`, which runs the ragged
+  kernel directly on odd shapes (1000³, 2047³, 127×129×513, 1×1×1, …) and checks
+  that dispatch takes no torch pad path. `TestAutotuner` now enables the sweep
+  explicitly.
 - `tests/test_nki_gemm.py`: neuron-marked 1000³ check against `torch.matmul`
   with `TRNBLAS_REQUIRE_NKI` semantics, so a silent fallback fails the test.
 

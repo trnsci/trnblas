@@ -56,18 +56,21 @@ class NkiFallbackWarning(UserWarning):
     """
 
 
-_fallback_warned: set[str] = set()
+_fallback_warned: set[tuple[str, str]] = set()
 
 
-def _warn_fallback(exc: BaseException) -> None:
+def _warn_fallback(
+    exc: BaseException,
+    what: str = "NKI kernel dispatch failed — falling back to torch.matmul",
+) -> None:
     """Emit NkiFallbackWarning once per unique error signature."""
-    key = f"{type(exc).__name__}: {str(exc).splitlines()[0][:200]}"
-    if key in _fallback_warned:
+    lines = str(exc).splitlines()
+    key = f"{type(exc).__name__}: {(lines[0] if lines else '')[:200]}"
+    if (what, key) in _fallback_warned:
         return
-    _fallback_warned.add(key)
+    _fallback_warned.add((what, key))
     warnings.warn(
-        f"NKI kernel dispatch failed — falling back to torch.matmul "
-        f"(set TRNBLAS_REQUIRE_NKI=1 to re-raise). First error: {key}",
+        f"{what} (set TRNBLAS_REQUIRE_NKI=1 to re-raise). First error: {key}",
         NkiFallbackWarning,
         stacklevel=3,
     )
@@ -106,8 +109,23 @@ _J_CHUNK_MAX_B_BYTES = 256 * 1024 * 1024
 _NRT_INNER_OP_LIMIT = 300
 
 # Autotuner — sweeps tile candidates on hardware once per shape bucket and
-# caches the winner to disk. Disabled in simulator mode and by TRNBLAS_AUTOTUNE=0.
-_AUTOTUNE_ENABLED: bool = os.environ.get("TRNBLAS_AUTOTUNE", "1") != "0"
+# caches the winner to disk. Opt-in since #50: TRNBLAS_AUTOTUNE=1 or
+# set_autotune(True). On trn2 the first-call sweep made cold GEMM 7-12x slower
+# (2048^3: 25.1 s vs 3.4 s; 4096^3: 182.7 s vs 15.6 s) and the tile it picked
+# gave no warm benefit, so the default is the fixed heuristic (128, 128, 512),
+# clamped per dimension by the kernel for small shapes. Never used in simulator mode.
+_AUTOTUNE_ENABLED: bool = os.environ.get("TRNBLAS_AUTOTUNE", "0").lower() in ("1", "true", "yes")
+
+# In-kernel ragged-edge GEMM (#50). Unaligned shapes go to _gemm_kernel_ragged,
+# which handles the M/K/N remainder tiles in-kernel, so there is no torch-level
+# pad/slice on the device. TRNBLAS_GEMM_RAGGED=0 restores the pad-in-torch path.
+# If the ragged kernel fails, dispatch falls back to the padded path (or
+# re-raises under TRNBLAS_REQUIRE_NKI=1).
+_RAGGED_ENABLED: bool = os.environ.get("TRNBLAS_GEMM_RAGGED", "1").lower() not in (
+    "0",
+    "false",
+    "no",
+)
 _AUTOTUNE_CACHE_FILE: Path = Path(
     os.environ.get("TRNBLAS_AUTOTUNE_CACHE", "/var/tmp/trnblas-autotune/cache.json")
 )
@@ -140,6 +158,16 @@ def set_backend(backend: str):
 
 def get_backend() -> str:
     return _backend
+
+
+def set_autotune(enabled: bool) -> None:
+    """Enable/disable the first-call GEMM tile sweep (off by default since #50)."""
+    global _AUTOTUNE_ENABLED
+    _AUTOTUNE_ENABLED = bool(enabled)
+
+
+def get_autotune() -> bool:
+    return _AUTOTUNE_ENABLED
 
 
 def _use_nki() -> bool:
@@ -583,17 +611,67 @@ def _run_padded_gemm(
     return result[:M, :N] if needs_pad else result
 
 
+def _ragged_dim_plan(D: int, tile: int) -> tuple[int, int, int]:
+    """Edge-tile plan for one GEMM dimension, mirroring `_gemm_kernel_ragged`.
+
+    Returns ``(T, n_full, rem)``: tile size ``T = min(tile, D)``, the number of
+    full tiles ``n_full = D // T`` (always >= 1), and the remainder tile size
+    ``rem = D - n_full * T`` (0 when aligned). The remainder tile starts at
+    ``n_full * T``. Every index in ``[0, D)`` is covered exactly once.
+    """
+    if D < 1:
+        raise ValueError(f"GEMM dimension must be >= 1, got {D}")
+    T = tile if tile < D else D
+    n_full = D // T
+    return T, n_full, D - n_full * T
+
+
+def _ragged_tiles(D: int, tile: int) -> list[tuple[int, int]]:
+    """(offset, size) list of the tiles `_gemm_kernel_ragged` visits along D."""
+    T, n_full, rem = _ragged_dim_plan(D, tile)
+    tiles = [(i * T, T) for i in range(n_full)]
+    if rem > 0:
+        tiles.append((n_full * T, rem))
+    return tiles
+
+
+def _ragged_gemm_reference(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    """Torch emulation of `_gemm_kernel_ragged`'s tile walk (for CPU tests).
+
+    Same loop structure and the same per-tile slices as the kernel: the
+    stationary tile is A[m, k].T (partitions = k size), the moving tile is
+    B[k, n] (partitions = k size, so the counts match), and partial products
+    accumulate into an FP32 "PSUM" tile of shape (m size, n size).
+    """
+    M, K = A.shape
+    _, N = B.shape
+    C = torch.empty(M, N, dtype=A.dtype)
+    for m_off, msz in _ragged_tiles(M, _TILE_M):
+        for n_off, nsz in _ragged_tiles(N, _TILE_N):
+            psum = torch.zeros(msz, nsz, dtype=torch.float64)
+            for k_off, ksz in _ragged_tiles(K, _TILE_K):
+                a_t = A[m_off : m_off + msz, k_off : k_off + ksz].T
+                b_t = B[k_off : k_off + ksz, n_off : n_off + nsz]
+                assert a_t.shape[0] == b_t.shape[0] == ksz <= _TILE_K
+                assert msz <= _TILE_M and nsz <= _TILE_N
+                psum += a_t.T.double() @ b_t.double()
+            C[m_off : m_off + msz, n_off : n_off + nsz] = psum.to(A.dtype)
+    return C
+
+
 def _nki_gemm_impl(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     """NKI GEMM implementation with tile-shape autotuner (#26).
 
-    On hardware: sweeps tile candidates once per shape bucket and caches the
+    With autotune enabled: sweeps tile candidates once per shape bucket and caches the
     winner to disk (``/var/tmp/trnblas-autotune/cache.json`` by default).
     Subsequent calls for the same bucket hit the in-process dict and then the
     NEFF cache — no re-sweep.
 
-    Padding is computed *after* tile selection so alignment matches the chosen
-    tile sizes.  In simulator mode or when ``TRNBLAS_AUTOTUNE=0`` is set,
-    the default (128, 128, 512) config is used without sweeping.
+    The sweep is opt-in (``TRNBLAS_AUTOTUNE=1`` / ``set_autotune(True)``) since
+    #50; by default and in simulator mode the (128, 128, 512) heuristic is used.
+    With the default tiles, unaligned shapes run ``_gemm_kernel_ragged`` (edge
+    tiles in-kernel, no torch pad). Otherwise operands are padded *after* tile
+    selection so alignment matches the chosen tile sizes.
 
     Set ``TRNBLAS_REQUIRE_NKI=1`` to re-raise kernel errors instead of falling
     back to ``torch.matmul``.
@@ -615,13 +693,27 @@ def _nki_gemm_impl(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     else:
         tile_m, tile_k, tile_n = _TILE_M, _TILE_K, _TILE_N
 
-    def _launch(A_feed: torch.Tensor, B_feed: torch.Tensor) -> torch.Tensor:
-        kernel = _get_gemm_kernel(tile_m, tile_k, tile_n)
+    def _run(kernel, A_feed: torch.Tensor, B_feed: torch.Tensor) -> torch.Tensor:
         if _use_simulator():
             out_np = nki.simulate(kernel)(A_feed.cpu().numpy(), B_feed.cpu().numpy())
             return torch.from_numpy(np.asarray(out_np)).to(A.device)
         (a, b), orig_device = _to_xla(A_feed, B_feed)
         return kernel(a, b).to(orig_device)
+
+    def _launch(A_feed: torch.Tensor, B_feed: torch.Tensor) -> torch.Tensor:
+        return _run(_get_gemm_kernel(tile_m, tile_k, tile_n), A_feed, B_feed)
+
+    # Ragged shapes with the default tiles: the edge tiles are handled in-kernel
+    # (#50), so there is no torch pad/slice and no per-shape pad/slice graphs on
+    # the device.
+    aligned = _gemm_padded_shape(M, K, N, tile_m, tile_k, tile_n) == (M, K, N)
+    if _RAGGED_ENABLED and not aligned and (tile_m, tile_k, tile_n) == (_TILE_M, _TILE_K, _TILE_N):
+        try:
+            return _run(_gemm_kernel_ragged, A.contiguous(), B.contiguous())
+        except Exception as exc:
+            if _REQUIRE_NKI:
+                raise
+            _warn_fallback(exc, "ragged GEMM kernel failed — falling back to padded NKI GEMM")
 
     try:
         return _run_padded_gemm(A, B, _launch, tile_m, tile_k, tile_n)
@@ -1216,6 +1308,107 @@ if HAS_NKI:
                 c_sbuf = nl.ndarray((TILE_M, TILE_N), dtype=a.dtype, buffer=nl.sbuf)
                 nisa.tensor_copy(src=psum, dst=c_sbuf)
                 nl.store(c[m_off : m_off + TILE_M, n_off : n_off + TILE_N], value=c_sbuf)
+        return c
+
+    @nki.jit
+    def _gemm_kernel_ragged(a, b):
+        """GEMM with in-kernel edge tiles for unaligned M/K/N (#50).
+
+        Tile sizes are the default (128, 128, 512), clamped to the dimension
+        when it is smaller. All shapes are static per compile: each dimension
+        splits into ``D // T`` full tiles plus one remainder tile of
+        ``D - (D // T) * T`` (see ``_ragged_dim_plan``). The K remainder is
+        accumulated into the same PSUM tile as a shorter matmul whose
+        stationary and moving operands both have ``KR`` partitions, starting
+        at partition 0. M/N remainder tiles are narrower PSUM/SBUF tiles.
+        The body is written out once per (M-tile kind, N-tile kind) because
+        the frontend resolves names from source and does not support kernel
+        helper closures.
+        """
+        M, K = a.shape
+        _, N = b.shape
+        TM = 128 if M > 128 else M
+        TK = 128 if K > 128 else K
+        TN = 512 if N > 512 else N
+        MF = M // TM
+        KF = K // TK
+        NF = N // TN
+        MR = M - MF * TM
+        KR = K - KF * TK
+        NR = N - NF * TN
+        M0 = MF * TM
+        K0 = KF * TK
+        N0 = NF * TN
+        c = nl.ndarray((M, N), dtype=a.dtype, buffer=nl.shared_hbm)
+
+        # Full M tiles.
+        for m in nl.affine_range(MF):
+            m_off = m * TM
+            # Full M x full N.
+            for n in nl.affine_range(NF):
+                n_off = n * TN
+                psum = nl.zeros((TM, TN), dtype=nl.float32, buffer=nl.psum)
+                for k in nl.affine_range(KF):
+                    k_off = k * TK
+                    a_t = nl.load_transpose2d(a[m_off : m_off + TM, k_off : k_off + TK])
+                    b_t = nl.load(b[k_off : k_off + TK, n_off : n_off + TN])
+                    nisa.nc_matmul(dst=psum, stationary=a_t, moving=b_t, accumulate=True)
+                if KR > 0:
+                    a_r = nl.load_transpose2d(a[m_off : m_off + TM, K0:K])
+                    b_r = nl.load(b[K0:K, n_off : n_off + TN])
+                    nisa.nc_matmul(dst=psum, stationary=a_r, moving=b_r, accumulate=True)
+                c_sbuf = nl.ndarray((TM, TN), dtype=a.dtype, buffer=nl.sbuf)
+                nisa.tensor_copy(src=psum, dst=c_sbuf)
+                nl.store(c[m_off : m_off + TM, n_off : n_off + TN], value=c_sbuf)
+            # Full M x N remainder.
+            if NR > 0:
+                psum_n = nl.zeros((TM, NR), dtype=nl.float32, buffer=nl.psum)
+                for k in nl.affine_range(KF):
+                    k_off = k * TK
+                    a_t = nl.load_transpose2d(a[m_off : m_off + TM, k_off : k_off + TK])
+                    b_t = nl.load(b[k_off : k_off + TK, N0:N])
+                    nisa.nc_matmul(dst=psum_n, stationary=a_t, moving=b_t, accumulate=True)
+                if KR > 0:
+                    a_r = nl.load_transpose2d(a[m_off : m_off + TM, K0:K])
+                    b_r = nl.load(b[K0:K, N0:N])
+                    nisa.nc_matmul(dst=psum_n, stationary=a_r, moving=b_r, accumulate=True)
+                c_n = nl.ndarray((TM, NR), dtype=a.dtype, buffer=nl.sbuf)
+                nisa.tensor_copy(src=psum_n, dst=c_n)
+                nl.store(c[m_off : m_off + TM, N0:N], value=c_n)
+
+        # M remainder tile.
+        if MR > 0:
+            # M remainder x full N.
+            for n in nl.affine_range(NF):
+                n_off = n * TN
+                psum_m = nl.zeros((MR, TN), dtype=nl.float32, buffer=nl.psum)
+                for k in nl.affine_range(KF):
+                    k_off = k * TK
+                    a_t = nl.load_transpose2d(a[M0:M, k_off : k_off + TK])
+                    b_t = nl.load(b[k_off : k_off + TK, n_off : n_off + TN])
+                    nisa.nc_matmul(dst=psum_m, stationary=a_t, moving=b_t, accumulate=True)
+                if KR > 0:
+                    a_r = nl.load_transpose2d(a[M0:M, K0:K])
+                    b_r = nl.load(b[K0:K, n_off : n_off + TN])
+                    nisa.nc_matmul(dst=psum_m, stationary=a_r, moving=b_r, accumulate=True)
+                c_m = nl.ndarray((MR, TN), dtype=a.dtype, buffer=nl.sbuf)
+                nisa.tensor_copy(src=psum_m, dst=c_m)
+                nl.store(c[M0:M, n_off : n_off + TN], value=c_m)
+            # M remainder x N remainder (corner).
+            if NR > 0:
+                psum_mn = nl.zeros((MR, NR), dtype=nl.float32, buffer=nl.psum)
+                for k in nl.affine_range(KF):
+                    k_off = k * TK
+                    a_t = nl.load_transpose2d(a[M0:M, k_off : k_off + TK])
+                    b_t = nl.load(b[k_off : k_off + TK, N0:N])
+                    nisa.nc_matmul(dst=psum_mn, stationary=a_t, moving=b_t, accumulate=True)
+                if KR > 0:
+                    a_r = nl.load_transpose2d(a[M0:M, K0:K])
+                    b_r = nl.load(b[K0:K, N0:N])
+                    nisa.nc_matmul(dst=psum_mn, stationary=a_r, moving=b_r, accumulate=True)
+                c_mn = nl.ndarray((MR, NR), dtype=a.dtype, buffer=nl.sbuf)
+                nisa.tensor_copy(src=psum_mn, dst=c_mn)
+                nl.store(c[M0:M, N0:N], value=c_mn)
         return c
 
     # Register all six variants.  The default (128, 128, 512) is also kept as

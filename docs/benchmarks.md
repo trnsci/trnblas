@@ -273,7 +273,9 @@ for the A10G).
 
 ## Tile-shape autotuner (v0.5.0)
 
-`nki_gemm` now sweeps six tile candidates `{64,128} × {128} × {128,256,512}` on
+Opt-in since #50 (`TRNBLAS_AUTOTUNE=1` or `trnblas.set_autotune(True)`); the
+default is the fixed `(128,128,512)` heuristic with no first-call sweep. When
+enabled, `nki_gemm` sweeps six tile candidates `{64,128} × {128} × {128,256,512}` on
 the first call per shape bucket and caches the winner to
 `/var/tmp/trnblas-autotune/cache.json` (overrideable via `TRNBLAS_AUTOTUNE_CACHE`).
 
@@ -285,7 +287,7 @@ the first call per shape bucket and caches the winner to
 | Sweep | 3 warm runs per candidate; candidates that don't evenly divide the padded shape are skipped |
 | Winner | Stored in-process in `_autotune_mem`; written to JSON cache |
 | Cache hit | Same bucket → dict lookup only, no re-sweep |
-| Escape hatch | `TRNBLAS_AUTOTUNE=0` → fixed `(128,128,512)`, identical to v0.4.x |
+| Default (since #50) | sweep off → fixed `(128,128,512)`; enable with `TRNBLAS_AUTOTUNE=1` |
 
 The sweep runs once per shape bucket per instance lifetime (the cache file persists
 on EBS across stop/start). DF-MP2's `nocc²` pair loop sees zero sweep overhead after

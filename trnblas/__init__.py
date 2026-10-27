@@ -21,7 +21,7 @@ from .level2 import gemv, ger, symv, trmv
 from .level3 import batched_gemm, gemm, symm, syrk, trmm, trsm
 
 # Backend control
-from .nki import HAS_NKI, get_backend, set_backend
+from .nki import HAS_NKI, get_autotune, get_backend, set_autotune, set_backend
 
 __all__ = [
     # Level 1
@@ -46,5 +46,7 @@ __all__ = [
     # Backend
     "HAS_NKI",
     "set_backend",
+    "set_autotune",
+    "get_autotune",
     "get_backend",
 ]
