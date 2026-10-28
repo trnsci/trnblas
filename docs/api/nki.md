@@ -8,9 +8,9 @@ Trainium Tensor Engine or fall back to PyTorch.
 ```python
 import trnblas
 
-trnblas.set_backend("auto")     # NKI on Trainium, PyTorch elsewhere (default)
+trnblas.set_backend("auto")  # NKI on Trainium, PyTorch elsewhere (default)
 trnblas.set_backend("pytorch")  # force PyTorch fallback
-trnblas.set_backend("nki")      # force NKI (requires nki>=0.3.0)
+trnblas.set_backend("nki")  # force NKI (requires nki>=0.3.0)
 ```
 
 `trnblas.HAS_NKI` is `True` when the `nki` package (NKI 0.3.0+, Neuron

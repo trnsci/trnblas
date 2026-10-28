@@ -82,6 +82,64 @@ class TestNkiGemmKernel:
         out = nki_gemm(A, B)
         torch.testing.assert_close(out, torch.zeros(128, 128), atol=0, rtol=0)
 
+    def test_odd_1000_cubed_padded(self, nki_backend, rng, monkeypatch):
+        """#50: 1000^3 pads to 1024^3 at dispatch; must match torch.matmul
+        and must not silently fall back."""
+        from trnblas.nki import dispatch
+
+        monkeypatch.setattr(dispatch, "_REQUIRE_NKI", True)
+        A = torch.randn(1000, 1000, generator=rng)
+        B = torch.randn(1000, 1000, generator=rng)
+        out = nki_gemm(A, B)
+        assert out.shape == (1000, 1000)
+        ref = torch.matmul(A.double(), B.double())
+        rel = (out.double().cpu() - ref).norm() / ref.norm()
+        assert rel < 1e-5, f"rel_err={rel:.3e}"
+        torch.testing.assert_close(out.cpu(), torch.matmul(A, B), atol=1e-2, rtol=1e-4)
+
+
+class TestRaggedKernel:
+    """#50: in-kernel edge tiles for unaligned M/K/N, without torch pad/slice."""
+
+    SHAPES = [
+        (1000, 1000, 1000),
+        (2047, 2047, 2047),
+        (127, 129, 513),
+        (1, 1, 1),
+        (100, 300, 50),
+        (128, 200, 1024),
+        (300, 128, 600),
+    ]
+
+    @pytest.mark.parametrize("M,K,N", SHAPES)
+    def test_ragged_kernel_direct(self, nki_backend, rng, M, K, N):
+        from trnblas.nki.dispatch import _gemm_kernel_ragged, _to_xla
+
+        A = torch.randn(M, K, generator=rng)
+        B = torch.randn(K, N, generator=rng)
+        (a, b), orig = _to_xla(A, B)
+        out = _gemm_kernel_ragged(a, b).to(orig)
+        assert out.shape == (M, N)
+        ref = A.double() @ B.double()
+        rel = (out.double() - ref).norm() / ref.norm()
+        assert rel < 1e-5, f"({M},{K},{N}) rel_err={rel:.3e}"
+
+    def test_dispatch_uses_ragged_no_fallback(self, nki_backend, rng, monkeypatch):
+        from trnblas.nki import dispatch
+
+        monkeypatch.setattr(dispatch, "_REQUIRE_NKI", True)
+        monkeypatch.setattr(dispatch, "_AUTOTUNE_ENABLED", False)
+        pads: list = []
+        orig_pad = dispatch._pad_gemm_operands
+        monkeypatch.setattr(
+            dispatch, "_pad_gemm_operands", lambda *a: pads.append(1) or orig_pad(*a)
+        )
+        A = torch.randn(1000, 1000, generator=rng)
+        B = torch.randn(1000, 1000, generator=rng)
+        out = nki_gemm(A, B)
+        assert not pads, "ragged shape went through the torch pad path"
+        torch.testing.assert_close(out.cpu(), A @ B, atol=1e-2, rtol=1e-4)
+
 
 class TestGemmDispatch:
     """Top-level `gemm()` BLAS call routes through the NKI kernel."""
@@ -225,7 +283,15 @@ class TestAutotuner:
     to exercise the autotuner logic without hardware dispatch overhead.
     test_correctness_per_config dispatches all six tile configs on hardware.
     test_hardware_sweep verifies the full end-to-end sweep path on trn1.
+
+    The sweep is opt-in since #50, so these tests enable it explicitly.
     """
+
+    @pytest.fixture(autouse=True)
+    def _enable_autotune(self, monkeypatch):
+        import trnblas.nki.dispatch as D
+
+        monkeypatch.setattr(D, "_AUTOTUNE_ENABLED", True)
 
     def test_escape_hatch(self, nki_backend, rng, monkeypatch):
         """TRNBLAS_AUTOTUNE=0 bypasses sweep and uses default tile config."""

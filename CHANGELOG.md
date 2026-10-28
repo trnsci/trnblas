@@ -7,6 +7,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Behaviour change: the GEMM tile autotuner is now opt-in (#50).** By default,
+  `nki_gemm` / `gemm` / `batched_gemm` use the fixed heuristic tile (128, 128, 512),
+  which the kernel clamps per dimension for small shapes, and run no first-call
+  sweep. Opt in with `TRNBLAS_AUTOTUNE=1` or `trnblas.set_autotune(True)`. Why: on
+  trn2 (SDK 2.33, native device, fp32, cold caches per process) the sweep made the
+  first call 7–12× slower, and the tile it picked gave no warm benefit:
+
+  | case | first call | warm |
+  |---|---:|---:|
+  | 2048³ autotune on | 25.1 s | 7.5 ms |
+  | 2048³ autotune off | 3.4 s | 8.1 ms |
+  | 4096³ autotune on | 182.7 s | 36.3 ms |
+  | 4096³ autotune off | 15.6 s | 35.4 ms |
+
+- **Unaligned GEMM shapes handle their edge tiles in-kernel (#50).** The new
+  `_gemm_kernel_ragged` splits each of M/K/N into full tiles plus one static
+  remainder tile. The K remainder is a shorter matmul (stationary and moving
+  operands both start at partition 0) accumulated into the same PSUM tile. M and
+  N remainders are narrower PSUM/SBUF tiles. This removes the torch-level
+  pad/slice and its extra copies, halving warm time on odd shapes on Trn2:
+
+  | case (autotune off) | torch pad, warm | ragged kernel, warm |
+  |---|---:|---:|
+  | 2047³ | 14.9 ms | 7.1 ms |
+  | 4095³ | 68.9 ms | 32.0 ms |
+
+  A roughly 10× first-call penalty seen on odd shapes during this work was not
+  the pad path. It came from the benchmark's own lazy
+  `torch.randn(..., device="neuron")`, which is shape-sensitive
+  (aws-neuron/aws-neuron-sdk#1439). With host-created inputs, cold first calls
+  cost the same at odd and aligned sizes (4095³ 16.1 s, 4096³ 15.3 s).
+
+  Aligned shapes still use the unchanged default kernel. `TRNBLAS_GEMM_RAGGED=0`
+  restores the torch pad path. If the ragged kernel raises, dispatch warns
+  (`NkiFallbackWarning`) and falls back to the padded NKI path, or re-raises
+  under `TRNBLAS_REQUIRE_NKI=1`. Checked with `nki.simulate` and
+  `nki.compiler.frontend.source_to_mlir(...).verify()` (parser and tracer
+  frontends, trn2) and on Trn2 hardware (neuron suite, awkward-size sweep).
+
+- **GEMM pad-to-tile / slice-back factored into `_run_padded_gemm` (#50).** The
+  NKI GEMM kernels have no remainder handling, so `nki_gemm` / `gemm` /
+  `batched_gemm` on the `nki` backend zero-pad M and K to the tile size (128)
+  and N to the N-tile (512) when N > 512, then slice the result back to (M, N).
+  Already-aligned contiguous operands are passed through with no copy. The
+  autotune sweep now uses the same helper. In this refactor alone the behaviour
+  was unchanged: dispatch
+  already padded this way, and 8191³ pads to exactly 8192³. The 1605 s first call
+  for 8191³ on Trn2 (#50) is therefore not a ragged-edge kernel path. The likely
+  cause is the first-call autotune sweep, which compiles and times up to six tile
+  configs at 8192³. The 8192³ run that followed reused both the cached winner
+  (same pow2 bucket) and the NEFF. Hardware confirmation is pending.
+
+### Added
+
+- `scripts/probe_first_call.py N [--mode gemm|full|direct-jit|direct-op|hop|mlir] [--cpu]`:
+  prints one `PHASE <name> <seconds>` line for each phase of a cold first GEMM call,
+  to find where the odd-shape first-call cost goes (#50).
+
+### Tests
+
+- `tests/test_gemm_padding.py`: CPU tests for the pad/slice wrapper with a
+  stand-in kernel. They cover odd M/K/N, every autotune tile candidate,
+  transposed views, `gemm` alpha/beta/C with all transpose combinations,
+  `batched_gemm`, and the aligned no-copy case.
+- `tests/test_gemm_padding.py`: edge-tile index math (`_ragged_dim_plan` /
+  `_ragged_tiles` cover every index exactly once; a torch emulation of the ragged
+  kernel's tile walk matches `torch.matmul`) and the autotune-off default.
+- `tests/test_nki_gemm.py`: neuron-marked `TestRaggedKernel`, which runs the ragged
+  kernel directly on odd shapes (1000³, 2047³, 127×129×513, 1×1×1, …) and checks
+  that dispatch takes no torch pad path. `TestAutotuner` now enables the sweep
+  explicitly.
+- `tests/test_nki_gemm.py`: neuron-marked 1000³ check against `torch.matmul`
+  with `TRNBLAS_REQUIRE_NKI` semantics, so a silent fallback fails the test.
+
 ## [0.5.5] — 2026-04-27
 
 ### Added
