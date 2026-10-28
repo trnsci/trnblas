@@ -173,10 +173,10 @@ def _cpu_kernel(kernel):
 
 
 def _hop(*ts):
-    """The dispatch's device hop: real _to_xla on device, identity on CPU."""
+    """The dispatch's device hop (native or XLA, `_to_device`); identity on CPU."""
     if CPU:
         return list(ts), ts[0].device
-    return D._to_xla(*ts)
+    return D._to_device(*ts)
 
 
 def nki_trace_lower_cpu(M, K, N_, kernel):

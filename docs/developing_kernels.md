@@ -4,16 +4,25 @@ trnblas ships five NKI kernels (`gemm`, `batched_gemm`, `syrk`,
 `trsm`, `mp2_energy`) in `trnblas/nki/dispatch.py`. This page is
 for contributors designing / debugging them.
 
-## Three dispatch modes
+## Dispatch modes
 
 | Mode | Trigger | When to use |
 |------|---------|-------------|
 | **PyTorch fallback** | `HAS_NKI = False` (non-Neuron host), or an `_nki_*_impl` exception gets caught | Laptops, GPUs, CI's ubuntu-latest — the default for anyone who doesn't have Neuron installed |
-| **NKI hardware** | `HAS_NKI = True` + default env. Kernel runs through `torch_xla` → NEFF compile → Trainium dispatch | Real perf numbers, final validation |
+| **NKI hardware, native** | `HAS_NKI = True` + TorchNeuron `torch_neuronx` (has `nki_op`) + a `neuron` device. Kernel runs as a `trnblas::` custom op on `device="neuron"` | Trn2/Trn3 on Neuron SDK 2.33+. Set `NKI_ENABLE_TRACE_CACHE=0` with an editable install. |
+| **NKI hardware, XLA** | `HAS_NKI = True` + `torch_xla` installed (and the native path unavailable). Kernel runs through `torch_xla` → NEFF compile → Trainium dispatch | Trn1; real perf numbers, final validation |
 | **NKI simulator** | `TRNBLAS_USE_SIMULATOR=1` + `HAS_NKI = True`. Kernel runs through `nki.simulate(kernel)(numpy_args)` on CPU | Fast correctness iteration during kernel design |
 
-The three modes share the same kernel source: `@nki.jit`-decorated
+The modes share the same kernel source: `@nki.jit`-decorated
 functions inside `if HAS_NKI:` blocks.
+
+Each host wrapper hands its operands to `_launch(kernel, op_name, *tensors)`
+in `dispatch.py` (or `_to_device` + `_call_kernel` when operands stay on the
+device across launches), which picks the native custom op or the
+`_to_xla()` path. A new kernel needs a matching annotated wrapper in
+`trnblas/nki/_native.py`, an entry in its `OPS` table, and an entry in
+`tests/test_nki_compile.py`, which runs `source_to_mlir(...).verify()` for
+every kernel on trn1 and trn2 (CPU, needs `nki`, runs in the simulator job).
 
 ## Simulator workflow
 

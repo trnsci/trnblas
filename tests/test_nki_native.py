@@ -1,0 +1,172 @@
+"""
+Native TorchNeuron dispatch on hardware (Trn2/Trn3, torch-neuronx 2.14+).
+
+Skipped unless the dispatch path resolves to "native": these do not run on
+the XLA lineage (Trn1) or off-hardware. The existing kernel suites
+(test_nki_gemm, test_nki_syrk, test_nki_mp2_energy, ...) also exercise the
+native path automatically on a TorchNeuron host; this file covers what is
+specific to it: custom-op registration, no torch_xla, eager op calls,
+torch.compile, and the path-aware batched-pair routing.
+
+Inputs are created on the host and copied to the device: on-device
+`torch.randn` is shape-sensitive (aws-neuron/aws-neuron-sdk#1439) and would
+skew any timing or first-call behaviour.
+"""
+
+import sys
+
+import pytest
+import torch
+
+import trnblas
+from trnblas.nki import HAS_NKI
+from trnblas.nki import dispatch as D
+
+
+def _native() -> bool:
+    if not HAS_NKI or D._use_simulator():
+        return False
+    try:
+        return D._get_dispatch_path() == "native"
+    except Exception:
+        return False
+
+
+pytestmark = [
+    pytest.mark.neuron,
+    pytest.mark.skipif(not _native(), reason="requires TorchNeuron (native) dispatch path"),
+]
+
+DEV = "neuron"
+
+
+@pytest.fixture
+def require_nki(monkeypatch):
+    """nki backend with kernel errors re-raised (no silent torch fallback)."""
+    old = trnblas.get_backend()
+    trnblas.set_backend("nki")
+    monkeypatch.setattr(D, "_REQUIRE_NKI", True)
+    yield
+    trnblas.set_backend(old)
+
+
+def _host(*shape, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    return torch.randn(*shape, generator=g)
+
+
+def _rel(out, ref):
+    return ((out.double() - ref.double()).norm() / ref.double().norm()).item()
+
+
+def _pair_reference(B, eps_occ, eps_vir):
+    return float(D._torch_batched_pair_energy(B.double(), eps_occ.double(), eps_vir.double()))
+
+
+class TestNativeRegistration:
+    def test_launch_does_not_import_torch_xla(self, require_nki):
+        trnblas.gemm(1.0, _host(128, 128), _host(128, 128, seed=1))
+        assert D._get_dispatch_path() == "native"
+        assert "torch_xla" not in sys.modules
+
+    def test_ops_registered_in_torch_ops(self):
+        ops = D._get_native_ops()
+        for name in ops:
+            assert hasattr(torch.ops.trnblas, name), name
+
+
+class TestNativeOpsEager:
+    @pytest.mark.parametrize("M,K,N", [(127, 129, 513), (1000, 1000, 1000), (1, 1, 1)])
+    def test_gemm_ragged_op(self, M, K, N):
+        A, B = _host(M, K), _host(K, N, seed=1)
+        out = torch.ops.trnblas.gemm_ragged(A.to(DEV), B.to(DEV))
+        assert out.device.type == "neuron"
+        assert _rel(out.cpu(), A.double() @ B.double()) < 1e-5
+
+    def test_gemm_default_tile_op(self):
+        A, B = _host(256, 256), _host(256, 1024, seed=1)
+        out = torch.ops.trnblas.gemm_128_128_512(A.to(DEV), B.to(DEV)).cpu()
+        assert _rel(out, A.double() @ B.double()) < 1e-5
+
+    def test_syrk_op(self):
+        A = _host(256, 128)
+        out = torch.ops.trnblas.syrk(A.to(DEV)).cpu()
+        assert _rel(out, A.double() @ A.double().T) < 1e-5
+
+    def test_public_gemm_on_resident_inputs_stays_on_device(self, require_nki):
+        A, B = _host(300, 200), _host(200, 600, seed=1)
+        C = trnblas.gemm(1.0, A.to(DEV), B.to(DEV))
+        assert C.device.type == "neuron"
+        assert _rel(C.cpu(), A.double() @ B.double()) < 1e-5
+
+
+class TestNativeTorchCompile:
+    def test_gemm_ragged_inside_compile(self):
+        gemm_ragged = D._get_native_ops()["gemm_ragged"]
+
+        @torch.compile(backend="neuron", fullgraph=True)
+        def scaled(a, b):
+            return gemm_ragged(a, b) * 2.0
+
+        A, B = _host(127, 129), _host(129, 513, seed=1)
+        out = scaled(A.to(DEV), B.to(DEV)).cpu()
+        assert _rel(out, 2.0 * (A.double() @ B.double())) < 1e-5
+
+    def test_syrk_inside_compile(self):
+        syrk = D._get_native_ops()["syrk"]
+
+        @torch.compile(backend="neuron", fullgraph=True)
+        def f(a):
+            return syrk(a) + 1.0
+
+        A = _host(256, 128)
+        out = f(A.to(DEV)).cpu()
+        assert _rel(out, A.double() @ A.double().T + 1.0) < 1e-5
+
+
+class TestNativeEnergyKernels:
+    def test_batched_pair_routes_chunked_and_matches(self, require_nki, monkeypatch):
+        nocc, nvir, naux = 4, 100, 200
+        B = 0.1 * _host(nocc, nvir, naux)
+        eps_occ = -1.0 - torch.rand(nocc, generator=torch.Generator().manual_seed(2))
+        eps_vir = 0.5 + torch.rand(nvir, generator=torch.Generator().manual_seed(3))
+        assert D._batched_pair_chunk_threshold() == 0
+        called = []
+        real = D._nki_batched_pair_energy_chunked_impl
+        monkeypatch.setattr(
+            D,
+            "_nki_batched_pair_energy_chunked_impl",
+            lambda *a: called.append(1) or real(*a),
+        )
+        e = float(trnblas.nki.nki_batched_pair_energy(B, eps_occ, eps_vir))
+        assert called == [1]
+        assert e == pytest.approx(_pair_reference(B, eps_occ, eps_vir), rel=1e-4)
+
+    def test_batched_pair_full_batch_still_available(self, require_nki, monkeypatch):
+        monkeypatch.setenv("TRNBLAS_BATCHED_PAIR_CHUNK_THRESHOLD", "4096")
+        nocc, nvir, naux = 2, 128, 128
+        B = 0.1 * _host(nocc, nvir, naux)
+        eps_occ = torch.tensor([-1.2, -1.0])
+        eps_vir = 0.5 + torch.rand(nvir, generator=torch.Generator().manual_seed(3))
+        e = float(trnblas.nki.nki_batched_pair_energy(B, eps_occ, eps_vir))
+        assert e == pytest.approx(_pair_reference(B, eps_occ, eps_vir), rel=1e-4)
+
+    def test_fused_gemm_energy(self, require_nki):
+        nvir, naux = 100, 200
+        bi, bj = 0.1 * _host(nvir, naux), 0.1 * _host(nvir, naux, seed=1)
+        eps_vir = 0.5 + torch.rand(nvir, generator=torch.Generator().manual_seed(3))
+        e = float(trnblas.nki.nki_fused_gemm_energy(bi, bj, -1.1, -1.0, eps_vir))
+        ref = float(
+            D._torch_fused_pair_energy(bi.double(), bj.double(), -1.1, -1.0, eps_vir.double())
+        )
+        assert e == pytest.approx(ref, rel=1e-4)
+
+    def test_mp2_energy(self, require_nki):
+        ic, nocc, nvir = 2, 3, 128
+        T = 0.1 * _host(ic * nvir, nocc * nvir)
+        eo_c = torch.tensor([-1.2, -1.1])
+        eo_f = torch.tensor([-1.2, -1.1, -1.0])
+        ev = 0.5 + torch.rand(nvir, generator=torch.Generator().manual_seed(3))
+        e = float(trnblas.nki.nki_mp2_energy(T, eo_c, eo_f, ev))
+        ref = float(D._torch_mp2_energy(T.double(), eo_c.double(), eo_f.double(), ev.double()))
+        assert e == pytest.approx(ref, rel=1e-4)
