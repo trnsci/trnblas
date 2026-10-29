@@ -126,11 +126,12 @@ class TestNativeTorchCompile:
 
 class TestNativeEnergyKernels:
     def test_batched_pair_routes_chunked_and_matches(self, require_nki, monkeypatch):
+        # Forced chunked: the default would take full-batch at this small shape.
+        monkeypatch.setenv("TRNBLAS_BATCHED_PAIR_CHUNK_THRESHOLD", "0")
         nocc, nvir, naux = 4, 100, 200
         B = 0.1 * _host(nocc, nvir, naux)
         eps_occ = -1.0 - torch.rand(nocc, generator=torch.Generator().manual_seed(2))
         eps_vir = 0.5 + torch.rand(nvir, generator=torch.Generator().manual_seed(3))
-        assert D._batched_pair_chunk_threshold() == 0
         called = []
         real = D._nki_batched_pair_energy_chunked_impl
         monkeypatch.setattr(
@@ -142,8 +143,13 @@ class TestNativeEnergyKernels:
         assert called == [1]
         assert e == pytest.approx(_pair_reference(B, eps_occ, eps_vir), rel=1e-4)
 
-    def test_batched_pair_full_batch_still_available(self, require_nki, monkeypatch):
-        monkeypatch.setenv("TRNBLAS_BATCHED_PAIR_CHUNK_THRESHOLD", "4096")
+    def test_batched_pair_default_takes_full_batch(self, require_nki, monkeypatch):
+        assert D._batched_pair_chunk_threshold() == 3072
+        monkeypatch.setattr(
+            D,
+            "_nki_batched_pair_energy_chunked_impl",
+            lambda *a: pytest.fail("est_iters 4 must take the full-batch kernel"),
+        )
         nocc, nvir, naux = 2, 128, 128
         B = 0.1 * _host(nocc, nvir, naux)
         eps_occ = torch.tensor([-1.2, -1.0])

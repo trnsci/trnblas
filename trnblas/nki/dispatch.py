@@ -90,16 +90,25 @@ _TILE_N = 512
 # When est_iters = nocc² × N_A² × N_K exceeds this threshold, route to
 # the chunked impl (_j_batched_kernel, Python i-loop, NOCC dispatches).
 #
-# The value is path-aware (see `_batched_pair_chunk_threshold`). Below the
-# threshold the full-batch kernel is preferred only because it replaces NOCC
-# dispatches with one, which pays off at the ~100 ms per-dispatch floor of the
-# XLA path. On the native TorchNeuron path the eager dispatch floor is ~0.2 ms
-# (trnsci/trnsci#35 Spike B), so NOCC chunked dispatches cost a few ms at most,
-# while the full-batch trace (and its compile) still grows with NOCC². Native
-# therefore always takes the chunked kernel; one compile serves every i-row.
+# The value is path-aware (see `_batched_pair_chunk_threshold`). XLA keeps
+# 4096. On the native TorchNeuron path (~0.2 ms dispatch floor) the trade is
+# compile time vs warm time, measured on trn2 (SDK 2.33, #52):
+#
+#   nocc,nvir,naux  est_iters  full first/warm    chunked first/warm
+#   4,128,128           16      8.3 s / 0.90 ms    1.5 s / 1.86 ms
+#   16,128,384         768      8.8 s / 2.33 ms    2.1 s / 25.7 ms
+#   32,128,384        3072     35.8 s / 6.67 ms    2.4 s / 71.9 ms
+#   16,256,512        4096     43.2 s / 7.0 ms     4.3 s / 42.3 ms
+#   64,128,128        4096    177.9 s / 21.8 ms    3.2 s / 168.7 ms
+#
+# Full-batch is 2-11x faster warm everywhere, but its compile grows with the
+# trace. Native takes full-batch up to est_iters 3072 (compile <= ~36 s) and the
+# chunked kernel above it, where measured compiles reach 43-178 s. est_iters
+# predicts compile only roughly: both 4096 rows differ 4x, tracking
+# nocc^2 * N_A^2 more than N_K.
 # TRNBLAS_BATCHED_PAIR_CHUNK_THRESHOLD overrides both (for re-benchmarking, #50).
 _BATCHED_PAIR_CHUNK_THRESHOLD = 4096
-_BATCHED_PAIR_CHUNK_THRESHOLD_NATIVE = 0
+_BATCHED_PAIR_CHUNK_THRESHOLD_NATIVE = 3072
 
 # J-sub-chunking: within the chunked impl, `_j_batched_kernel` receives the full
 # B:(nocc × nvir_pad × naux_pad) tensor.  At large shapes (nocc=96, nvir_pad≈768,
@@ -616,8 +625,9 @@ def _gemm_op_name(tile_m: int, tile_k: int, tile_n: int) -> str:
 def _batched_pair_chunk_threshold() -> int:
     """est_iters above which batched-pair takes the chunked kernel (path-aware).
 
-    XLA keeps 4096. Native uses 0 (always chunked): its ~0.2 ms dispatch floor
-    removes the reason to prefer the single full-batch launch.
+    XLA keeps 4096. Native uses 3072: full-batch is 2-11x faster warm, but
+    above that its first-call compile was 43-178 s on trn2 (see the table at
+    `_BATCHED_PAIR_CHUNK_THRESHOLD`).
     """
     env = os.environ.get("TRNBLAS_BATCHED_PAIR_CHUNK_THRESHOLD", "").strip()
     if env:
@@ -941,8 +951,9 @@ def nki_batched_pair_energy(
     Eliminates the ~100ms × nocc² Neuron XLA per-dispatch overhead.
 
     Routing between the full-batch kernel and the chunked per-i kernel is
-    path-aware (`_batched_pair_chunk_threshold`): on the native TorchNeuron
-    path (~0.2 ms dispatch floor) the chunked kernel is always used.
+    path-aware (`_batched_pair_chunk_threshold`): the native TorchNeuron path
+    switches to the chunked kernel above est_iters 3072 (XLA: 4096), where the
+    full-batch compile becomes prohibitive.
 
     On NKI backend: one `_batched_pair_kernel` call covering all pairs.
     On PyTorch backend (or hardware errors): falls back to the torch

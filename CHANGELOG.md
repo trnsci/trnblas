@@ -35,8 +35,10 @@ Trn2/Trn3), every NKI kernel is now registered as a PyTorch custom op with
 - **Path-aware batched-pair routing.** `nki_batched_pair_energy` chose the
   single full-batch kernel below `_BATCHED_PAIR_CHUNK_THRESHOLD = 4096`
   because one launch amortizes the XLA path's ~100 ms dispatch floor. The
-  native eager floor is ~0.2 ms, so the native path always uses the chunked
-  per-i kernel (one compile, NOCC launches). The XLA value is unchanged.
+  native path uses 3072, measured on trn2: the full-batch kernel is 2–11×
+  faster warm at every shape, but above est_iters 3072 its first-call compile
+  was 43–178 s, against 2–4 s for the chunked kernel. The XLA value is
+  unchanged.
   `TRNBLAS_BATCHED_PAIR_CHUNK_THRESHOLD` overrides both, for re-benchmarking
   (`scripts/bench_native_dispatch.py pair`).
 - `TRNSCI_NKI_DISPATCH=auto|native|xla` forces the dispatch path (a

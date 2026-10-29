@@ -32,9 +32,11 @@ detected on the first kernel launch:
 - **XLA (Trn1)**: kernels run on the `torch_xla` device, as before.
 
 `set_backend` is unaffected: it still chooses NKI vs PyTorch. On the native
-path `nki_batched_pair_energy` always uses the chunked per-i kernel
-(`j_batched`): the ~0.2 ms eager dispatch floor no longer justifies the
-single full-batch launch that amortizes the XLA path's ~100 ms floor.
+path `nki_batched_pair_energy` takes the single full-batch kernel
+(`batched_pair`) up to est_iters = nocc² × N_A² × N_K = 3072 and the chunked
+per-i kernel (`j_batched`) above it (XLA: 4096). On trn2 the full-batch kernel
+is 2–11× faster warm, but above 3072 its first-call compile reached 43–178 s,
+against 2–4 s for the chunked kernel.
 See [Installation](../installation.md#two-neuron-pytorch-lineages).
 
 ## Environment variables
@@ -44,7 +46,7 @@ See [Installation](../installation.md#two-neuron-pytorch-lineages).
 | `TRNBLAS_REQUIRE_NKI=1` | Re-raise kernel exceptions instead of falling back to `torch.matmul` — surfaces silent breakage in validation runs. |
 | `TRNBLAS_USE_SIMULATOR=1` | Route kernel dispatch through `nki.simulate(kernel)(numpy_args)` on CPU. Bypasses `torch_xla` + NEFF compile; used for fast correctness iteration. See [docs/developing_kernels.md](../developing_kernels.md). |
 | `TRNSCI_NKI_DISPATCH=auto\|native\|xla` | Suite-wide. Forces the native or XLA dispatch path. |
-| `TRNBLAS_BATCHED_PAIR_CHUNK_THRESHOLD=<n>` | Overrides batched-pair routing (default 4096 on XLA, 0 on native). |
+| `TRNBLAS_BATCHED_PAIR_CHUNK_THRESHOLD=<n>` | Overrides batched-pair routing (default 4096 on XLA, 3072 on native). |
 
 ## GEMM kernel
 

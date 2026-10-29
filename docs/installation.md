@@ -124,7 +124,7 @@ pytest tests/ -v
 | `TRNBLAS_USE_SIMULATOR=1` | Route kernel dispatch through `nki.simulate(kernel)(numpy_args)` on CPU. Bypasses `torch_xla` + NEFF compile; used for fast correctness iteration. Requires `nki>=0.3.0`. |
 | `TRNSCI_NKI_DISPATCH=auto\|native\|xla` | Suite-wide. Forces the native or XLA dispatch path; `auto` (default) detects. Forcing an unavailable path raises. |
 | `TRNSCI_XLA_DEPRECATION=1` | Suite-wide, off by default. The XLA path emits one `DeprecationWarning`. |
-| `TRNBLAS_BATCHED_PAIR_CHUNK_THRESHOLD=<n>` | Overrides the batched-pair full-batch vs chunked routing threshold (default 4096 on XLA, 0 on native). For re-benchmarking. |
+| `TRNBLAS_BATCHED_PAIR_CHUNK_THRESHOLD=<n>` | Overrides the batched-pair full-batch vs chunked routing threshold (default 4096 on XLA, 3072 on native). For re-benchmarking. |
 | `NKI_ENABLE_TRACE_CACHE=0` | TorchNeuron (not trnblas) setting. Turns off the cross-process NKI kernel cache, which cannot version editable installs. |
 
 ## Requirements

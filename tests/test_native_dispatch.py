@@ -419,18 +419,27 @@ class TestHostWrappersOnNativePath:
         )
         assert native_stub == ["fused_gemm_energy"]
 
-    def test_batched_pair_takes_chunked_kernel_on_native(self, native_stub):
-        nocc = 3
+    def test_batched_pair_small_takes_full_batch_on_native(self, native_stub):
+        # est_iters = 32^2 * 1 * 3 = 3072 <= native threshold: one launch.
+        nocc = 32
+        dispatch.nki_batched_pair_energy(
+            torch.randn(nocc, 128, 384), -torch.rand(nocc), torch.rand(128)
+        )
+        assert native_stub == ["batched_pair"]
+
+    def test_batched_pair_large_takes_chunked_on_native(self, native_stub):
+        # est_iters = 64^2 * 1 * 1 = 4096 > 3072: one j_batched launch per i
+        # (still full-batch on XLA, whose threshold is 4096).
+        nocc = 64
         dispatch.nki_batched_pair_energy(
             torch.randn(nocc, 128, 128), -torch.rand(nocc), torch.rand(128)
         )
-        # Native threshold is 0: one j_batched launch per occupied orbital.
         assert native_stub == ["j_batched"] * nocc
 
     def test_batched_pair_threshold_env_override(self, native_stub, monkeypatch):
-        monkeypatch.setenv("TRNBLAS_BATCHED_PAIR_CHUNK_THRESHOLD", "4096")
+        monkeypatch.setenv("TRNBLAS_BATCHED_PAIR_CHUNK_THRESHOLD", "0")
         dispatch.nki_batched_pair_energy(torch.randn(3, 128, 128), -torch.rand(3), torch.rand(128))
-        assert native_stub == ["batched_pair"]
+        assert native_stub == ["j_batched"] * 3
 
     def test_autotune_sweep_launches_ops(self, native_stub, monkeypatch, tmp_path):
         monkeypatch.setattr(dispatch, "_AUTOTUNE_ENABLED", True)
@@ -452,10 +461,10 @@ class TestBatchedPairThreshold:
         monkeypatch.setattr(dispatch, "_dispatch_path", "xla")
         assert dispatch._batched_pair_chunk_threshold() == 4096
 
-    def test_native_always_chunks(self, monkeypatch):
+    def test_native_value(self, monkeypatch):
         monkeypatch.setattr(dispatch, "_dispatch_path", "native")
         monkeypatch.setattr(dispatch, "_USE_SIMULATOR", False)
-        assert dispatch._batched_pair_chunk_threshold() == 0
+        assert dispatch._batched_pair_chunk_threshold() == 3072
 
     def test_simulator_keeps_xla_value_without_detection(self, monkeypatch):
         monkeypatch.setattr(dispatch, "_USE_SIMULATOR", True)

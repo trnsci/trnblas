@@ -8,9 +8,9 @@ Run on a TorchNeuron (Trn2/Trn3) host:
 
 ``pair``  For each (nocc, nvir, naux), times the full-batch kernel
           (``_batched_pair_kernel``, one launch) against the chunked kernel
-          (``_j_batched_kernel``, one launch per i-row). The native path routes
-          everything to the chunked kernel (``_BATCHED_PAIR_CHUNK_THRESHOLD_NATIVE
-          = 0``); this measures whether that holds.
+          (``_j_batched_kernel``, one launch per i-row). The native default
+          (``_BATCHED_PAIR_CHUNK_THRESHOLD_NATIVE = 3072``) came from this
+          sweep on trn2 (#52).
 ``gemm``  ``trnblas.gemm`` (NKI) vs ``A @ B`` (aten) on device-resident inputs,
           aligned and ragged shapes.
 
