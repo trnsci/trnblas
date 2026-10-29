@@ -36,7 +36,7 @@ neuron = [
 ]
 dev = [
     "pre-commit>=4.0",
-    "pytest>=7.0",
+    "pytest>=7.0,<9",  # pytest-benchmark 5.3 breaks on pytest 9 (Function._nodeid)
     "pytest-benchmark>=4.0",
     "pytest-cov>=4.0",
     "ruff>=0.6",
