@@ -148,6 +148,25 @@ def j_batched(
     return _d._j_batched_kernel(b_i, B, eps_occ_i, eps_occ_row, eps_vir_col, eps_vir_row)
 
 
+@nki_op(
+    "trnblas::pair_energy_sym",
+    mutates_args={},
+    fake_fn=lambda bt_i, Bw, eps_occ_i, eps_occ_w, eps_vir_col, eps_vir_row: Bw.new_empty(
+        (_PAIR_TILE, Bw.shape[0]), dtype=torch.float32
+    ),
+)
+def pair_energy_sym(
+    bt_i: torch.Tensor,
+    Bw: torch.Tensor,
+    eps_occ_i: torch.Tensor,
+    eps_occ_w: torch.Tensor,
+    eps_vir_col: torch.Tensor,
+    eps_vir_row: torch.Tensor,
+) -> torch.Tensor:
+    # Grid of 2: one program per physical core of the LNC=2 logical core.
+    return _d._pair_energy_sym_kernel[2](bt_i, Bw, eps_occ_i, eps_occ_w, eps_vir_col, eps_vir_row)
+
+
 # Keyed by the short op name used in `dispatch._launch` / `_call_kernel`.
 OPS = {
     **{_d._gemm_op_name(*tile): _register_gemm(tile) for tile in _d._TILE_CANDIDATES},
@@ -157,4 +176,5 @@ OPS = {
     "fused_gemm_energy": fused_gemm_energy,
     "batched_pair": batched_pair,
     "j_batched": j_batched,
+    "pair_energy_sym": pair_energy_sym,
 }

@@ -146,6 +146,47 @@ _RAGGED_ENABLED: bool = os.environ.get("TRNBLAS_GEMM_RAGGED", "1").lower() not i
     "false",
     "no",
 )
+# Native-path GEMM policy. The standalone NKI GEMM kernels here run as one
+# program and stage A through DMA transposes; a spike of the same loop as an
+# LNC=2 grid (`kernel[2]`, one program per physical core) with a pre-transposed
+# A came within 8-15% of aten at 2048^3 and above. Measured on trn2 (SDK 2.33,
+# fp32, device-resident, warm), aten is faster at every shape tried:
+#
+#   M x K x N                 aten      NKI (ragged/128-128-512)
+#   1024^3                    0.20 ms   0.54 ms
+#   2048^3                    0.65 ms   2.06 ms
+#   4096^3                    4.09 ms   12.1 ms
+#   12928 x 1536 x 28672      32.2 ms   77.5 ms   (DF-MP2 energy chunk)
+#
+# so there is no crossover to route on: plain GEMM-family calls (`gemm`,
+# `batched_gemm`, `syrk`, and the trailing updates inside `trsm`) on tensors
+# that already live on the `neuron` device go to aten. Host tensors keep the
+# NKI path (aten there would mean the CPU). The fused kernels (MP2 energy,
+# batched pair) are not affected. TRNBLAS_NATIVE_GEMM=nki restores the NKI
+# kernels for device-resident operands (for validation and re-benchmarking).
+_NATIVE_GEMM_CHOICES = ("auto", "nki")
+
+
+def _native_gemm_policy() -> str:
+    value = os.environ.get("TRNBLAS_NATIVE_GEMM", "auto").strip().lower()
+    if value not in _NATIVE_GEMM_CHOICES:
+        raise ValueError(
+            f"TRNBLAS_NATIVE_GEMM must be one of {_NATIVE_GEMM_CHOICES}; got {value!r}"
+        )
+    return value
+
+
+def _on_neuron_device(*tensors: torch.Tensor) -> bool:
+    return all(t.device.type == "neuron" for t in tensors)
+
+
+def _gemm_via_aten(*tensors: torch.Tensor) -> bool:
+    """True when a plain GEMM on these operands should run as aten on the device."""
+    if _use_simulator() or not _on_neuron_device(*tensors):
+        return False
+    return _native_gemm_policy() == "auto"
+
+
 _AUTOTUNE_CACHE_FILE: Path = Path(
     os.environ.get("TRNBLAS_AUTOTUNE_CACHE", "/var/tmp/trnblas-autotune/cache.json")
 )
@@ -211,8 +252,8 @@ def nki_batched_gemm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     natural use case is one batched_gemm with batch=N_aux per orbital
     pair — exactly this loop's sweet spot.
     """
-    if not _use_nki():
-        return torch.bmm(A, B)
+    if not _use_nki() or _gemm_via_aten(A, B):
+        return torch.matmul(A, B)
     return torch.stack([_nki_gemm_impl(A[i], B[i]) for i in range(A.shape[0])])
 
 
@@ -318,7 +359,7 @@ def nki_gemm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     For DF-MP2 tensor contractions where A is the MO coefficient matrix
     (reused across auxiliary basis indices), this cuts SBUF loads in half.
     """
-    if _use_nki():
+    if _use_nki() and not _gemm_via_aten(A, B):
         return _nki_gemm_impl(A, B)
     return torch.matmul(A, B)
 
@@ -332,7 +373,7 @@ def nki_syrk(A: torch.Tensor) -> torch.Tensor:
 
     On PyTorch: falls back to `torch.matmul(A, A.T)`.
     """
-    if _use_nki():
+    if _use_nki() and not _gemm_via_aten(A):
         return _nki_syrk_impl(A)
     return torch.matmul(A, A.T)
 
@@ -968,6 +1009,17 @@ def nki_batched_pair_energy(
     """
     if not _use_nki():
         return _torch_batched_pair_energy(B, eps_occ, eps_vir)
+    route = _pair_energy_route(B)
+    if route == "aten":
+        return _torch_chunked_pair_energy(B, eps_occ, eps_vir)
+    if route == "sym":
+        try:
+            return _nki_pair_energy_sym_impl(B, eps_occ, eps_vir)
+        except Exception as exc:
+            if _REQUIRE_NKI:
+                raise
+            _warn_fallback(exc, "pair_energy_sym kernel failed — falling back to aten")
+            return _torch_chunked_pair_energy(B, eps_occ, eps_vir)
     try:
         return _nki_batched_pair_energy_impl(B, eps_occ, eps_vir)
     except Exception as exc:
@@ -975,6 +1027,176 @@ def nki_batched_pair_energy(
             raise
         _warn_fallback(exc)
         return _torch_batched_pair_energy(B, eps_occ, eps_vir)
+
+
+# ── Native batched-pair energy: symmetric, LNC=2 kernel (`_pair_energy_sym_kernel`) ──
+#
+# On device-resident inputs on the native path, `nki_batched_pair_energy` picks
+# between the LNC=2 symmetric kernel and aten (chunked GEMM + torch reduction):
+# the kernel launches once per occupied row, so it pays ~nocc launch floors and
+# only wins once each row carries enough work. Measured on trn2 (SDK 2.33,
+# fp32, device-resident, warm; aten = `_torch_chunked_pair_energy` on the
+# device; row GFLOP = 2 * (nocc//2 + 1) * nvir_pad^2 * naux_pad):
+#
+#   nocc,nvir,naux   row GFLOP   aten        sym kernel
+#   16,128,384          0.11      1.9 ms      5.5 ms
+#   20,200,555          0.92      4.3 ms      7.5 ms
+#   32,256,768          1.71     12.1 ms     13.8 ms
+#   32,384,1024         5.13     27.3 ms     20.5 ms
+#   48,384,1152         8.50     61.9 ms     39.4 ms
+#   64,448,1536        26.6     207 ms      118 ms
+#   96,672,2304        66.9     63.0 s      0.69 s
+#
+# The crossover sits between 1.7 and 5.1 row GFLOP; `_PAIR_SYM_MIN_ROW_FLOP`
+# takes 3e9. TRNBLAS_PAIR_ENERGY overrides: auto | sym | aten | legacy (the
+# full-batch / chunked kernels).
+_PAIR_ENERGY_CHOICES = ("auto", "sym", "aten", "legacy")
+_PAIR_SYM_MIN_ROW_FLOP = 3.0e9
+# SBUF bytes per partition the kernel keeps live: B[i].T and B[j].T
+# (NK * NVIR each) plus the T strip block (NA * NVIR), all fp32. trn2 has
+# 192 KiB per partition; leave room for the compiler's temporaries.
+_PAIR_SYM_SBUF_BUDGET = 144 * 1024
+
+
+def _pair_sym_dims(nocc: int, nvir: int, naux: int) -> dict:
+    """Padded sizes, j-window length and per-d weights for `_pair_energy_sym_kernel`.
+
+    Row i takes j = i + d (mod nocc) for d = 0..nocc//2, so every unordered
+    pair {i, j} is visited by exactly one (i, d) — twice for d = nocc/2 when
+    nocc is even. e_ij = e_ji, so off-diagonal d get weight 2 except that
+    doubled d, which gets 1. The window is padded to an even length (one j
+    per LNC=2 program) with weight-0 entries.
+    """
+    nvir_pad = _round_up(nvir, 128)
+    naux_pad = _round_up(naux, 128)
+    half = nocc // 2
+    nd = half + 1
+    nd_pad = nd + (nd % 2)
+    weights = [2.0] * nd_pad
+    weights[0] = 1.0
+    if half > 0 and nocc % 2 == 0:
+        weights[half] = 1.0
+    for d in range(nd, nd_pad):
+        weights[d] = 0.0
+    na, nk = nvir_pad // 128, naux_pad // 128
+    sbuf_bytes = 4 * nvir_pad * (2 * nk + na)
+    return dict(
+        nvir_pad=nvir_pad,
+        naux_pad=naux_pad,
+        nd_pad=nd_pad,
+        weights=weights,
+        sbuf_bytes=sbuf_bytes,
+        row_flop=2.0 * nd * nvir_pad * nvir_pad * naux_pad,
+    )
+
+
+def _pair_energy_route(B: torch.Tensor) -> str:
+    """'sym', 'aten' or 'legacy' for `nki_batched_pair_energy` on these inputs."""
+    choice = os.environ.get("TRNBLAS_PAIR_ENERGY", "auto").strip().lower()
+    if choice not in _PAIR_ENERGY_CHOICES:
+        raise ValueError(
+            f"TRNBLAS_PAIR_ENERGY must be one of {_PAIR_ENERGY_CHOICES}; got {choice!r}"
+        )
+    if _use_simulator() or not _on_neuron_device(B) or _get_dispatch_path() != "native":
+        return "legacy"
+    if choice != "auto":
+        return choice
+    dims = _pair_sym_dims(*B.shape)
+    if dims["sbuf_bytes"] > _PAIR_SYM_SBUF_BUDGET:
+        return "aten"
+    return "sym" if dims["row_flop"] >= _PAIR_SYM_MIN_ROW_FLOP else "aten"
+
+
+def _torch_chunked_pair_energy(
+    B: torch.Tensor,
+    eps_occ: torch.Tensor,
+    eps_vir: torch.Tensor,
+    mem_budget_bytes: int = 1_500_000_000,
+) -> torch.Tensor:
+    """MP2 energy as chunked GEMM + torch reduction (the aten path).
+
+    T_chunk = B[i_chunk] @ B_flat.T, then sum T * (2T - T^T) / denom, with the
+    i chunk sized so one T_chunk stays under `mem_budget_bytes`.
+    """
+    nocc, nvir, naux = B.shape
+    i_block = max(1, min(nocc, int(mem_budget_bytes // (4 * nvir * nocc * nvir))))
+    B_flat = B.reshape(nocc * nvir, naux)
+    eps_o_pair = eps_occ.view(nocc, 1, 1, 1) + eps_occ.view(1, nocc, 1, 1)
+    eps_v_pair = eps_vir.view(1, 1, nvir, 1) + eps_vir.view(1, 1, 1, nvir)
+    e = torch.zeros((), dtype=B.dtype, device=B.device)
+    for i0 in range(0, nocc, i_block):
+        i1 = min(i0 + i_block, nocc)
+        T = (B_flat[i0 * nvir : i1 * nvir] @ B_flat.T).reshape(i1 - i0, nvir, nocc, nvir)
+        T = T.permute(0, 2, 1, 3)
+        e = e + (T * (2.0 * T - T.transpose(-2, -1)) / (eps_o_pair[i0:i1] - eps_v_pair)).sum()
+    return e
+
+
+def _pair_sym_feeds(B: torch.Tensor, eps_occ: torch.Tensor, eps_vir: torch.Tensor, dims: dict):
+    """Device operands for `_pair_energy_sym_kernel`: B[j].T stacked twice (so each
+    row's j window is a contiguous slice), the matching eps window row, and the
+    padded eps_vir column/row."""
+    nocc, nvir, naux = B.shape
+    nv, na = dims["nvir_pad"], dims["naux_pad"]
+    if (nv, na) != (nvir, naux):
+        Bp = torch.zeros(nocc, nv, na, dtype=B.dtype, device=B.device)
+        Bp[:, :nvir, :naux] = B
+    else:
+        Bp = B
+    Bt = Bp.permute(0, 2, 1).contiguous()  # (nocc, naux_pad, nvir_pad)
+    Bx = torch.cat([Bt, Bt], dim=0)
+    eo = eps_occ.reshape(1, nocc).to(B.dtype)
+    ex = torch.cat([eo, eo], dim=1)
+    ev = torch.zeros(nv, dtype=B.dtype, device=B.device)
+    ev[:nvir] = eps_vir
+    return Bt, Bx, eo, ex, ev.reshape(nv, 1).contiguous(), ev.reshape(1, nv).contiguous()
+
+
+def _pair_sym_reference(B: torch.Tensor, eps_occ: torch.Tensor, eps_vir: torch.Tensor):
+    """Torch emulation of the sym kernel's (i, d) walk and weights (for CPU tests)."""
+    nocc = B.shape[0]
+    dims = _pair_sym_dims(*B.shape)
+    Bt, Bx, eo, ex, evc, evr = _pair_sym_feeds(B, eps_occ, eps_vir, dims)
+    nd_pad = dims["nd_pad"]
+    w = torch.tensor(dims["weights"], dtype=torch.float64)
+    total = torch.zeros((), dtype=torch.float64)
+    for i in range(nocc):
+        for d in range(nd_pad):
+            bi, bj = Bt[i].double(), Bx[i + d].double()
+            T = bi.T @ bj
+            denom = float(eo[0, i]) + float(ex[0, i + d]) - evc.double() - evr.double()
+            total = total + w[d] * (T * (2.0 * T - T.T) / denom).sum()
+    return total
+
+
+def _nki_pair_energy_sym_impl(
+    B: torch.Tensor, eps_occ: torch.Tensor, eps_vir: torch.Tensor
+) -> torch.Tensor:
+    if not HAS_NKI:
+        raise RuntimeError("NKI not available")
+    nocc = B.shape[0]
+    dims = _pair_sym_dims(*B.shape)
+    if dims["sbuf_bytes"] > _PAIR_SYM_SBUF_BUDGET:
+        raise ValueError(
+            f"pair_energy_sym needs {dims['sbuf_bytes']} SBUF bytes per partition "
+            f"(budget {_PAIR_SYM_SBUF_BUDGET}) for B of shape {tuple(B.shape)}"
+        )
+    Bt, Bx, eo, ex, evc, evr = _pair_sym_feeds(B, eps_occ, eps_vir, dims)
+    nd_pad = dims["nd_pad"]
+    op = _get_native_ops()["pair_energy_sym"]
+    acc = None
+    for i in range(nocc):
+        p = op(
+            Bt[i],
+            Bx[i : i + nd_pad],
+            eo[:, i : i + 1],
+            ex[:, i : i + nd_pad].contiguous(),
+            evc,
+            evr,
+        )
+        acc = p if acc is None else acc + p
+    w = torch.tensor(dims["weights"], dtype=acc.dtype).to(acc.device)
+    return (acc.sum(0) * w).sum()
 
 
 def _nki_batched_pair_energy_impl(
@@ -2177,4 +2399,101 @@ if HAS_NKI:
             acc_j[0:TILE, j : j + 1] = pair_energy
 
         nl.store(e_partial[0:TILE, 0:NOCC], value=acc_j)
+        return e_partial
+
+    @nki.jit
+    def _pair_energy_sym_kernel(bt_i, Bw, eps_occ_i, eps_occ_w, eps_vir_col, eps_vir_row):
+        """DF-MP2 pair energies for one occupied row i over a window of j (native, LNC=2).
+
+        Launched as ``_pair_energy_sym_kernel[2](...)``: the two programs are the
+        two physical cores of a Trn2 LNC=2 logical core, each taking half of the
+        j window. The standalone GEMM kernels above run as one program, which is
+        most of why aten `matmul` (which uses both cores) beats them.
+
+        bt_i:        (NAUX, NVIR) = B[i].T, so Tensor Engine operands are plain
+                     loads (no DMA transposes). Loaded into SBUF once per launch.
+        Bw:          (ND, NAUX, NVIR) j window, B[j].T for j = i + d (mod nocc),
+                     d = 0..ND-1. ND is even. Each B[j].T is loaded into SBUF once.
+        eps_occ_i:   (1, 1). eps_occ_w: (1, ND), eps for the window.
+        eps_vir_col: (NVIR, 1); eps_vir_row: (1, NVIR).
+        NAUX and NVIR are multiples of 128 (zero padded by the host).
+
+        Per pair, one GEMM fills T = B[i] B[j].T (NVIR x NVIR) in SBUF a 128-row
+        strip at a time (fresh PSUM tile per output block, accumulate over K).
+        T.T blocks come from Tensor Engine transposes of the SBUF-resident T, so
+        the second GEMM of `_batched_pair_kernel` is gone. Returns per-partition
+        partials (128, ND); the host weights each d (pair symmetry e_ij = e_ji)
+        and sums.
+        """
+        ND = Bw.shape[0]
+        NAUX = Bw.shape[1]
+        NVIR = Bw.shape[2]
+        TILE = 128
+        TN = 512 if NVIR % 512 == 0 else 128
+        NA = NVIR // TILE
+        NB = NVIR // TN
+        NK = NAUX // TILE
+        pid = nl.program_id(0)
+        NJ = ND // 2
+        e_partial = nl.ndarray((TILE, ND), dtype=nl.float32, buffer=nl.shared_hbm)
+        eps_i = nl.load(eps_occ_i[0:1, 0:1])
+        ev_row = nl.load(eps_vir_row[0:1, 0:NVIR])
+        bi_sb = nl.ndarray((TILE, NK * NVIR), dtype=nl.float32, buffer=nl.sbuf)
+        for k in nl.affine_range(NK):
+            bi_sb[0:TILE, k * NVIR : (k + 1) * NVIR] = nl.load(
+                bt_i[k * TILE : (k + 1) * TILE, 0:NVIR]
+            )
+        acc_j = nl.zeros((TILE, NJ), dtype=nl.float32, buffer=nl.sbuf)
+        for jj in nl.affine_range(NJ):
+            j = pid * NJ + jj
+            eps_j = nl.load(eps_occ_w[0:1, j : j + 1])
+            eo = nl.add(eps_i, eps_j)
+            bj_sb = nl.ndarray((TILE, NK * NVIR), dtype=nl.float32, buffer=nl.sbuf)
+            for k in nl.affine_range(NK):
+                bj_sb[0:TILE, k * NVIR : (k + 1) * NVIR] = nl.load(
+                    Bw[j, k * TILE : (k + 1) * TILE, 0:NVIR]
+                )
+            t_all = nl.ndarray((TILE, NA * NVIR), dtype=nl.float32, buffer=nl.sbuf)
+            for a in nl.affine_range(NA):
+                a_off = a * TILE
+                for b in nl.affine_range(NB):
+                    b_off = b * TN
+                    pt = nl.zeros((TILE, TN), dtype=nl.float32, buffer=nl.psum)
+                    for k in nl.affine_range(NK):
+                        nisa.nc_matmul(
+                            dst=pt,
+                            stationary=bi_sb[0:TILE, k * NVIR + a_off : k * NVIR + a_off + TILE],
+                            moving=bj_sb[0:TILE, k * NVIR + b_off : k * NVIR + b_off + TN],
+                            accumulate=True,
+                        )
+                    nisa.tensor_copy(
+                        src=pt, dst=t_all[0:TILE, a * NVIR + b_off : a * NVIR + b_off + TN]
+                    )
+            acc_ab = nl.zeros((TILE, NA * NA), dtype=nl.float32, buffer=nl.sbuf)
+            for a in nl.affine_range(NA):
+                a_off = a * TILE
+                ev_a = nl.load(eps_vir_col[a_off : a_off + TILE, 0:1])
+                for b in nl.affine_range(NA):
+                    b_off = b * TILE
+                    # T.T[a-strip, b-strip] = (T[b-strip, a-strip]).T
+                    ptt = nl.ndarray((TILE, TILE), dtype=nl.float32, buffer=nl.psum)
+                    nisa.nc_transpose(
+                        dst=ptt, data=t_all[0:TILE, b * NVIR + a_off : b * NVIR + a_off + TILE]
+                    )
+                    tt = nl.ndarray((TILE, TILE), dtype=nl.float32, buffer=nl.sbuf)
+                    nisa.tensor_copy(src=ptt, dst=tt)
+                    t = t_all[0:TILE, a * NVIR + b_off : a * NVIR + b_off + TILE]
+                    denom = nl.subtract(
+                        nl.subtract(
+                            nl.broadcast_to(eo, (TILE, TILE)), nl.broadcast_to(ev_a, (TILE, TILE))
+                        ),
+                        nl.broadcast_to(ev_row[0:1, b_off : b_off + TILE], (TILE, TILE)),
+                    )
+                    num = nl.multiply(t, nl.subtract(nl.multiply(t, 2.0), tt))
+                    term = nl.multiply(num, nl.reciprocal(denom))
+                    acc_ab[0:TILE, a * NA + b : a * NA + b + 1] = nl.sum(
+                        term, axis=1, keepdims=True
+                    )
+            acc_j[0:TILE, jj : jj + 1] = nl.sum(acc_ab, axis=1, keepdims=True)
+        nl.store(e_partial[0:TILE, pid * NJ : pid * NJ + NJ], value=acc_j)
         return e_partial

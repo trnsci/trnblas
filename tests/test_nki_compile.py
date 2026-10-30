@@ -71,6 +71,19 @@ def _j_batched_inputs():
     )
 
 
+def _pair_sym_inputs():
+    nd = 4
+    ev_col, ev_row = _eps_vir(256)
+    return (
+        _f32(256, 256),
+        _f32(nd, 256, 256),
+        np.full((1, 1), -0.5, np.float32),
+        np.full((1, nd), -0.5, np.float32),
+        ev_col,
+        ev_row,
+    )
+
+
 # kernel id -> (kernel lookup on dispatch, example inputs matching the host wrappers)
 _KERNELS = {
     **{
@@ -88,7 +101,12 @@ _KERNELS = {
     "fused_gemm_energy": (lambda d: d._fused_gemm_energy_kernel, _fused_inputs),
     "batched_pair": (lambda d: d._batched_pair_kernel, _batched_pair_inputs),
     "j_batched": (lambda d: d._j_batched_kernel, _j_batched_inputs),
+    "pair_energy_sym": (lambda d: d._pair_energy_sym_kernel, _pair_sym_inputs),
 }
+
+# Kernels launched as an LNC=2 grid (one program per physical core): verified
+# with lnc=2 on trn2 only, which is the only target they are dispatched on.
+_LNC2 = {"pair_energy_sym"}
 
 
 @pytest.fixture(autouse=True)
@@ -105,8 +123,15 @@ def test_kernel_mlir_verifies(kernel_id, target):
     from trnblas.nki import dispatch
 
     get_kernel, make_inputs = _KERNELS[kernel_id]
+    lnc = 2 if kernel_id in _LNC2 else 1
+    if lnc == 2 and target != "trn2":
+        pytest.skip("LNC=2 kernels are native-path (Trn2) only")
     result = source_to_mlir(
-        get_kernel(dispatch), *make_inputs(), target=target, frontend=FrontendKind.TRACER
+        get_kernel(dispatch),
+        *make_inputs(),
+        target=target,
+        lnc=lnc,
+        frontend=FrontendKind.TRACER,
     )
     result.verify()
 

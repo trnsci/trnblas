@@ -125,6 +125,8 @@ pytest tests/ -v
 | `TRNSCI_NKI_DISPATCH=auto\|native\|xla` | Suite-wide. Forces the native or XLA dispatch path; `auto` (default) detects. Forcing an unavailable path raises. |
 | `TRNSCI_XLA_DEPRECATION=1` | Suite-wide, off by default. The XLA path emits one `DeprecationWarning`. |
 | `TRNBLAS_BATCHED_PAIR_CHUNK_THRESHOLD=<n>` | Overrides the batched-pair full-batch vs chunked routing threshold (default 4096 on XLA, 3072 on native). For re-benchmarking. |
+| `TRNBLAS_NATIVE_GEMM=auto\|nki` | Native path only. `auto` (default): `gemm` / `batched_gemm` / `syrk` / `trsm` updates on tensors already on the `neuron` device run as aten `matmul`, which is faster there. `nki` forces the NKI GEMM kernels. |
+| `TRNBLAS_PAIR_ENERGY=auto\|sym\|aten\|legacy` | Native path, device-resident inputs only. Picks the `nki_batched_pair_energy` implementation: the LNC=2 symmetric kernel, aten (chunked GEMM + reduction), or the full-batch / chunked kernels. `auto` takes `sym` above 3 GFLOP per row launch. |
 | `NKI_ENABLE_TRACE_CACHE=0` | TorchNeuron (not trnblas) setting. Turns off the cross-process NKI kernel cache, which cannot version editable installs. |
 
 ## Requirements

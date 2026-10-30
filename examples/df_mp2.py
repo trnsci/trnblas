@@ -28,6 +28,21 @@ import torch
 import trnblas
 
 
+def _sync(device: torch.device) -> None:
+    """Wait for queued device work so per-stage timings are honest.
+
+    Eager launches on the native `neuron` device (and on CUDA) are
+    asynchronous; without a fence each stage's timer would only measure
+    the enqueue and the final `float()` would absorb everything.
+    """
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    elif device.type == "neuron":
+        from trnblas.nki.dispatch import _device_synchronize
+
+        _device_synchronize()
+
+
 def _bcast(M: torch.Tensor, batch: int) -> torch.Tensor:
     """Materialise a per-batch copy of a 2D matrix as a (batch, *, *) tensor."""
     return M.unsqueeze(0).expand(batch, *M.shape).contiguous()
@@ -167,6 +182,8 @@ def df_mp2_energy(
         uplo="lower",
         trans=True,
     )
+    if timings is not None:
+        _sync(C_occ.device)
     t_chol = time.perf_counter() - t0
 
     # Step 2: Half-transform (μν|P) → (ia|P)
@@ -181,12 +198,16 @@ def df_mp2_energy(
     #     C_vir.T broadcast across batch=nocc; iv_P is already (nocc, nbasis, naux).
     C_vir_T_b = _bcast(C_vir.T, nocc)  # (nocc, nvir, nbasis)
     ia_P = trnblas.batched_gemm(1.0, C_vir_T_b, iv_P)  # (nocc, nvir, naux)
+    if timings is not None:
+        _sync(C_occ.device)
     t_half = time.perf_counter() - t0
 
     # Step 3: Metric contraction B[i] = ia_P[i] @ J_inv_half — one batched GEMM.
     t0 = time.perf_counter()
     J_b = _bcast(J_inv_half, nocc)  # (nocc, naux, naux)
     B = trnblas.batched_gemm(1.0, ia_P, J_b)  # (nocc, nvir, naux)
+    if timings is not None:
+        _sync(C_occ.device)
     t_metric = time.perf_counter() - t0
 
     # Step 4: Energy.
