@@ -163,6 +163,39 @@ Each i-dispatch is ~24 ms (XLA overhead + ~1 ms Tensor Engine execution), so
 The full-batch kernel's 18 GB XLA graph is replaced by 64 × ~1.4 GB graphs that
 compile and cache normally.
 
+## DF-MP2 end-to-end on Trn2 (native TorchNeuron): NKI vs aten vs CPU
+
+trn2.3xlarge, SDK 2.33 (torch-neuronx 2.14, NKI 0.7), one LNC=2 logical core,
+fp32, warm median (the first rep compiles). CPU is `set_backend("pytorch")` on
+**2 host threads** (`OMP_NUM_THREADS=2`, `taskset -c 4,5`), so it is a floor for
+the box rather than a CPU-node baseline. "aten" is the same algorithm with
+`set_backend("pytorch")` on `neuron`-device tensors. "NKI" is
+`set_backend("nki")`, device-resident inputs, `--energy pair`. Reproduce with
+`scripts/bench_df_mp2_paths.py` (PySCF RHF + DF, weigend aux unless "RI" =
+cc-pVTZ-RI). aten and NKI after the change were measured in the same session.
+
+| molecule / basis | nbasis/nocc/naux | CPU | aten | NKI before | NKI after |
+|---|---|---|---|---|---|
+| H₂O / cc-pVDZ | 24/5/71 | 0.3 ms | 16.9 ms | 15.2 ms | 8.9 ms |
+| CH₄ / cc-pVTZ | 86/5/93 | 1.2 ms | 8.3 ms | 22.2 ms | 8.2 ms |
+| glycine / cc-pVDZ | 95/20/300 | 66 ms | 29.8 ms | 27.3 ms | 15.7 ms |
+| glycine / cc-pVTZ | 220/20/300 | 220 ms | 15.0 ms | 61.8 ms | 19.7 ms |
+| glycine / cc-pVTZ, RI | 220/20/555 | 223 ms | 28.8 ms | 93.1 ms | 23.1 ms |
+| (H₂O)₃ / cc-pVTZ, RI | 174/15/423 | 84 ms | 19.8 ms | 48.8 ms | 20.5 ms |
+| synthetic | 512/64/1536 | 18.4 s | 303 ms | 8.0 s | 226 ms |
+
+- Below about nbasis 100 with nocc 5, the CPU wins: the whole calculation
+  takes about 1 ms or less there, and any device path costs 5–10 ms of fixed overhead.
+- On the real molecules, the NKI path after this change runs the same aten
+  GEMMs as the aten path, and every energy step there is below the
+  sym-kernel crossover. The two match within run-to-run noise, which comes
+  almost entirely from the Cholesky + TRSM stage (5–26 ms on the device).
+- At 512/64/1536, `pair_energy_sym` takes the energy step from 207 ms (aten)
+  to 120 ms, which is 1.34× end to end. At 96/672/2304 the energy step alone
+  drops from 63 s (aten chunked reduction) to 0.69 s.
+- Host-resident inputs (the old `df_mp2_pyscf.py` default) cost 2–5× end to
+  end: every NKI launch copies its operands over and back.
+
 ## DF-MP2 end-to-end — Trainium1 vs NVIDIA A10G
 
 Synthetic inputs, same seed, same three shapes on both platforms.

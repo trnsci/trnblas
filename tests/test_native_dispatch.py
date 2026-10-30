@@ -30,6 +30,7 @@ EXPECTED_OPS = GEMM_OPS | {
     "fused_gemm_energy",
     "batched_pair",
     "j_batched",
+    "pair_energy_sym",
 }
 
 
@@ -42,6 +43,8 @@ def reset_dispatch_state(monkeypatch):
     monkeypatch.delenv("TRNSCI_NKI_DISPATCH", raising=False)
     monkeypatch.delenv("TRNSCI_XLA_DEPRECATION", raising=False)
     monkeypatch.delenv("TRNBLAS_BATCHED_PAIR_CHUNK_THRESHOLD", raising=False)
+    monkeypatch.delenv("TRNBLAS_PAIR_ENERGY", raising=False)
+    monkeypatch.delenv("TRNBLAS_NATIVE_GEMM", raising=False)
     # Drop any `_native` left by an earlier test so registration re-runs.
     monkeypatch.delitem(sys.modules, "trnblas.nki._native", raising=False)
     monkeypatch.delattr(trnblas.nki, "_native", raising=False)
@@ -357,6 +360,9 @@ def native_stub(monkeypatch):
     ops["j_batched"] = rec(
         "j_batched", lambda bi, B, eoi, eor, vc, vr: torch.zeros(pair, B.shape[0])
     )
+    ops["pair_energy_sym"] = rec(
+        "pair_energy_sym", lambda bi, Bw, eoi, eow, vc, vr: torch.zeros(pair, Bw.shape[0])
+    )
     assert set(ops) == EXPECTED_OPS
     monkeypatch.setattr(dispatch, "_native_ops", ops)
     return calls
@@ -562,6 +568,127 @@ class TestLazyRegistration:
         assert fake("batched_pair")(
             meta(5, 128, 256), meta(1, 5), meta(128, 1), meta(1, 128)
         ).shape == (128, 25)
+        assert fake("pair_energy_sym")(
+            meta(256, 128), meta(4, 256, 128), meta(1, 1), meta(1, 4), meta(128, 1), meta(1, 128)
+        ).shape == (128, 4)
         assert fake("j_batched")(
             meta(128, 256), meta(4, 128, 256), meta(1, 1), meta(1, 4), meta(128, 1), meta(1, 128)
         ).shape == (128, 4)
+
+
+class TestNativeGemmPolicy:
+    """Plain GEMM-family calls on device-resident operands route to aten (native path).
+
+    CPU tensors stand in for `neuron` tensors by patching `_on_neuron_device`.
+    """
+
+    @pytest.fixture
+    def nki_backend(self, monkeypatch):
+        monkeypatch.setattr(dispatch, "HAS_NKI", True)
+        monkeypatch.setattr(dispatch, "_backend", "nki")
+        monkeypatch.setattr(dispatch, "_use_simulator", lambda: False)
+        monkeypatch.delenv("TRNBLAS_NATIVE_GEMM", raising=False)
+
+        def boom(*a, **k):
+            raise AssertionError("NKI GEMM kernel launched")
+
+        monkeypatch.setattr(dispatch, "_nki_gemm_impl", boom)
+        monkeypatch.setattr(dispatch, "_nki_syrk_impl", boom)
+
+    def test_device_resident_goes_to_aten(self, monkeypatch, nki_backend):
+        monkeypatch.setattr(dispatch, "_on_neuron_device", lambda *t: True)
+        A, B = torch.randn(7, 5), torch.randn(5, 3)
+        torch.testing.assert_close(dispatch.nki_gemm(A, B), A @ B)
+        torch.testing.assert_close(dispatch.nki_syrk(A), A @ A.T)
+        Ab, Bb = torch.randn(4, 7, 5), torch.randn(4, 5, 3)
+        torch.testing.assert_close(dispatch.nki_batched_gemm(Ab, Bb), torch.bmm(Ab, Bb))
+        L = torch.tril(torch.randn(300, 300)) + 300 * torch.eye(300)
+        X = dispatch.nki_trsm(L, torch.eye(300), uplo="lower", trans=True)
+        torch.testing.assert_close(L.T @ X, torch.eye(300), atol=1e-5, rtol=0)
+
+    def test_host_tensors_keep_nki(self, monkeypatch, nki_backend):
+        monkeypatch.setattr(dispatch, "_on_neuron_device", lambda *t: False)
+        with pytest.raises(AssertionError, match="NKI GEMM kernel launched"):
+            dispatch.nki_gemm(torch.randn(4, 4), torch.randn(4, 4))
+
+    def test_env_nki_forces_kernel(self, monkeypatch, nki_backend):
+        monkeypatch.setattr(dispatch, "_on_neuron_device", lambda *t: True)
+        monkeypatch.setenv("TRNBLAS_NATIVE_GEMM", "nki")
+        with pytest.raises(AssertionError, match="NKI GEMM kernel launched"):
+            dispatch.nki_gemm(torch.randn(4, 4), torch.randn(4, 4))
+
+    def test_env_rejects_unknown(self, monkeypatch, nki_backend):
+        monkeypatch.setattr(dispatch, "_on_neuron_device", lambda *t: True)
+        monkeypatch.setenv("TRNBLAS_NATIVE_GEMM", "fast")
+        with pytest.raises(ValueError, match="TRNBLAS_NATIVE_GEMM"):
+            dispatch.nki_gemm(torch.randn(4, 4), torch.randn(4, 4))
+
+    def test_simulator_keeps_nki(self, monkeypatch, nki_backend):
+        monkeypatch.setattr(dispatch, "_on_neuron_device", lambda *t: True)
+        monkeypatch.setattr(dispatch, "_use_simulator", lambda: True)
+        assert not dispatch._gemm_via_aten(torch.randn(2, 2))
+
+
+class TestPairEnergySym:
+    """Host-side logic of the native LNC=2 symmetric pair-energy kernel."""
+
+    @pytest.mark.parametrize("nocc", range(1, 10))
+    def test_window_weights_cover_every_ordered_pair_once(self, nocc):
+        dims = dispatch._pair_sym_dims(nocc, 128, 128)
+        cover = torch.zeros(nocc, nocc, dtype=torch.float64)
+        for i in range(nocc):
+            for d, w in enumerate(dims["weights"]):
+                j = (i + d) % nocc
+                cover[i, j] += w / 2
+                cover[j, i] += w / 2
+        torch.testing.assert_close(cover, torch.ones(nocc, nocc, dtype=torch.float64))
+        assert dims["nd_pad"] % 2 == 0
+
+    @pytest.mark.parametrize("shape", [(1, 3, 5), (2, 7, 9), (5, 19, 71), (4, 130, 129)])
+    def test_reference_walk_matches_pair_loop(self, shape):
+        g = torch.Generator().manual_seed(0)
+        nocc, nvir, naux = shape
+        B = 0.1 * torch.randn(nocc, nvir, naux, generator=g)
+        eo = -0.5 - torch.rand(nocc, generator=g)
+        ev = 0.2 + torch.rand(nvir, generator=g)
+        ref = dispatch._torch_batched_pair_energy(B.double(), eo.double(), ev.double())
+        got = dispatch._pair_sym_reference(B, eo, ev)
+        torch.testing.assert_close(got, ref, rtol=1e-5, atol=0)
+
+    def test_chunked_aten_energy_matches_pair_loop(self):
+        g = torch.Generator().manual_seed(1)
+        B = 0.1 * torch.randn(6, 11, 17, generator=g, dtype=torch.float64)
+        eo = -0.5 - torch.rand(6, generator=g, dtype=torch.float64)
+        ev = 0.2 + torch.rand(11, generator=g, dtype=torch.float64)
+        ref = dispatch._torch_batched_pair_energy(B, eo, ev)
+        # A budget of two i-rows forces three chunks.
+        got = dispatch._torch_chunked_pair_energy(B, eo, ev, mem_budget_bytes=2 * 4 * 11 * 6 * 11)
+        torch.testing.assert_close(got, ref)
+
+    @pytest.fixture
+    def native_device(self, monkeypatch):
+        monkeypatch.setattr(dispatch, "_use_simulator", lambda: False)
+        monkeypatch.setattr(dispatch, "_on_neuron_device", lambda *t: True)
+        monkeypatch.setattr(dispatch, "_dispatch_path", "native")
+
+    def test_route_by_work(self, native_device):
+        assert dispatch._pair_energy_route(torch.empty(20, 200, 555)) == "aten"
+        assert dispatch._pair_energy_route(torch.empty(64, 448, 1536)) == "sym"
+
+    def test_route_aten_when_sbuf_too_small(self, native_device):
+        # nvir_pad 1024, naux_pad 4096: 4 * 1024 * (2 * 32 + 8) bytes per partition.
+        assert dispatch._pair_energy_route(torch.empty(64, 1000, 4000)) == "aten"
+
+    def test_route_env_override(self, native_device, monkeypatch):
+        monkeypatch.setenv("TRNBLAS_PAIR_ENERGY", "legacy")
+        assert dispatch._pair_energy_route(torch.empty(64, 448, 1536)) == "legacy"
+        monkeypatch.setenv("TRNBLAS_PAIR_ENERGY", "sym")
+        assert dispatch._pair_energy_route(torch.empty(2, 8, 8)) == "sym"
+        monkeypatch.setenv("TRNBLAS_PAIR_ENERGY", "bogus")
+        with pytest.raises(ValueError, match="TRNBLAS_PAIR_ENERGY"):
+            dispatch._pair_energy_route(torch.empty(2, 8, 8))
+
+    def test_route_legacy_off_native(self, monkeypatch):
+        monkeypatch.setattr(dispatch, "_use_simulator", lambda: False)
+        monkeypatch.setattr(dispatch, "_on_neuron_device", lambda *t: False)
+        assert dispatch._pair_energy_route(torch.empty(64, 448, 1536)) == "legacy"

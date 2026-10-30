@@ -176,3 +176,52 @@ class TestNativeEnergyKernels:
         e = float(trnblas.nki.nki_mp2_energy(T, eo_c, eo_f, ev))
         ref = float(D._torch_mp2_energy(T.double(), eo_c.double(), eo_f.double(), ev.double()))
         assert e == pytest.approx(ref, rel=1e-4)
+
+
+class TestNativeDevicePolicy:
+    """Device-resident operands: GEMM-family → aten, large pair energy → sym kernel."""
+
+    def test_resident_gemm_skips_nki_kernel(self, require_nki, monkeypatch):
+        monkeypatch.delenv("TRNBLAS_NATIVE_GEMM", raising=False)
+        monkeypatch.setattr(D, "_nki_gemm_impl", lambda *a: pytest.fail("NKI GEMM launched"))
+        A, B = _host(300, 200), _host(200, 600, seed=1)
+        C = trnblas.gemm(1.0, A.to(DEV), B.to(DEV))
+        assert C.device.type == "neuron"
+        assert _rel(C.cpu(), A.double() @ B.double()) < 1e-5
+
+    def test_resident_gemm_env_nki_runs_kernel(self, require_nki, monkeypatch):
+        monkeypatch.setenv("TRNBLAS_NATIVE_GEMM", "nki")
+        called = []
+        real = D._nki_gemm_impl
+        monkeypatch.setattr(D, "_nki_gemm_impl", lambda *a: called.append(1) or real(*a))
+        A, B = _host(300, 200), _host(200, 600, seed=1)
+        C = trnblas.gemm(1.0, A.to(DEV), B.to(DEV))
+        assert called == [1]
+        assert _rel(C.cpu(), A.double() @ B.double()) < 1e-5
+
+    @pytest.mark.parametrize(
+        "nocc,nvir,naux", [(1, 19, 71), (2, 128, 128), (5, 19, 71), (4, 130, 129), (7, 256, 384)]
+    )
+    def test_pair_energy_sym_kernel(self, require_nki, monkeypatch, nocc, nvir, naux):
+        monkeypatch.setenv("TRNBLAS_PAIR_ENERGY", "sym")
+        B = 0.1 * _host(nocc, nvir, naux)
+        eps_occ = -1.0 - torch.rand(nocc, generator=torch.Generator().manual_seed(2))
+        eps_vir = 0.5 + torch.rand(nvir, generator=torch.Generator().manual_seed(3))
+        called = []
+        real = D._nki_pair_energy_sym_impl
+        monkeypatch.setattr(D, "_nki_pair_energy_sym_impl", lambda *a: called.append(1) or real(*a))
+        e = trnblas.nki.nki_batched_pair_energy(B.to(DEV), eps_occ.to(DEV), eps_vir.to(DEV))
+        assert called == [1]
+        assert float(e) == pytest.approx(_pair_reference(B, eps_occ, eps_vir), rel=1e-5)
+
+    def test_pair_energy_small_resident_goes_to_aten(self, require_nki, monkeypatch):
+        monkeypatch.delenv("TRNBLAS_PAIR_ENERGY", raising=False)
+        monkeypatch.setattr(
+            D, "_nki_pair_energy_sym_impl", lambda *a: pytest.fail("sym kernel below crossover")
+        )
+        nocc, nvir, naux = 5, 19, 71
+        B = 0.1 * _host(nocc, nvir, naux)
+        eps_occ = -1.0 - torch.rand(nocc, generator=torch.Generator().manual_seed(2))
+        eps_vir = 0.5 + torch.rand(nvir, generator=torch.Generator().manual_seed(3))
+        e = trnblas.nki.nki_batched_pair_energy(B.to(DEV), eps_occ.to(DEV), eps_vir.to(DEV))
+        assert float(e) == pytest.approx(_pair_reference(B, eps_occ, eps_vir), rel=1e-5)

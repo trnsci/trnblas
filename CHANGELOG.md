@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+#### Native DF-MP2: aten routing for plain GEMMs, LNC=2 symmetric pair-energy kernel
+
+Measured end to end on trn2 with real molecules (`scripts/bench_df_mp2_paths.py`).
+On the native `neuron` device, aten `matmul` beats the standalone NKI GEMM at
+every shape tried (2.4–3.2×). The NKI GEMM runs as a single program and
+stages A through DMA transposes. In a spike, the same loop launched as an
+LNC=2 grid (one program per physical core) with a pre-transposed A came
+within 8–15% of aten at 2048³ and above, so those two choices account for
+most of the gap.
+
+- **Behaviour change: GEMM-family calls on device-resident operands go to aten
+  on the native path.** `gemm`, `batched_gemm`, `syrk` and the trailing updates
+  in `trsm` call `torch.matmul` when every operand is already on the `neuron`
+  device. Host tensors keep the NKI kernels, and so do the XLA path and the
+  simulator. `TRNBLAS_NATIVE_GEMM=nki` restores the NKI kernels for
+  device-resident operands.
+- **`trnblas::pair_energy_sym`**, a new native-only fused energy kernel. It is
+  launched as an LNC=2 grid (one program per physical core) and reads a
+  pre-transposed B, so its loads are plain DMAs. B[i] and B[j] stay in SBUF.
+  Each pair needs one GEMM, and T^T comes from Tensor Engine transposes of the
+  SBUF-resident T. Pair symmetry (e_ij = e_ji) halves the pair count. It
+  launches once per occupied row, which keeps the trace and compile small
+  (10–45 s instead of 12 min for a single launch). It is 1.75× faster than aten
+  at nocc=64/nvir=448/naux=1536 (118 vs 207 ms), and 92× faster at
+  96/672/2304 (0.69 vs 63 s), where the aten chunked reduction falls off a
+  cliff.
+- **Routing for `nki_batched_pair_energy` on device-resident native inputs:**
+  the sym kernel above 3 GFLOP per launch, otherwise aten (chunked GEMM + torch
+  reduction). Every real molecule measured so far is below that crossover.
+  `TRNBLAS_PAIR_ENERGY=auto|sym|aten|legacy` overrides it. Host inputs, the
+  XLA path and the simulator keep the existing full-batch / chunked kernels.
+- `examples/df_mp2_pyscf.py` gains `--device` (default `auto`: move the
+  integrals to the `neuron` device once on the native path) and
+  `--energy chunk|fused|pair`. `examples/df_mp2.py` synchronizes the device
+  before each stage timer, so per-stage times on `neuron`/CUDA are honest.
+- `scripts/bench_df_mp2_paths.py`: per-stage timings for NKI / aten-on-device /
+  CPU on PySCF molecules and synthetic shapes.
+
 #### Native PyTorch dispatch on TorchNeuron (#50, trnsci/trnsci#35)
 
 On TorchNeuron (Neuron SDK 2.33+, `torch-neuronx` 2.14, PyTorch 2.14,

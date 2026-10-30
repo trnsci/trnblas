@@ -10,6 +10,12 @@ Usage:
     python examples/df_mp2_pyscf.py                      # H2O / STO-3G
     python examples/df_mp2_pyscf.py --mol h2o --basis cc-pvdz
     python examples/df_mp2_pyscf.py --mol ch4 --basis cc-pvdz
+    python examples/df_mp2_pyscf.py --mol glycine --basis cc-pvtz --energy pair
+
+``--device auto`` (the default) moves the integrals to the Trainium ``neuron``
+device once when the native TorchNeuron path is available, so every stage runs
+on device-resident tensors. With host tensors, each NKI launch copies its
+operands to the device and the result back (2-4x slower end to end on trn2).
 """
 
 import argparse
@@ -19,16 +25,41 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from _pyscf_bridge import build_df_mp2_inputs, make_mol, pyscf_reference_energy
+from _pyscf_bridge import _MOLECULES, build_df_mp2_inputs, make_mol, pyscf_reference_energy
 from df_mp2 import df_mp2_energy
+
+_ENERGY_FLAGS = {
+    "chunk": {},
+    "fused": {"use_fused": True},
+    "pair": {"use_batched_pair": True},
+}
+
+
+def _resolve_device(device: str) -> str:
+    if device != "auto":
+        return device
+    try:
+        from trnblas.nki.dispatch import _get_dispatch_path
+
+        return "neuron" if _get_dispatch_path() == "native" else "cpu"
+    except Exception:
+        return "cpu"
 
 
 def main():
 
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mol", default="h2o", choices=["h2o", "ch4", "nh3"])
+    ap.add_argument("--mol", default="h2o", choices=sorted(_MOLECULES))
     ap.add_argument("--basis", default="sto-3g")
     ap.add_argument("--auxbasis", default="weigend")
+    ap.add_argument("--device", default="auto", help="auto (neuron when native), cpu, neuron")
+    ap.add_argument(
+        "--energy",
+        default="chunk",
+        choices=sorted(_ENERGY_FLAGS),
+        help="chunk: GEMM + torch reduction; fused: GEMM + nki_mp2_energy; "
+        "pair: nki_batched_pair_energy",
+    )
     args = ap.parse_args()
 
     mol = make_mol(args.mol, args.basis)
@@ -43,9 +74,14 @@ def main():
     t_build = time.perf_counter() - t0
     print(f"  naux={inputs['J_metric'].shape[0]}  build {t_build:.2f}s")
 
+    device = _resolve_device(args.device)
+    if device != "cpu":
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+    print(f"  device={device}  energy={args.energy}")
+
     timings: dict = {}
     t0 = time.perf_counter()
-    e_trnblas = df_mp2_energy(**inputs, timings=timings)
+    e_trnblas = df_mp2_energy(**inputs, timings=timings, **_ENERGY_FLAGS[args.energy])
     t_trnblas = time.perf_counter() - t0
 
     t0 = time.perf_counter()
