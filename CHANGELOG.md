@@ -60,6 +60,10 @@ Trn2/Trn3), every NKI kernel is now registered as a PyTorch custom op with
 - `scripts/bench_native_dispatch.py`: native re-benchmarks of batched-pair
   full vs chunked and NKI `gemm` vs aten `A @ B`, with host-created inputs.
 
+## [0.6.0] — 2026-10-28
+
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron device) — see trnsci/trnsci#35.
+
 ### Changed
 
 - **Behaviour change: the GEMM tile autotuner is now opt-in (#50).** By default,

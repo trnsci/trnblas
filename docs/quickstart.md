@@ -40,9 +40,9 @@ n = trnblas.nrm2(u)
 ```python
 import trnblas
 
-trnblas.set_backend("auto")     # NKI on Trainium, PyTorch elsewhere (default)
+trnblas.set_backend("auto")  # NKI on Trainium, PyTorch elsewhere (default)
 trnblas.set_backend("pytorch")  # force PyTorch
-trnblas.set_backend("nki")      # force NKI (requires Neuron hardware)
+trnblas.set_backend("nki")  # force NKI (requires Neuron hardware)
 ```
 
 ## DF-MP2 example

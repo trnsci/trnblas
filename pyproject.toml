@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "trnblas"
-version = "0.5.5"
+version = "0.6.0"
 description = "BLAS operations for AWS Trainium via NKI"
 readme = "README.md"
 license = "Apache-2.0"
@@ -47,7 +47,7 @@ torchneuron = [
 ]
 dev = [
     "pre-commit>=4.0",
-    "pytest>=7.0",
+    "pytest>=7.0,<9",  # pytest-benchmark 5.3 breaks on pytest 9 (Function._nodeid)
     "pytest-benchmark>=4.0",
     "pytest-cov>=4.0",
     "ruff>=0.6",
