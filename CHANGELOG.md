@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-10-30
+
+Native TorchNeuron dispatch (Trn2/Trn3) alongside the PyTorch/XLA path (Trn1, maintenance); validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0) — see trnsci/trnsci#35.
+
+Headline performance: native GEMM routes to aten for device-resident operands (2.4–3.2× faster than the NKI GEMM on Trn2), and a new fused LNC=2 `pair_energy_sym` kernel for DF-MP2 (#55).
+
 ### Added
 
 #### Native DF-MP2: metric factor on the host (#50)
