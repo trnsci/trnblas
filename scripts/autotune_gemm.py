@@ -26,7 +26,7 @@ from collections.abc import Callable
 
 import torch
 
-from trnblas.nki.dispatch import _REQUIRE_NKI, HAS_NKI, _round_up, _to_xla
+from trnblas.nki.dispatch import _REQUIRE_NKI, HAS_NKI, _round_up, _to_device
 
 # Tile configurations to sweep. NKI 2.24 limits: partition dim ≤ 128,
 # stationary free dim ≤ 128, moving free dim ≤ 512.
@@ -117,7 +117,7 @@ def measure(
 ) -> tuple[float, float]:
     """Return (cold_seconds, warm_mean_seconds)."""
     A_p, B_p, (M, N) = _pad(A, B, tile_m, tile_k, tile_n)
-    (a, b), orig = _to_xla(A_p, B_p)
+    (a, b), orig = _to_device(A_p, B_p)
 
     # Cold: first invocation triggers NEFF compile (possibly) + run.
     t0 = time.perf_counter()

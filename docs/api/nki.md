@@ -17,12 +17,36 @@ trnblas.set_backend("nki")  # force NKI (requires nki>=0.3.0)
 SDK 2.29+) is importable. trnblas uses the canonical `nki.*`
 namespace directly; the legacy `neuronxcc.nki.*` shim is not used.
 
+## Dispatch path
+
+On Neuron hardware, kernels run on one of two `torch-neuronx` lineages,
+detected on the first kernel launch:
+
+- **Native (TorchNeuron, Trn2/Trn3)**: each kernel is a PyTorch custom op
+  on `device="neuron"`, also callable directly and inside
+  `torch.compile(backend="neuron")`: `torch.ops.trnblas.gemm_ragged`,
+  `gemm_<tm>_<tk>_<tn>` (one per autotune tile config, default
+  `gemm_128_128_512`), `syrk`, `mp2_energy`, `fused_gemm_energy`,
+  `batched_pair`, `j_batched`. TRSM rides the GEMM ops. The ops are
+  registered only once this path is selected.
+- **XLA (Trn1)**: kernels run on the `torch_xla` device, as before.
+
+`set_backend` is unaffected: it still chooses NKI vs PyTorch. On the native
+path `nki_batched_pair_energy` takes the single full-batch kernel
+(`batched_pair`) up to est_iters = nocc² × N_A² × N_K = 3072 and the chunked
+per-i kernel (`j_batched`) above it (XLA: 4096). On trn2 the full-batch kernel
+is 2–11× faster warm, but above 3072 its first-call compile reached 43–178 s,
+against 2–4 s for the chunked kernel.
+See [Installation](../installation.md#two-neuron-pytorch-lineages).
+
 ## Environment variables
 
 | Variable | Effect |
 |---|---|
 | `TRNBLAS_REQUIRE_NKI=1` | Re-raise kernel exceptions instead of falling back to `torch.matmul` — surfaces silent breakage in validation runs. |
 | `TRNBLAS_USE_SIMULATOR=1` | Route kernel dispatch through `nki.simulate(kernel)(numpy_args)` on CPU. Bypasses `torch_xla` + NEFF compile; used for fast correctness iteration. See [docs/developing_kernels.md](../developing_kernels.md). |
+| `TRNSCI_NKI_DISPATCH=auto\|native\|xla` | Suite-wide. Forces the native or XLA dispatch path. |
+| `TRNBLAS_BATCHED_PAIR_CHUNK_THRESHOLD=<n>` | Overrides batched-pair routing (default 4096 on XLA, 3072 on native). |
 
 ## GEMM kernel
 

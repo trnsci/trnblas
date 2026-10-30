@@ -27,7 +27,8 @@ trnblas/
 │   ├── level3.py            # gemm, batched_gemm, symm, syrk, trsm, trmm
 │   └── nki/
 │       ├── __init__.py
-│       └── dispatch.py      # auto/pytorch/nki dispatch + NKI GEMM kernel
+│       ├── dispatch.py      # auto/pytorch/nki dispatch, NKI kernels, native/XLA path selection
+│       └── _native.py       # TorchNeuron custom ops (nki_op), loaded lazily
 ├── tests/
 │   ├── conftest.py          # Fixtures: random matrices, SPD matrices
 │   ├── test_level1.py       # Vector operation tests

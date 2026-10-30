@@ -8,6 +8,7 @@ tile reuse on the Tensor Engine for 2x fewer SBUF loads vs naive.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import warnings
@@ -88,7 +89,26 @@ _TILE_N = 512
 # 786,432 iters (medium, nocc=64) → 18 GB (exceeds available disk).
 # When est_iters = nocc² × N_A² × N_K exceeds this threshold, route to
 # the chunked impl (_j_batched_kernel, Python i-loop, NOCC dispatches).
+#
+# The value is path-aware (see `_batched_pair_chunk_threshold`). XLA keeps
+# 4096. On the native TorchNeuron path (~0.2 ms dispatch floor) the trade is
+# compile time vs warm time, measured on trn2 (SDK 2.33, #52):
+#
+#   nocc,nvir,naux  est_iters  full first/warm    chunked first/warm
+#   4,128,128           16      8.3 s / 0.90 ms    1.5 s / 1.86 ms
+#   16,128,384         768      8.8 s / 2.33 ms    2.1 s / 25.7 ms
+#   32,128,384        3072     35.8 s / 6.67 ms    2.4 s / 71.9 ms
+#   16,256,512        4096     43.2 s / 7.0 ms     4.3 s / 42.3 ms
+#   64,128,128        4096    177.9 s / 21.8 ms    3.2 s / 168.7 ms
+#
+# Full-batch is 2-11x faster warm everywhere, but its compile grows with the
+# trace. Native takes full-batch up to est_iters 3072 (compile <= ~36 s) and the
+# chunked kernel above it, where measured compiles reach 43-178 s. est_iters
+# predicts compile only roughly: both 4096 rows differ 4x, tracking
+# nocc^2 * N_A^2 more than N_K.
+# TRNBLAS_BATCHED_PAIR_CHUNK_THRESHOLD overrides both (for re-benchmarking, #50).
 _BATCHED_PAIR_CHUNK_THRESHOLD = 4096
+_BATCHED_PAIR_CHUNK_THRESHOLD_NATIVE = 3072
 
 # J-sub-chunking: within the chunked impl, `_j_batched_kernel` receives the full
 # B:(nocc × nvir_pad × naux_pad) tensor.  At large shapes (nocc=96, nvir_pad≈768,
@@ -278,10 +298,9 @@ def _nki_mp2_energy_impl(
         )
         partial = torch.from_numpy(np.asarray(partial_np)).to(T_flat.device)
     else:
-        (t, eo_c, eo_f, ev_col, ev_row), orig_device = _to_xla(
-            t_in, eo_c_in, eo_f_in, ev_col_in, ev_row_in
+        partial = _launch(
+            _mp2_energy_kernel, "mp2_energy", t_in, eo_c_in, eo_f_in, ev_col_in, ev_row_in
         )
-        partial = _mp2_energy_kernel(t, eo_c, eo_f, ev_col, ev_row).to(orig_device)
     return partial.sum()
 
 
@@ -454,6 +473,170 @@ def _to_xla(*tensors):
     return [t.to(device) for t in tensors], orig
 
 
+# ── Device dispatch path: native TorchNeuron vs XLA ──────────────────────────
+#
+# Two Neuron PyTorch lineages coexist:
+#   native  torch-neuronx 2.14+ (TorchNeuron, Trn2/Trn3): Trainium is a
+#           PyTorch `neuron` device; kernels are custom ops registered via
+#           `torch_neuronx.nki_op` (see `_native.py`).
+#   xla     torch-neuronx 2.9 lineage (PyTorch/XLA; Trn1 and Inf2 stay
+#           here): kernels dispatch on the torch_xla device via `_to_xla()`.
+# Anything else is "cpu": no device path, so a kernel launch outside the
+# simulator raises (from `_to_xla`) exactly as it did before the native
+# path existed, and the public wrappers fall back to torch as before.
+# Detection runs on the first launch, not at import, and the native probe
+# never imports torch_xla.
+
+_NEURON_DEVICE = "neuron"
+_dispatch_path: str | None = None
+_native_ops: dict | None = None
+_xla_deprecation_warned: bool = False
+
+_XLA_DEPRECATION_MESSAGE = (
+    "the PyTorch/XLA path is deprecated on Trn2/Trn3; use TorchNeuron (native). "
+    "Trn1/Inf2 remain supported in maintenance mode."
+)
+
+
+def _native_available() -> bool:
+    try:
+        import torch_neuronx
+    except Exception:
+        return False
+    # The XLA-lineage torch_neuronx has no `nki_op`.
+    if not hasattr(torch_neuronx, "nki_op"):
+        return False
+    try:
+        torch.device(_NEURON_DEVICE)  # torch_neuronx renames PrivateUse1 to "neuron"
+        return torch_neuronx.device_count() > 0
+    except Exception:
+        return False
+
+
+def _detect_dispatch_path() -> str:
+    # TRNSCI_NKI_DISPATCH=auto|native|xla is shared by every trnsci library, so
+    # one variable pins the whole suite on hosts that have both lineages.
+    forced = os.environ.get("TRNSCI_NKI_DISPATCH", "auto").strip().lower()
+    if forced == "native":
+        if not _native_available():
+            raise RuntimeError(
+                "TRNSCI_NKI_DISPATCH=native, but no TorchNeuron backend with a "
+                "'neuron' device is available"
+            )
+        return "native"
+    if forced == "xla":
+        if importlib.util.find_spec("torch_xla") is None:
+            raise RuntimeError("TRNSCI_NKI_DISPATCH=xla, but torch_xla is not installed")
+        return "xla"
+    if forced != "auto":
+        raise ValueError(f"TRNSCI_NKI_DISPATCH must be auto, native, or xla; got {forced!r}")
+    if _native_available():
+        return "native"
+    if importlib.util.find_spec("torch_xla") is not None:
+        return "xla"
+    return "cpu"
+
+
+def _maybe_warn_xla_deprecated() -> None:
+    """Dormant XLA deprecation hook (trnsci/trnsci#35).
+
+    Off by default; the suite turns it on (TRNSCI_XLA_DEPRECATION=1) when
+    TorchNeuron reaches GA. Emits a single DeprecationWarning per process.
+    """
+    global _xla_deprecation_warned
+    if _xla_deprecation_warned:
+        return
+    if os.environ.get("TRNSCI_XLA_DEPRECATION", "").strip().lower() not in ("1", "true", "yes"):
+        return
+    _xla_deprecation_warned = True
+    warnings.warn(_XLA_DEPRECATION_MESSAGE, DeprecationWarning, stacklevel=3)
+
+
+def _get_dispatch_path() -> str:
+    """Return "native", "xla", or "cpu" (cached after the first call)."""
+    global _dispatch_path
+    if _dispatch_path is None:
+        _dispatch_path = _detect_dispatch_path()
+        if _dispatch_path == "xla":
+            _maybe_warn_xla_deprecated()
+    return _dispatch_path
+
+
+def _get_native_ops() -> dict:
+    """Import `_native` (registering the trnblas:: custom ops) on first use."""
+    global _native_ops
+    if _native_ops is None:
+        from . import _native
+
+        _native_ops = _native.OPS
+    return _native_ops
+
+
+def _to_device(*tensors):
+    """Move tensors to the kernel device for the selected dispatch path.
+
+    Returns ``(device_tensors, orig_device)``. Native: ``device="neuron"``.
+    XLA (and "cpu", which then raises as before): ``_to_xla``, unchanged.
+    """
+    if _get_dispatch_path() == "native":
+        orig = tensors[0].device
+        return [t.to(_NEURON_DEVICE) for t in tensors], orig
+    return _to_xla(*tensors)
+
+
+def _call_kernel(kernel, op_name: str, *device_tensors: torch.Tensor) -> torch.Tensor:
+    """Run one kernel on tensors already on the kernel device (see `_to_device`).
+
+    `op_name` is the `trnblas::<op_name>` custom op used on the native path;
+    the XLA path calls `kernel` directly on torch_xla tensors.
+    """
+    if _get_dispatch_path() == "native":
+        return _get_native_ops()[op_name](*device_tensors)
+    return kernel(*device_tensors)
+
+
+def _launch(kernel, op_name: str, *tensors: torch.Tensor) -> torch.Tensor:
+    """Run one kernel launch on the Neuron device and return the result on
+    the device of the first input. Every host wrapper goes through here (or
+    through `_to_device` + `_call_kernel` when operands stay resident across
+    several launches)."""
+    xs, orig = _to_device(*tensors)
+    return _call_kernel(kernel, op_name, *xs).to(orig)
+
+
+def _device_synchronize() -> None:
+    """Wait for queued native kernels (for timing). No-op on the XLA path,
+    whose sweep timing is unchanged."""
+    if _get_dispatch_path() != "native":
+        return
+    import torch_neuronx
+
+    sync = getattr(torch_neuronx, "synchronize", None)
+    if sync is None:
+        sync = torch_neuronx.neuron.synchronize
+    sync()
+
+
+def _gemm_op_name(tile_m: int, tile_k: int, tile_n: int) -> str:
+    """Native custom-op name for a GEMM tile-config kernel."""
+    return f"gemm_{tile_m}_{tile_k}_{tile_n}"
+
+
+def _batched_pair_chunk_threshold() -> int:
+    """est_iters above which batched-pair takes the chunked kernel (path-aware).
+
+    XLA keeps 4096. Native uses 3072: full-batch is 2-11x faster warm, but
+    above that its first-call compile was 43-178 s on trn2 (see the table at
+    `_BATCHED_PAIR_CHUNK_THRESHOLD`).
+    """
+    env = os.environ.get("TRNBLAS_BATCHED_PAIR_CHUNK_THRESHOLD", "").strip()
+    if env:
+        return int(env)
+    if not _use_simulator() and _get_dispatch_path() == "native":
+        return _BATCHED_PAIR_CHUNK_THRESHOLD_NATIVE
+    return _BATCHED_PAIR_CHUNK_THRESHOLD
+
+
 def _get_gemm_kernel(tile_m: int, tile_k: int, tile_n: int):
     """Return the @nki.jit kernel for the given tile config.
 
@@ -510,11 +693,14 @@ def _save_autotune_cache() -> None:
         pass
 
 
-def _sweep_tile_configs(M_pad: int, K_pad: int, N_pad: int, a_xla, b_xla) -> tuple[int, int, int]:
+def _sweep_tile_configs(M_pad: int, K_pad: int, N_pad: int, a_dev, b_dev) -> tuple[int, int, int]:
     """Time each candidate tile config on hardware; return the fastest.
 
+    ``a_dev`` / ``b_dev`` are already on the kernel device (`_to_device`).
     Skips configs that don't evenly divide the padded shape. Falls back to
-    the default if every candidate errors or gets filtered out.
+    the default if every candidate errors or gets filtered out. On the native
+    path each timing is fenced with a device synchronize (eager launches are
+    asynchronous); the XLA path times exactly as before.
     """
     import time
 
@@ -524,11 +710,14 @@ def _sweep_tile_configs(M_pad: int, K_pad: int, N_pad: int, a_xla, b_xla) -> tup
         if M_pad % tm or K_pad % tk or N_pad % tn:
             continue
         k = _get_gemm_kernel(tm, tk, tn)
+        op_name = _gemm_op_name(tm, tk, tn)
         try:
-            k(a_xla, b_xla)  # warm-up (compile + first run)
+            _call_kernel(k, op_name, a_dev, b_dev)  # warm-up (compile + first run)
+            _device_synchronize()
             t0 = time.perf_counter()
             for _ in range(3):
-                k(a_xla, b_xla)
+                _call_kernel(k, op_name, a_dev, b_dev)
+            _device_synchronize()
             t = (time.perf_counter() - t0) / 3
             if t < best_t:
                 best, best_t = (tm, tk, tn), t
@@ -542,7 +731,7 @@ def _sweep_on_default_pad(
 ) -> tuple[int, int, int]:
     """Pad with default tile sizes to produce aligned sweep inputs, then sweep."""
     A_p, B_p, _ = _pad_gemm_operands(A, B, _TILE_M, _TILE_K, _TILE_N)
-    (a, b), _ = _to_xla(A_p, B_p)
+    (a, b), _ = _to_device(A_p, B_p)
     return _sweep_tile_configs(A_p.shape[0], A_p.shape[1], B_p.shape[1], a, b)
 
 
@@ -693,15 +882,19 @@ def _nki_gemm_impl(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     else:
         tile_m, tile_k, tile_n = _TILE_M, _TILE_K, _TILE_N
 
-    def _run(kernel, A_feed: torch.Tensor, B_feed: torch.Tensor) -> torch.Tensor:
+    def _run(kernel, op_name: str, A_feed: torch.Tensor, B_feed: torch.Tensor) -> torch.Tensor:
         if _use_simulator():
             out_np = nki.simulate(kernel)(A_feed.cpu().numpy(), B_feed.cpu().numpy())
             return torch.from_numpy(np.asarray(out_np)).to(A.device)
-        (a, b), orig_device = _to_xla(A_feed, B_feed)
-        return kernel(a, b).to(orig_device)
+        return _launch(kernel, op_name, A_feed, B_feed)
 
-    def _launch(A_feed: torch.Tensor, B_feed: torch.Tensor) -> torch.Tensor:
-        return _run(_get_gemm_kernel(tile_m, tile_k, tile_n), A_feed, B_feed)
+    def _launch_tiled(A_feed: torch.Tensor, B_feed: torch.Tensor) -> torch.Tensor:
+        return _run(
+            _get_gemm_kernel(tile_m, tile_k, tile_n),
+            _gemm_op_name(tile_m, tile_k, tile_n),
+            A_feed,
+            B_feed,
+        )
 
     # Ragged shapes with the default tiles: the edge tiles are handled in-kernel
     # (#50), so there is no torch pad/slice and no per-shape pad/slice graphs on
@@ -709,14 +902,14 @@ def _nki_gemm_impl(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     aligned = _gemm_padded_shape(M, K, N, tile_m, tile_k, tile_n) == (M, K, N)
     if _RAGGED_ENABLED and not aligned and (tile_m, tile_k, tile_n) == (_TILE_M, _TILE_K, _TILE_N):
         try:
-            return _run(_gemm_kernel_ragged, A.contiguous(), B.contiguous())
+            return _run(_gemm_kernel_ragged, "gemm_ragged", A.contiguous(), B.contiguous())
         except Exception as exc:
             if _REQUIRE_NKI:
                 raise
             _warn_fallback(exc, "ragged GEMM kernel failed — falling back to padded NKI GEMM")
 
     try:
-        return _run_padded_gemm(A, B, _launch, tile_m, tile_k, tile_n)
+        return _run_padded_gemm(A, B, _launch_tiled, tile_m, tile_k, tile_n)
     except Exception as exc:
         if _REQUIRE_NKI:
             raise
@@ -757,6 +950,11 @@ def nki_batched_pair_energy(
     @nki.jit dispatch that computes all orbital-pair energies in one NEFF.
     Eliminates the ~100ms × nocc² Neuron XLA per-dispatch overhead.
 
+    Routing between the full-batch kernel and the chunked per-i kernel is
+    path-aware (`_batched_pair_chunk_threshold`): the native TorchNeuron path
+    switches to the chunked kernel above est_iters 3072 (XLA: 4096), where the
+    full-batch compile becomes prohibitive.
+
     On NKI backend: one `_batched_pair_kernel` call covering all pairs.
     On PyTorch backend (or hardware errors): falls back to the torch
     reference — equivalent result, O(nocc²) Python overhead but no
@@ -794,7 +992,7 @@ def _nki_batched_pair_energy_impl(
     _N_A = _round_up(nvir, 128) // 128
     _N_K = _round_up(naux, 128) // 128
     est_iters = (nocc * nocc) * _N_A * _N_A * _N_K
-    if est_iters > _BATCHED_PAIR_CHUNK_THRESHOLD:
+    if est_iters > _batched_pair_chunk_threshold():
         return _nki_batched_pair_energy_chunked_impl(B, eps_occ, eps_vir)
 
     TILE = 128
@@ -831,13 +1029,14 @@ def _nki_batched_pair_energy_impl(
         )
         partial = torch.from_numpy(np.asarray(partial_np)).to(B.device)
     else:
-        (B_xla, eo_xla, evc_xla, evr_xla), orig = _to_xla(
+        partial = _launch(
+            _batched_pair_kernel,
+            "batched_pair",
             B_feed,
             eps_occ_row,
             ev_col_feed.to(B.device),
             ev_row_feed.to(B.device),
         )
-        partial = _batched_pair_kernel(B_xla, eo_xla, evc_xla, evr_xla).to(orig)
 
     return partial.sum()
 
@@ -962,11 +1161,12 @@ def _nki_batched_pair_energy_chunked_impl(
                     e_total = e_total + float(torch.from_numpy(np.asarray(partial_np)).sum())
         return e_total
 
-    # Hardware: move fixed tensors to XLA once; slice b_i, eo_i, and j-chunks per i.
+    # Hardware: move fixed tensors to the device once; slice b_i, eo_i, and
+    # j-chunks per i on the device (native or XLA, via `_to_device`).
     # When j_chunk_size == nocc: original single-call path (preserves NEFF cache).
     # When j_chunk_size < nocc: j-sub-chunked path; all j-chunks share the same
     # B_j shape → ONE NEFF compile, nocc × (nocc_padded/j_chunk_size) warm dispatches.
-    (B_xla, eo_row_xla, evc_xla, evr_xla), orig = _to_xla(
+    (B_xla, eo_row_xla, evc_xla, evr_xla), orig = _to_device(
         B_feed,
         eps_occ_row,
         ev_col_feed.to(B.device),
@@ -978,15 +1178,24 @@ def _nki_batched_pair_energy_chunked_impl(
         eo_i_xla = eo_row_xla[0:1, i : i + 1]  # (1, 1)
         if j_chunk_size == nocc:
             # Original call signature — no slice, preserves existing NEFF cache.
-            partial = _j_batched_kernel(b_i_xla, B_xla, eo_i_xla, eo_row_xla, evc_xla, evr_xla).to(
-                orig
-            )
+            partial = _call_kernel(
+                _j_batched_kernel,
+                "j_batched",
+                b_i_xla,
+                B_xla,
+                eo_i_xla,
+                eo_row_xla,
+                evc_xla,
+                evr_xla,
+            ).to(orig)
             e_total = e_total + partial.sum()
         else:
             for j_start in range(0, nocc_padded, j_chunk_size):
                 B_j = B_xla[j_start : j_start + j_chunk_size]
                 eo_j = eo_row_xla[0:1, j_start : j_start + j_chunk_size]
-                partial = _j_batched_kernel(b_i_xla, B_j, eo_i_xla, eo_j, evc_xla, evr_xla).to(orig)
+                partial = _call_kernel(
+                    _j_batched_kernel, "j_batched", b_i_xla, B_j, eo_i_xla, eo_j, evc_xla, evr_xla
+                ).to(orig)
                 e_total = e_total + partial.sum()
     return e_total
 
@@ -1105,11 +1314,15 @@ def _nki_fused_gemm_energy_impl(
         )
         partial = torch.from_numpy(np.asarray(partial_np)).to(b_i.device)
     else:
-        (bi_xla, bj_xla, eo_xla, evc_xla, evr_xla), orig = _to_xla(
-            bi_feed, bj_feed, eo_sum, ev_col_feed.to(b_i.device), ev_row_feed.to(b_i.device)
+        partial = _launch(
+            _fused_gemm_energy_kernel,
+            "fused_gemm_energy",
+            bi_feed,
+            bj_feed,
+            eo_sum,
+            ev_col_feed.to(b_i.device),
+            ev_row_feed.to(b_i.device),
         )
-        e_out = _fused_gemm_energy_kernel(bi_xla, bj_xla, eo_xla, evc_xla, evr_xla)
-        partial = e_out.to(orig)
 
     # Slice unpadded rows (zero-pad rows contribute zero energy, but
     # slice keeps the caller's sum from touching padding artefacts).
@@ -1149,9 +1362,7 @@ def _nki_syrk_impl(A: torch.Tensor) -> torch.Tensor:
             out_np = nki.simulate(_syrk_kernel)(A_feed.cpu().numpy())
             result = torch.from_numpy(np.asarray(out_np)).to(A.device)
         else:
-            (a,), orig_device = _to_xla(A_feed)
-            c = _syrk_kernel(a)
-            result = c.to(orig_device)
+            result = _launch(_syrk_kernel, "syrk", A_feed)
         return result[:M, :M] if needs_pad else result
     except Exception as exc:
         if _REQUIRE_NKI:

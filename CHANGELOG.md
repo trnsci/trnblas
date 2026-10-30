@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+#### Native PyTorch dispatch on TorchNeuron (#50, trnsci/trnsci#35)
+
+On TorchNeuron (Neuron SDK 2.33+, `torch-neuronx` 2.14, PyTorch 2.14,
+Trn2/Trn3), every NKI kernel is now registered as a PyTorch custom op with
+`torch_neuronx.nki_op` and dispatched on `device="neuron"`, with no
+`torch_xla` import. Ops: `trnblas::gemm_ragged`, one
+`trnblas::gemm_<tm>_<tk>_<tn>` per GEMM tile config (default
+`gemm_128_128_512`), `syrk`, `mp2_energy`, `fused_gemm_energy`,
+`batched_pair`, `j_batched`. Kernel bodies are unchanged.
+
+- The dispatch path is detected on the first kernel launch: native when
+  `torch_neuronx` exports `nki_op` and a `neuron` device is available, XLA
+  when `torch_xla` is installed, otherwise none. The XLA path (Trn1) is
+  unchanged, as are the `torch.matmul` fallback and the
+  `TRNBLAS_USE_SIMULATOR` path.
+- Custom ops are registered lazily (`trnblas/nki/_native.py` is imported
+  only when the native path is selected), so CPU-only installs and the XLA
+  lineage see no import-time side effects.
+- All host wrappers share one launch helper: GEMM (default and in-kernel
+  ragged, still with no torch-side pad), batched GEMM, SYRK, TRSM (through
+  GEMM), the MP2 / fused-pair / batched-pair energy kernels, and the opt-in
+  autotune sweep (which synchronizes the device around its timings on the
+  native path).
+- **Path-aware batched-pair routing.** `nki_batched_pair_energy` chose the
+  single full-batch kernel below `_BATCHED_PAIR_CHUNK_THRESHOLD = 4096`
+  because one launch amortizes the XLA path's ~100 ms dispatch floor. The
+  native path uses 3072, measured on trn2: the full-batch kernel is 2–11×
+  faster warm at every shape, but above est_iters 3072 its first-call compile
+  was 43–178 s, against 2–4 s for the chunked kernel. The XLA value is
+  unchanged.
+  `TRNBLAS_BATCHED_PAIR_CHUNK_THRESHOLD` overrides both, for re-benchmarking
+  (`scripts/bench_native_dispatch.py pair`).
+- `TRNSCI_NKI_DISPATCH=auto|native|xla` forces the dispatch path (a
+  suite-wide variable shared by all trnsci libraries). Forcing a path that
+  isn't available raises instead of falling back.
+- Dormant XLA deprecation hook: with `TRNSCI_XLA_DEPRECATION=1`, selecting
+  the XLA path emits one `DeprecationWarning`. Off by default; the suite
+  turns it on at TorchNeuron GA (trnsci/trnsci#35).
+- New `[torchneuron]` extra (`torch>=2.14`, `torch-neuronx>=2.14`,
+  `nki>=0.6`); `[neuron]` stays the PyTorch/XLA lineage.
+- Docs: install notes cover both extras and lineages and recommend
+  `NKI_ENABLE_TRACE_CACHE=0` for editable installs.
+- Tests: `conftest.py` sets `NKI_ENABLE_TRACE_CACHE=0` by default; CPU tests
+  for path selection, launch routing of every host wrapper, lazy
+  registration, op schemas and fake shapes, and the deprecation hook;
+  `tests/test_nki_compile.py` runs `source_to_mlir(...).verify()` for every
+  kernel on trn1 and trn2 (simulator CI job); `@pytest.mark.neuron`
+  native-path tests (`tests/test_nki_native.py`, not yet run on hardware).
+- `scripts/bench_native_dispatch.py`: native re-benchmarks of batched-pair
+  full vs chunked and NKI `gemm` vs aten `A @ B`, with host-created inputs.
+
 ## [0.6.0] — 2026-10-28
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron device) — see trnsci/trnsci#35.

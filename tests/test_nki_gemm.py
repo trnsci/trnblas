@@ -113,12 +113,12 @@ class TestRaggedKernel:
 
     @pytest.mark.parametrize("M,K,N", SHAPES)
     def test_ragged_kernel_direct(self, nki_backend, rng, M, K, N):
-        from trnblas.nki.dispatch import _gemm_kernel_ragged, _to_xla
+        from trnblas.nki.dispatch import _call_kernel, _gemm_kernel_ragged, _to_device
 
         A = torch.randn(M, K, generator=rng)
         B = torch.randn(K, N, generator=rng)
-        (a, b), orig = _to_xla(A, B)
-        out = _gemm_kernel_ragged(a, b).to(orig)
+        (a, b), orig = _to_device(A, B)
+        out = _call_kernel(_gemm_kernel_ragged, "gemm_ragged", a, b).to(orig)
         assert out.shape == (M, N)
         ref = A.double() @ B.double()
         rel = (out.double() - ref).norm() / ref.norm()
@@ -350,7 +350,13 @@ class TestAutotuner:
 
     def test_correctness_per_config(self, nki_backend, rng):
         """Every tile candidate that divides (128,128,512) produces correct output."""
-        from trnblas.nki.dispatch import _TILE_CANDIDATES, _get_gemm_kernel, _to_xla
+        from trnblas.nki.dispatch import (
+            _TILE_CANDIDATES,
+            _call_kernel,
+            _gemm_op_name,
+            _get_gemm_kernel,
+            _to_device,
+        )
 
         M, K, N = 128, 128, 512
         A = torch.randn(M, K, generator=rng)
@@ -360,8 +366,8 @@ class TestAutotuner:
             if M % tm or K % tk or N % tn:
                 continue
             kernel = _get_gemm_kernel(tm, tk, tn)
-            (a, b), orig = _to_xla(A.contiguous(), B.contiguous())
-            result = kernel(a, b).to(orig)
+            (a, b), orig = _to_device(A.contiguous(), B.contiguous())
+            result = _call_kernel(kernel, _gemm_op_name(tm, tk, tn), a, b).to(orig)
             torch.testing.assert_close(
                 result,
                 ref,
