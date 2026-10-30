@@ -192,9 +192,84 @@ cc-pVTZ-RI). aten and NKI after the change were measured in the same session.
   almost entirely from the Cholesky + TRSM stage (5–26 ms on the device).
 - At 512/64/1536, `pair_energy_sym` takes the energy step from 207 ms (aten)
   to 120 ms, which is 1.34× end to end. At 96/672/2304 the energy step alone
-  drops from 63 s (aten chunked reduction) to 0.69 s.
+  drops from 1.22 s (aten chunked reduction, warm, device mostly free) to
+  0.69 s. An earlier version of this page gave 63 s for aten there. That is
+  the same reduction run while 10–14 GB of the 24 GB logical core are already
+  held; see the next section.
 - Host-resident inputs (the old `df_mp2_pyscf.py` default) cost 2–5× end to
   end: every NKI launch copies its operands over and back.
+
+## DF-MP2 on Trn2: metric factor on the host
+
+`trnblas.metric_inv_half(J)` returns X = L⁻ᵀ for J = L Lᵀ. On the native path
+with J on the device and naux ≤ 1024, it copies J to the host, runs LAPACK in
+float64 and uploads X once. Above 1024 it runs `torch.linalg.cholesky` + `trsm`
+on the device, as before. `TRNBLAS_METRIC_SOLVE=auto|host|device` overrides
+the choice.
+
+Crossover (`scripts/bench_metric_solve.py`). Setup: trn2.3xlarge, one LNC=2
+core, fp32 J on the device, the host on 2 threads with
+`OMP_WAIT_POLICY=PASSIVE`. Times are warm medians in ms. The residual is
+max|XᵀJX − I| at cond(J) = 1e4.
+
+| naux | device (chol + trsm) | host (down + fp64 LAPACK + up) | residual, device / host |
+|---|---|---|---|
+| 71 | 2.6 | 0.5 | 3e-5 / 3e-7 |
+| 128 | 3.1 | 0.4 | 3e-5 / 3e-7 |
+| 300 | 5.9 | 1.6 | 4e-5 / 2e-7 |
+| 423 | 9.4 | 3.1 | 3e-5 / 2e-7 |
+| 555 | 13.5 | 9.0 | 7e-5 / 2e-7 |
+| 1024 | 38.9 | 40.2 | 4e-5 / 1e-7 |
+| 1536 | 93.6 | 115 | 5e-5 / 1e-7 |
+| 2304 | 215 | 278 | 4e-5 / 1e-7 |
+
+- **Up to naux 555 the host route is faster.** Above 1536 the device is
+  faster. At cond(J) = 1e7, typical of RI metrics, the device residual grows
+  to 1e-2–4e-2 while the host stays at 5e-6.
+- **The device route compiles once per new naux.** That takes 33–210 s at
+  naux 1024–6144 the first time; after that it is cached on disk.
+
+End to end, all with `OMP_WAIT_POLICY=PASSIVE`. Times are warm best-of ms. The
+NKI paths use device-resident inputs and `--energy pair`. aten and CPU use
+`--energy chunk`. The "device chol" column is #55's behaviour
+(`TRNBLAS_METRIC_SOLVE=device`).
+
+| molecule / basis | nbasis/nocc/naux | CPU (2 thr) | aten | NKI, device chol | NKI, host chol | vs aten | |ΔE| (host chol) |
+|---|---|---|---|---|---|---|---|
+| H₂O / cc-pVDZ | 24/5/71 | 0.4 | 5.6 | 5.5 | 3.1 | 1.81× | 3.2e-08 |
+| H₂O / cc-pVTZ | 58/5/71 | 0.8 | 4.6 | 4.4 | 3.3 | 1.39× | 3.5e-07 |
+| NH₃ / cc-pVDZ | 29/5/82 | 0.5 | 5.7 | 3.7 | 3.1 | 1.84× | 1.4e-07 |
+| NH₃ / cc-pVTZ | 72/5/82 | 1.1 | 6.7 | 5.4 | 3.2 | 2.09× | 3.5e-07 |
+| CH₄ / cc-pVDZ | 34/5/93 | 0.7 | 5.6 | 5.4 | 3.3 | 1.70× | 8.5e-09 |
+| CH₄ / cc-pVTZ | 86/5/93 | 2.4 | 4.3 | 4.0 | 3.3 | 1.30× | 3.2e-07 |
+| glycine / cc-pVDZ | 95/20/300 | 27.4 | 8.1 | 8.5 | 4.5 | 1.80× | 2.9e-07 |
+| glycine / cc-pVTZ | 220/20/300 | 230 | 17.3 | 11.7 | 9.6 | 1.80× | 4.1e-08 |
+| glycine / cc-pVTZ, RI | 220/20/555 | 276 | 22.3 | 20.8 | 16.5 | 1.35× | 1.5e-07 |
+| (H₂O)₃ / cc-pVTZ, RI | 174/15/423 | 93.2 | 15.6 | 12.6 | 14.2 | 1.10× | 2.5e-07 |
+| synthetic | 512/64/1536 | 21.4 s | 309 | 232 | 228 | 1.35× | 9.3e-09 |
+| synthetic | 768/96/2304 | 120 s | 25.0 s (1.55 s)* | 947 | 948 | 26× (1.6×)* | 6.3e-07 |
+
+\* With the default 1.5 GB chunk budget, the aten energy step at 768/96/2304
+takes 24.7 s. A 0.75 GB budget brings it to 1.29 s. The default chunks land
+when the ERI, the broadcast metric and B already occupy most of the logical
+core, and the eager chunk loop then slows 20–50×. A standalone repro shows
+1.22 s with 8 GB held, 35 s with 10 GB and 64 s with 14 GB; at 18 GB it fails
+with "Failed to load model" after five minutes. naux 1536 and 2304 are above
+the crossover, so the two NKI columns run the same code there.
+
+- **Small molecules (nocc 5):** the host route takes the metric stage from
+  1.6–3 ms to 0.4–0.6 ms. The CPU still wins at this size.
+- **Glycine and the water trimer:** the device beats the 2-thread CPU by
+  6.6–24×, and trnblas beats aten by 1.1–1.8×.
+- **Accuracy:** |ΔE| against PySCF stays at 8e-9 to 4e-7 Ha on every path,
+  in the FP32 regime. The FP32 GEMMs and energy dominate the error, so the
+  more accurate float64 metric factor doesn't show in ΔE here.
+- **`OMP_WAIT_POLICY=PASSIVE`:** with the default OpenMP wait policy, torch's
+  pool spin-waits on the same 2 pinned cores the Neuron runtime threads use.
+  Small uploads then take ~4 ms instead of 0.06 ms, and every device total
+  grows by 3–6 ms (H₂O: 8.4 vs 3.1 ms). On the default policy the host route
+  still wins: 1.0–2.0× faster than aten, and up to 2× faster than the device
+  route, on the real molecules.
 
 ## DF-MP2 end-to-end — Trainium1 vs NVIDIA A10G
 

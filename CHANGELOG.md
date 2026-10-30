@@ -15,6 +15,40 @@ Headline performance: native GEMM routes to aten for device-resident operands (2
 
 ### Added
 
+#### Native DF-MP2: metric factor on the host (#50)
+
+- **`trnblas.metric_inv_half(J)`** (and `trnblas.nki.nki_metric_inv_half`)
+  returns the Cholesky inverse factor X = L^-T of an SPD metric J = L L^T, so
+  `A @ X` is the density-fitting metric contraction. On the native path with J
+  on the `neuron` device and naux ≤ 1024, it copies J to the host once, runs
+  LAPACK Cholesky + triangular solve in float64 and uploads X once. Above
+  that, and everywhere else (host tensors, the XLA path, the simulator, the
+  pytorch backend), it is `torch.linalg.cholesky` + `trsm` as before.
+  `TRNBLAS_METRIC_SOLVE=auto|host|device` overrides the choice. Measured on trn2
+  with 2 host threads, the host route is 2–8× faster up to naux 555, ties at
+  1024 and loses from 1536. Its residual max|XᵀJX − I| is 100–300× smaller
+  (2000–8000× at cond(J) = 1e7). `examples/df_mp2.py` uses it for step 1.
+- `scripts/bench_metric_solve.py`: the host vs device crossover by naux.
+  `scripts/bench_df_mp2_paths.py --metric auto|host|device`.
+- `docs/benchmarks.md`: on the trn2 box, `OMP_WAIT_POLICY=PASSIVE` cuts 2–6 ms
+  from every device path on small molecules. With torch's OpenMP pool
+  spin-waiting on the same few cores, the Neuron runtime's threads are
+  starved, and a 20 KB upload takes ~4 ms instead of 0.06 ms.
+
+### Fixed
+
+- **The 96/672/2304 aten figure in the pair-energy entry below.** It was
+  63 s, but that is not aten's steady state. With the device mostly free, the
+  warm chunked aten energy there takes 1.22 s, so the sym kernel (0.69 s) is
+  1.8× faster, not 92×. The 35–64 s only appears when 10–14 GB of the 24 GB
+  logical core are already held, as in a full 768/96/2304 DF-MP2 run (trnblas#50).
+- **`gemm` with a transposed left operand and a right operand over 4 GiB on
+  the `neuron` device** no longer aborts the process. aten::mm on that layout
+  hits an execution timeout and "NRT status 1203, A DMA engine encountered an
+  unrecoverable error" on torch-neuronx 2.14.3 / runtime 2.35. DF-MP2's
+  half-transform `C_occ.T @ eri_flat` hits it from nbasis 768 / naux 2304.
+  `gemm` now copies the (small) left operand to row-major first in that case.
+
 #### Native DF-MP2: aten routing for plain GEMMs, LNC=2 symmetric pair-energy kernel
 
 Measured end to end on trn2 with real molecules (`scripts/bench_df_mp2_paths.py`).

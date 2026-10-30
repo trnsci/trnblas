@@ -187,6 +187,27 @@ def _gemm_via_aten(*tensors: torch.Tensor) -> bool:
     return _native_gemm_policy() == "auto"
 
 
+# aten::mm on the native `neuron` device aborts (execution timeout, then
+# "NRT status 1203, A DMA engine encountered an unrecoverable error") when the
+# left operand is a transposed view and the right operand is larger than
+# 4 GiB: (96, 768)-view @ (768, 1399808) fails, (768, 1397760) runs, and a
+# contiguous left operand runs at 5.4 GB. DF-MP2's half-transform
+# `C_occ.T @ eri_flat` hits it from nbasis 768 / naux 2304. Until the runtime
+# is fixed, copy the (small) left operand to row-major first.
+_NEURON_MM_BIG_RHS_BYTES = 1 << 32
+
+
+def _neuron_mm_lhs(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """`a`, made contiguous when `a @ b` would hit the strided-lhs/>4 GiB abort."""
+    if (
+        not a.is_contiguous()
+        and b.numel() * b.element_size() >= _NEURON_MM_BIG_RHS_BYTES
+        and _on_neuron_device(a, b)
+    ):
+        return a.contiguous()
+    return a
+
+
 _AUTOTUNE_CACHE_FILE: Path = Path(
     os.environ.get("TRNBLAS_AUTOTUNE_CACHE", "/var/tmp/trnblas-autotune/cache.json")
 )
@@ -499,6 +520,99 @@ def _nki_trsm_left(
             if ks > 0:
                 X[:ks] = X[:ks] - nki_gemm(mat[:ks, ks:k].contiguous(), X[ks:k])
     return alpha * X
+
+
+# ── DF metric factor J^-1/2 = L^-T: host LAPACK vs device ────────────────────
+#
+# DF-MP2 needs X = L^-T with J = L L^T (so B = (ia|Q) X gives B B^T =
+# (ia|Q) J^-1 (jb|Q)^T). On the native path with a device-resident J, the
+# device route is `torch.linalg.cholesky` + the blocked `trsm` against the
+# identity, i.e. ~naux/128 small solves and aten updates, each its own
+# launch: 5-26 ms and noisy at naux 71-555 (#55). The host route copies J
+# down once (naux^2 floats), runs LAPACK potrf + trsm in float64, and
+# uploads X once. Float64 also helps accuracy: RI metrics have condition
+# numbers of 1e6-1e9, where an FP32 Cholesky loses most of its digits.
+#
+# Measured on trn2 (SDK 2.33, fp32 J resident on the device, host on 2
+# threads with OMP_WAIT_POLICY=PASSIVE, warm median ms;
+# scripts/bench_metric_solve.py; resid = max|X^T J X - I| at cond(J) = 1e4):
+#
+#   naux    device (chol + trsm)    host (down + fp64 + up)   resid dev / host
+#     71      2.6  (1.8 + 0.8)          0.5                    3e-5 / 3e-7
+#    300      5.9  (1.9 + 4.0)          1.6                    4e-5 / 2e-7
+#    423      9.4  (3.3 + 6.2)          3.1                    3e-5 / 2e-7
+#    555     13.5  (4.6 + 8.9)          9.0                    7e-5 / 2e-7
+#   1024     38.9  (23.4 + 15.4)       40.2                    4e-5 / 1e-7
+#   1536     93.6  (52.1 + 41.6)      115                      5e-5 / 1e-7
+#   2304    215    (124 + 91)         278                      4e-5 / 1e-7
+#
+# Host wins by 1.5-6x up to naux 555 and ties at 1024; from 1536 the device
+# is 1.2-1.3x faster. `_METRIC_HOST_MAX_NAUX` sits at the tie, where the host
+# route's 100-300x smaller residual decides it (2000-8000x at cond 1e7).
+# The device route also compiles once per new naux (33-210 s at naux
+# 1024-6144 the first time; cached on disk afterwards); the host route
+# never compiles.
+# TRNBLAS_METRIC_SOLVE=auto|host|device overrides. Host tensors, the XLA
+# path, the simulator and the pytorch backend keep the device route (which
+# is plain torch there), so the XLA path and the aten baseline are unchanged.
+_METRIC_SOLVE_CHOICES = ("auto", "host", "device")
+_METRIC_HOST_MAX_NAUX = 1024
+
+
+def _metric_solve_route(J: torch.Tensor) -> str:
+    """'host' or 'device' for `nki_metric_inv_half` on this J."""
+    choice = os.environ.get("TRNBLAS_METRIC_SOLVE", "auto").strip().lower()
+    if choice not in _METRIC_SOLVE_CHOICES:
+        raise ValueError(
+            f"TRNBLAS_METRIC_SOLVE must be one of {_METRIC_SOLVE_CHOICES}; got {choice!r}"
+        )
+    if not _use_nki() or _use_simulator() or not _on_neuron_device(J):
+        return "device"
+    if choice != "auto":
+        return choice
+    return "host" if J.shape[0] <= _METRIC_HOST_MAX_NAUX else "device"
+
+
+def _host_inv_chol_factor(J: torch.Tensor) -> torch.Tensor:
+    """L^-T for J = L L^T on the host in float64 (torch's LAPACK potrf + trsm).
+
+    torch's own LAPACK, not SciPy's: a second BLAS runtime in the process
+    brings a second spinning thread pool, which on a few pinned cores made
+    torch's own LAPACK calls several times slower when the two interleaved.
+    """
+    Jd = J.detach().to(device="cpu", dtype=torch.float64)
+    L, info = torch.linalg.cholesky_ex(Jd)
+    if int(info) != 0:
+        raise torch.linalg.LinAlgError(
+            f"metric Cholesky failed: leading minor of order {int(info)} is not positive-definite"
+        )
+    eye = torch.eye(Jd.shape[0], dtype=torch.float64)
+    # solve_triangular returns a column-major result; make it row-major on the
+    # host. Uploading the strided tensor costs ~3.8 ms at naux 71 on trn2
+    # (the device materialises the layout), against 0.06 ms contiguous.
+    return torch.linalg.solve_triangular(L.T, eye, upper=True).contiguous()
+
+
+def _device_inv_chol_factor(J: torch.Tensor) -> torch.Tensor:
+    L = torch.linalg.cholesky(J)
+    eye = torch.eye(J.shape[0], dtype=J.dtype, device=J.device)
+    return nki_trsm(L, eye, uplo="lower", trans=True)
+
+
+def nki_metric_inv_half(J: torch.Tensor) -> torch.Tensor:
+    """Cholesky inverse factor X = L^-T of an SPD metric J = L L^T.
+
+    X X^T = J^-1, so `A @ X` is the density-fitting metric contraction
+    (`B = (ia|Q) J^-1/2` in DF-MP2). On the native path with J on the
+    `neuron` device and naux <= `_METRIC_HOST_MAX_NAUX`, the factor is
+    computed on the host in float64 and uploaded once (one download of J,
+    one upload of X); otherwise `torch.linalg.cholesky` + `nki_trsm`.
+    The result has J's dtype and device.
+    """
+    if _metric_solve_route(J) == "host":
+        X = _host_inv_chol_factor(J)
+        return X.to(dtype=J.dtype).to(J.device)
+    return _device_inv_chol_factor(J)
 
 
 def _round_up(n: int, multiple: int) -> int:
@@ -1045,8 +1159,13 @@ def nki_batched_pair_energy(
 #   32,384,1024         5.13     27.3 ms     20.5 ms
 #   48,384,1152         8.50     61.9 ms     39.4 ms
 #   64,448,1536        26.6     207 ms      118 ms
-#   96,672,2304        66.9     63.0 s      0.69 s
+#   96,672,2304        66.9     1.22 s      0.69 s
 #
+# (#55 recorded 63 s for aten at 96/672/2304. That number is not aten's
+# steady state: with a few GB free on the logical core the warm chunked
+# reduction takes 1.22 s, and it degrades to 35-64 s only when 10-14 GB of
+# the 24 GB core are already held, as in a full 768/96/2304 DF-MP2 run. See
+# trnblas#50.)
 # The crossover sits between 1.7 and 5.1 row GFLOP; `_PAIR_SYM_MIN_ROW_FLOP`
 # takes 3e9. TRNBLAS_PAIR_ENERGY overrides: auto | sym | aten | legacy (the
 # full-batch / chunked kernels).

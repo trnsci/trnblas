@@ -17,6 +17,7 @@ import warnings
 import pytest
 import torch
 
+import trnblas
 import trnblas.nki
 from trnblas.nki import dispatch
 
@@ -45,6 +46,7 @@ def reset_dispatch_state(monkeypatch):
     monkeypatch.delenv("TRNBLAS_BATCHED_PAIR_CHUNK_THRESHOLD", raising=False)
     monkeypatch.delenv("TRNBLAS_PAIR_ENERGY", raising=False)
     monkeypatch.delenv("TRNBLAS_NATIVE_GEMM", raising=False)
+    monkeypatch.delenv("TRNBLAS_METRIC_SOLVE", raising=False)
     # Drop any `_native` left by an earlier test so registration re-runs.
     monkeypatch.delitem(sys.modules, "trnblas.nki._native", raising=False)
     monkeypatch.delattr(trnblas.nki, "_native", raising=False)
@@ -692,3 +694,121 @@ class TestPairEnergySym:
         monkeypatch.setattr(dispatch, "_use_simulator", lambda: False)
         monkeypatch.setattr(dispatch, "_on_neuron_device", lambda *t: False)
         assert dispatch._pair_energy_route(torch.empty(64, 448, 1536)) == "legacy"
+
+
+class TestMetricInvHalf:
+    """`metric_inv_half`: host LAPACK (float64) vs device Cholesky + TRSM routing.
+
+    CPU tensors stand in for `neuron` tensors by patching `_on_neuron_device`.
+    """
+
+    @staticmethod
+    def _spd(n, seed=0, dtype=torch.float32):
+        g = torch.Generator().manual_seed(seed)
+        R = torch.randn(n, n, generator=g, dtype=torch.float64)
+        return (R @ R.T / n + torch.eye(n, dtype=torch.float64)).to(dtype)
+
+    @pytest.fixture
+    def native_nki(self, monkeypatch):
+        monkeypatch.setattr(dispatch, "HAS_NKI", True)
+        monkeypatch.setattr(dispatch, "_backend", "nki")
+        monkeypatch.setattr(dispatch, "_use_simulator", lambda: False)
+        monkeypatch.setattr(dispatch, "_on_neuron_device", lambda *t: True)
+
+    def test_route_host_up_to_crossover(self, native_nki):
+        n = dispatch._METRIC_HOST_MAX_NAUX
+        assert dispatch._metric_solve_route(torch.empty(n, n)) == "host"
+        assert dispatch._metric_solve_route(torch.empty(n + 1, n + 1)) == "device"
+
+    def test_route_env_override(self, native_nki, monkeypatch):
+        monkeypatch.setenv("TRNBLAS_METRIC_SOLVE", "device")
+        assert dispatch._metric_solve_route(torch.empty(8, 8)) == "device"
+        monkeypatch.setenv("TRNBLAS_METRIC_SOLVE", "host")
+        assert dispatch._metric_solve_route(torch.empty(10**4, 1)) == "host"
+        monkeypatch.setenv("TRNBLAS_METRIC_SOLVE", "gpu")
+        with pytest.raises(ValueError, match="TRNBLAS_METRIC_SOLVE"):
+            dispatch._metric_solve_route(torch.empty(8, 8))
+
+    def test_route_device_off_native(self, monkeypatch):
+        """Host tensors, XLA tensors, the simulator and the pytorch backend keep the old path."""
+        monkeypatch.setattr(dispatch, "HAS_NKI", True)
+        monkeypatch.setattr(dispatch, "_backend", "nki")
+        monkeypatch.setattr(dispatch, "_use_simulator", lambda: False)
+        monkeypatch.setenv("TRNBLAS_METRIC_SOLVE", "host")
+        assert dispatch._metric_solve_route(torch.empty(8, 8)) == "device"  # cpu tensor
+        monkeypatch.setattr(dispatch, "_on_neuron_device", lambda *t: True)
+        monkeypatch.setattr(dispatch, "_use_simulator", lambda: True)
+        assert dispatch._metric_solve_route(torch.empty(8, 8)) == "device"
+        monkeypatch.setattr(dispatch, "_use_simulator", lambda: False)
+        monkeypatch.setattr(dispatch, "_backend", "pytorch")
+        assert dispatch._metric_solve_route(torch.empty(8, 8)) == "device"
+
+    @pytest.mark.parametrize("n", [1, 7, 71, 300])
+    def test_host_factor_is_inverse_cholesky(self, n):
+        J = self._spd(n, dtype=torch.float64)
+        X = dispatch._host_inv_chol_factor(J)
+        assert X.dtype == torch.float64
+        assert X.is_contiguous()  # a strided upload is ~60x slower on trn2
+        torch.testing.assert_close(X, torch.triu(X))
+        L = torch.linalg.cholesky(J)
+        torch.testing.assert_close(X, torch.linalg.inv(L).T, rtol=1e-10, atol=1e-12)
+        torch.testing.assert_close(X.T @ J @ X, torch.eye(n, dtype=torch.float64))
+
+    def test_host_factor_rejects_indefinite(self):
+        J = -torch.eye(4, dtype=torch.float64)
+        with pytest.raises(torch.linalg.LinAlgError):
+            dispatch._host_inv_chol_factor(J)
+
+    def test_public_host_route_keeps_dtype_and_matches_device_route(self, native_nki, monkeypatch):
+        J = self._spd(300, seed=3)
+        monkeypatch.setattr(dispatch, "_gemm_via_aten", lambda *t: True)
+        monkeypatch.setenv("TRNBLAS_METRIC_SOLVE", "host")
+        X_host = trnblas.metric_inv_half(J)
+        monkeypatch.setenv("TRNBLAS_METRIC_SOLVE", "device")
+        X_dev = trnblas.metric_inv_half(J)
+        assert X_host.dtype == J.dtype and X_host.device == J.device
+        torch.testing.assert_close(X_host, X_dev, rtol=1e-4, atol=1e-5)
+
+    def test_pytorch_backend_equals_old_df_mp2_step(self, monkeypatch):
+        monkeypatch.setattr(dispatch, "_backend", "pytorch")
+        J = self._spd(200, seed=4)
+        L = torch.linalg.cholesky(J)
+        ref = trnblas.trsm(1.0, L, torch.eye(200), uplo="lower", trans=True)
+        torch.testing.assert_close(trnblas.metric_inv_half(J), ref, rtol=0, atol=0)
+
+
+class TestNeuronMmLhsWorkaround:
+    """Strided lhs @ >4 GiB rhs aborts on the neuron device; gemm copies the lhs first."""
+
+    class _Big:
+        """Stands in for a >4 GiB rhs without allocating one."""
+
+        def numel(self):
+            return 1 << 31
+
+        def element_size(self):
+            return 4
+
+    def test_contiguous_copy_only_when_needed(self, monkeypatch):
+        monkeypatch.setattr(dispatch, "_on_neuron_device", lambda *t: True)
+        a = torch.randn(8, 4).T
+        out = dispatch._neuron_mm_lhs(a, self._Big())
+        assert out.is_contiguous()
+        torch.testing.assert_close(out, a)
+        assert dispatch._neuron_mm_lhs(a, torch.randn(8, 3)) is a  # small rhs
+        c = torch.randn(4, 8)
+        assert dispatch._neuron_mm_lhs(c, self._Big()) is c  # already contiguous
+
+    def test_host_tensors_untouched(self):
+        a = torch.randn(8, 4).T
+        assert dispatch._neuron_mm_lhs(a, self._Big()) is a
+
+    def test_gemm_routes_lhs_through_workaround(self, monkeypatch):
+        seen = []
+        real = dispatch._neuron_mm_lhs
+        monkeypatch.setattr(
+            dispatch, "_neuron_mm_lhs", lambda a, b: seen.append(a.shape) or real(a, b)
+        )
+        A, B = torch.randn(6, 3), torch.randn(6, 5)
+        torch.testing.assert_close(trnblas.gemm(1.0, A, B, transA=True), A.T @ B)
+        assert seen == [torch.Size([3, 6])]

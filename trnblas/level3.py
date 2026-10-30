@@ -37,10 +37,11 @@ def gemm(
 
     On Trainium, dispatches to NKI GEMM with stationary tile reuse.
     """
-    from .nki.dispatch import _use_nki, nki_gemm
+    from .nki.dispatch import _neuron_mm_lhs, _use_nki, nki_gemm
 
     a = A.T if transA else A
     b = B.T if transB else B
+    a = _neuron_mm_lhs(a, b)
 
     if _use_nki() and a.dim() == 2 and b.dim() == 2:
         result = alpha * nki_gemm(a, b)
@@ -167,6 +168,23 @@ def trsm(
     from .nki import nki_trsm
 
     return nki_trsm(A, B, side=side, uplo=uplo, trans=trans, diag=diag, alpha=alpha)
+
+
+def metric_inv_half(J: torch.Tensor) -> torch.Tensor:
+    """Cholesky inverse factor of an SPD metric: X = L^-T where J = L @ L^T.
+
+    X @ X^T = J^-1, so `(ia|Q) @ X` is the density-fitting metric
+    contraction B_ia^P = sum_Q (ia|Q) [J^-1/2]_QP used by DF-MP2.
+
+    On Trainium's native path with J on the `neuron` device (and naux up to
+    the measured crossover), the factor is computed on the host with LAPACK
+    in float64 and uploaded once; otherwise it is `torch.linalg.cholesky`
+    followed by `trsm(1.0, L, I, uplo="lower", trans=True)`.
+    `TRNBLAS_METRIC_SOLVE=auto|host|device` overrides the choice.
+    """
+    from .nki.dispatch import nki_metric_inv_half
+
+    return nki_metric_inv_half(J)
 
 
 def trmm(
