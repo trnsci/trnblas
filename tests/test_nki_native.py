@@ -225,3 +225,31 @@ class TestNativeDevicePolicy:
         eps_vir = 0.5 + torch.rand(nvir, generator=torch.Generator().manual_seed(3))
         e = trnblas.nki.nki_batched_pair_energy(B.to(DEV), eps_occ.to(DEV), eps_vir.to(DEV))
         assert float(e) == pytest.approx(_pair_reference(B, eps_occ, eps_vir), rel=1e-5)
+
+
+class TestNativeMetricInvHalf:
+    """`metric_inv_half` on a device-resident J: host LAPACK route vs device route."""
+
+    @staticmethod
+    def _spd(n):
+        R = _host(n, n, seed=5).double()
+        return (R @ R.T / n + torch.eye(n, dtype=torch.float64)).float()
+
+    @pytest.mark.parametrize("route", ["host", "device"])
+    @pytest.mark.parametrize("n", [71, 300])
+    def test_route_on_device(self, require_nki, monkeypatch, route, n):
+        monkeypatch.setenv("TRNBLAS_METRIC_SOLVE", route)
+        called = []
+        real = D._host_inv_chol_factor
+        monkeypatch.setattr(D, "_host_inv_chol_factor", lambda J: called.append(1) or real(J))
+        J = self._spd(n)
+        X = trnblas.metric_inv_half(J.to(DEV))
+        assert X.device.type == "neuron" and X.dtype == torch.float32
+        assert called == ([1] if route == "host" else [])
+        Xd, Jd = X.cpu().double(), J.double()
+        resid = (Xd.T @ Jd @ Xd - torch.eye(n, dtype=torch.float64)).abs().max().item()
+        assert resid < 1e-4
+
+    def test_auto_takes_host_below_crossover(self, require_nki, monkeypatch):
+        monkeypatch.delenv("TRNBLAS_METRIC_SOLVE", raising=False)
+        assert D._metric_solve_route(torch.eye(71).to(DEV)) == "host"

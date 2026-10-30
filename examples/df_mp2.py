@@ -172,16 +172,12 @@ def df_mp2_energy(
     nbasis, nocc = C_occ.shape
     naux = J_metric.shape[0]
 
-    # Step 1: Cholesky of metric → L; J^{-1/2} via L^{-T}: solve L^T @ X = I
+    # Step 1: Cholesky of metric → L; J^{-1/2} = L^{-T} (solve L^T @ X = I).
+    #   On the native Trainium path with a device-resident J this runs on the
+    #   host in float64 and uploads X once; elsewhere it is
+    #   torch.linalg.cholesky + trnblas.trsm (see `trnblas.metric_inv_half`).
     t0 = time.perf_counter()
-    L = torch.linalg.cholesky(J_metric)
-    J_inv_half = trnblas.trsm(
-        1.0,
-        L,
-        torch.eye(naux, dtype=J_metric.dtype, device=J_metric.device),
-        uplo="lower",
-        trans=True,
-    )
+    J_inv_half = trnblas.metric_inv_half(J_metric)
     if timings is not None:
         _sync(C_occ.device)
     t_chol = time.perf_counter() - t0

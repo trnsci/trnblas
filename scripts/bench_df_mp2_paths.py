@@ -20,6 +20,9 @@ Two steps, so the PySCF SCF never runs inside a device process:
 
           ``--energy`` picks the energy step: ``chunk`` (GEMM + torch reduction),
           ``fused`` (GEMM + `nki_mp2_energy`), ``pair`` (`nki_batched_pair_energy`).
+          ``--metric`` sets ``TRNBLAS_METRIC_SOLVE`` (``auto``: host LAPACK for
+          the metric factor on the native path up to the crossover;
+          ``device``: Cholesky + TRSM on the device, the earlier behaviour).
 
 Each repetition prints one line
 ``RESULT {json}`` with the per-stage seconds (device-synchronised), total, and
@@ -87,6 +90,7 @@ def run(args) -> None:
 
     import trnblas
 
+    os.environ["TRNBLAS_METRIC_SOLVE"] = args.metric
     blob = torch.load(_cache_file(args.cache, args.mol, args.basis, args.auxbasis))
     inputs, e_ref = blob["inputs"], blob["e_ref"]
 
@@ -124,6 +128,7 @@ def run(args) -> None:
             "naux": naux,
             "path": args.path,
             "energy_mode": args.energy,
+            "metric_solve": args.metric,
             "rep": rep,
             "h2d": round(h2d, 4),
             **{k: round(v, 4) for k, v in t.items()},
@@ -143,6 +148,7 @@ def main() -> None:
     ap.add_argument("--cache", default="/var/tmp/trnblas-dfmp2-inputs")
     ap.add_argument("--path", choices=["nki", "nki-host", "aten", "cpu"], default="nki")
     ap.add_argument("--energy", choices=["chunk", "fused", "pair"], default="chunk")
+    ap.add_argument("--metric", choices=["auto", "host", "device"], default="auto")
     ap.add_argument("--reps", type=int, default=3)
     args = ap.parse_args()
     if args.cmd == "prep":
