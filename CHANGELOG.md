@@ -7,21 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
+## [0.8.0] — 2026-10-30
 
-- **`trnblas::pair_energy_sym` now compiles and runs at LNC=1**
-  (`NEURON_LOGICAL_NC_CONFIG=1`). It was launched as an explicit
-  `kernel[2]` grid, which neuronx-cc rejects at LNC=1 with `NCC_EVRF066`
-  ("configured with LNC=2, but neuronx-cc is using LNC=1"). It now launches
-  gridless and splits the j window by `nl.num_programs()`, falling back to
-  one program. Warm time at 64/448/1536 is unchanged at LNC=2 (119.7 vs
-  119.9 ms); at LNC=1 it is 231 ms on one core (#50).
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron; LNC=1 and LNC=2) — see trnsci/trnsci#35.
 
-## [0.7.0] — 2026-10-30
-
-Native TorchNeuron dispatch (Trn2/Trn3) alongside the PyTorch/XLA path (Trn1, maintenance); validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0) — see trnsci/trnsci#35.
-
-Headline performance: native GEMM routes to aten for device-resident operands (2.4–3.2× faster than the NKI GEMM on Trn2), and a new fused LNC=2 `pair_energy_sym` kernel for DF-MP2 (#55).
+Headline performance: native DF-MP2 factors the metric on the host (float64 LAPACK, naux ≤ 1024) and runs 1.1–1.8× faster end to end than aten on glycine and (H₂O)₃ (#57); `pair_energy_sym` now runs at LNC=1 as well as LNC=2 (#58).
 
 ### Added
 
@@ -47,7 +37,14 @@ Headline performance: native GEMM routes to aten for device-resident operands (2
 
 ### Fixed
 
-- **The 96/672/2304 aten figure in the pair-energy entry below.** It was
+- **`trnblas::pair_energy_sym` now compiles and runs at LNC=1**
+  (`NEURON_LOGICAL_NC_CONFIG=1`). It was launched as an explicit
+  `kernel[2]` grid, which neuronx-cc rejects at LNC=1 with `NCC_EVRF066`
+  ("configured with LNC=2, but neuronx-cc is using LNC=1"). It now launches
+  gridless and splits the j window by `nl.num_programs()`, falling back to
+  one program. Warm time at 64/448/1536 is unchanged at LNC=2 (119.7 vs
+  119.9 ms); at LNC=1 it is 231 ms on one core (#50).
+- **The 96/672/2304 aten figure in the [0.7.0] pair-energy entry.** It was
   63 s, but that is not aten's steady state. With the device mostly free, the
   warm chunked aten energy there takes 1.22 s, so the sym kernel (0.69 s) is
   1.8× faster, not 92×. The 35–64 s only appears when 10–14 GB of the 24 GB
@@ -58,6 +55,14 @@ Headline performance: native GEMM routes to aten for device-resident operands (2
   unrecoverable error" on torch-neuronx 2.14.3 / runtime 2.35. DF-MP2's
   half-transform `C_occ.T @ eri_flat` hits it from nbasis 768 / naux 2304.
   `gemm` now copies the (small) left operand to row-major first in that case.
+
+## [0.7.0] — 2026-10-30
+
+Native TorchNeuron dispatch (Trn2/Trn3) alongside the PyTorch/XLA path (Trn1, maintenance); validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0) — see trnsci/trnsci#35.
+
+Headline performance: native GEMM routes to aten for device-resident operands (2.4–3.2× faster than the NKI GEMM on Trn2), and a new fused LNC=2 `pair_energy_sym` kernel for DF-MP2 (#55).
+
+### Added
 
 #### Native DF-MP2: aten routing for plain GEMMs, LNC=2 symmetric pair-energy kernel
 
