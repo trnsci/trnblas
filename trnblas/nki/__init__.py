@@ -15,6 +15,7 @@ from .dispatch import (
     set_autotune,
     set_backend,
 )
+from .multicore import get_cores, set_cores
 
 __all__ = [
     "HAS_NKI",
@@ -22,6 +23,8 @@ __all__ = [
     "get_backend",
     "set_autotune",
     "get_autotune",
+    "set_cores",
+    "get_cores",
     "nki_gemm",
     "nki_batched_gemm",
     "nki_batched_pair_energy",

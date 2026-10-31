@@ -25,6 +25,7 @@ nav:
       - Level 2 (Matrix-Vector): api/level2.md
       - Level 3 (Matrix-Matrix): api/level3.md
       - NKI Backend: api/nki.md
+      - Multi-core (parallel): api/parallel.md
   - Architecture: architecture.md
   - Contributing:
       - Developing NKI kernels: developing_kernels.md

@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+#### Multi-core on one Trn2 chip (#24)
+
+- **`trnblas.parallel`**: SPMD tensor-parallel GEMM and DF-MP2, one process
+  per logical NeuronCore, under `torchrun` with TorchNeuron's `neuron`
+  process-group backend. Cross-core data moves only through on-chip
+  collectives.
+  - `df_mp2_energy(...)` takes the same host inputs as `examples/df_mp2.py`.
+    It splits the ERI upload by μ rows, reduce-scatters the half-transform
+    over the occupied index, all-gathers B and splits the pair energy by
+    occupied rows. The metric factor on rank 0 overlaps the upload.
+  - `eri_symmetric=True` uploads only the lower triangle of (μν|P), or takes
+    it packed (`pack_tril`, PySCF's `_cderi.T`).
+  - Measured on trn2.3xlarge (4 logical cores), end to end from host inputs
+    against the single-core library path:
+    - 512/64/1536: 348 → 138 ms (2.5×);
+    - 768/96/2304: 1323 → 459 ms (2.9×).
+  - The energy step alone scales 3.6× on 4 cores.
+  - `gemm_row_parallel`, `gemm_col_parallel`, `gemm_k_parallel` and
+    `all_gather_rows` work on shards resident on each rank. At 8192³ the local
+    GEMM goes from 30.2 to 10.6 ms on 4 ranks, or 13.5 ms with C all-gathered.
+  - Everything also runs on CPU with `gloo`, which is how it is tested.
+- **`trnblas.set_cores(n | "auto" | None)` / `TRNBLAS_CORES`**: opt-in,
+  single-process split of `nki_batched_pair_energy` by occupied rows across
+  visible cores, with B staged through a reused pinned host buffer.
+  - 96/672/2304: 685 → 389 ms on 4 cores.
+  - 64/448/1536: about even.
+  - `auto` splits above 1e13 flop.
+  - Unset, nothing changes.
+- `scripts/bench_parallel.py` and `scripts/bench_multicore.py`, and a
+  multi-core section in `docs/benchmarks.md`.
+
+### Not changed
+
+- **`trnblas.gemm` stays single-core.** Splitting a GEMM whose operands sit on
+  `neuron:0` means staging them through the host, which made it 7–40× slower
+  at 4096³–8192³. Host-input GEMM is bound by the host link and got slower
+  with more cores.
+
 ## [0.8.0] — 2026-10-30
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron; LNC=1 and LNC=2) — see trnsci/trnsci#35.

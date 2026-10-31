@@ -271,6 +271,101 @@ the crossover, so the two NKI columns run the same code there.
   still wins: 1.0–2.0× faster than aten, and up to 2× faster than the device
   route, on the real molecules.
 
+## Multi-core on one Trn2 chip (#24)
+
+The setup is trn2.3xlarge, SDK 2.33 (native TorchNeuron), LNC=2, so there are
+4 logical cores, and the whole chip was held for each run. Host threads were
+pinned to 2 CPUs (`taskset -c 4,5`, `OMP_NUM_THREADS=2`). Times are warm
+medians in ms, fp32. The inputs are synthetic `examples/df_mp2._make_inputs`,
+and "packed" also symmetrises (μν|P). Reproduce with
+`scripts/bench_parallel.py` (SPMD, under `torchrun`) and
+`scripts/bench_multicore.py` (single process, and the CPU baselines).
+
+### DF-MP2 end to end, from host inputs
+
+- **single-core** is `examples/df_mp2.df_mp2_energy`
+  (`use_batched_pair=True`) on `neuron:0`. Its time is warm compute plus
+  one upload of the inputs.
+- **SPMD** is `trnblas.parallel.df_mp2_energy`, one process per core.
+- **packed** passes the lower triangle of the ERI (`eri_symmetric=True`).
+
+| nbasis/nocc/naux | single-core | SPMD 1 / 2 / 4 | SPMD packed 1 / 2 / 4 | best vs single-core |
+|---|---|---|---|---|
+| 512/64/1536 | 348 | 346 / 203 / 162 | 309 / 171 / 138 | **2.5×** |
+| 768/96/2304 | 1323 | 1326 / 831 / 620 | 1192 / 696 / 459 | **2.9×** |
+
+On 2 CPU threads (`torch` / MKL), the energy step alone takes 14.5 s at
+512/64/1536 and 94 s at 768/96/2304.
+
+Scaling efficiency of SPMD against its own 1-rank time, at 2 / 4 ranks:
+
+| shape | full ERI | packed ERI | energy step alone |
+|---|---|---|---|
+| 512/64/1536 | 85% / 53% | 90% / 56% | 92% / 89% (124 / 67 / 35 ms) |
+| 768/96/2304 | 80% / 53% | 86% / 65% | 91% / 90% (691 / 380 / 193 ms) |
+
+- **The energy step scales almost linearly.** All-gathering B (147–567 MB)
+  takes 2–11 ms.
+- **The rest is fixed cost.** The ERI upload is bound by the host link
+  (~13 GB/s for the chip, 1.6 / 5.4 GB). The metric factor runs on rank 0
+  (90 / 200 ms) while the other ranks upload. The packed ERI halves the
+  upload, and at 768/96/2304 the upload and the metric factor are then about equal.
+- Energies agree with the single-core path to 1e-7 relative.
+
+### DF-MP2 pair energy, single process (`TRNBLAS_CORES`)
+
+B is resident on `neuron:0` and staged through the host to the other cores
+(`scripts/bench_multicore.py energy`, sym route).
+
+| nocc/nvir/naux | 1 core | 2 cores | 4 cores | SPMD, same step, 4 ranks |
+|---|---|---|---|---|
+| 64/448/1536 | 120 | 106 | 108 | 35 |
+| 96/672/2304 | 685 | 485 | 389 | 193 |
+
+With the data already on each core, the same row split runs 111 / 62 / 40
+and 664 / 362 / 189 ms. The difference from the table above is the host
+staging. That is why the single-process path is opt-in, and why `auto` splits
+only above 1e13 flop.
+
+### GEMM, C = A @ B fp32
+
+**resident** means the shards are already on their cores. **gathered** adds
+the all-gather (or, for K, the all-reduce) that gives every rank the full C.
+Single-core aten is 4.13 ms at 4096³ and 30.6 ms at 8192³. The NKI kernel
+takes 12.1 ms at 4096³. CPU on 2 threads takes 356 ms and 2.79 s.
+
+| 8192³ | 1 | 2 | 4 | 4-core efficiency |
+|---|---|---|---|---|
+| single process, resident, row (1 thread / thread per core) | 30.6 | 18.0 / 17.8 | 9.3 / 11.6 | 82% |
+| single process, resident, col | 30.6 | 18.1 / 18.1 | 12.8 / 12.7 | 60% |
+| SPMD row, compute / gathered | 30.2 / 31.2 | 19.1 / 24.1 | 10.6 / 13.5 | 71% / 58% |
+| SPMD col, compute / gathered | 30.2 / 33.8 | 19.6 / 26.3 | 10.9 / 15.6 | 69% / 54% |
+| SPMD K, compute / all-reduced | 29.9 / 34.7 | 19.4 / 26.8 | 10.6 / 15.0 | 71% / 58% |
+| single process, host A, B → host C (row) | 148 | 166 | 204 | — |
+| single process, A, B on `neuron:0`, staged (row) | 30.6 | 209 | 456 | — |
+
+At 4096³, resident compute is 4.1 / 2.4 / 1.6–2.3 ms across the modes. The
+host-input split runs 42–61 ms and the staged split 53–173 ms.
+
+- **A transparent multi-core `gemm` on `neuron:0` data loses at every size.**
+  Staging the operands through the host costs more than the GEMM itself.
+  The default `gemm` is therefore unchanged.
+- **Host-input GEMM is bound by the host link.** Splitting it only adds
+  copies, so it gets slower with more cores.
+- **The split pays only when the shards already live on their cores.** For
+  compute alone, threads and processes come out the same: at these sizes
+  there are few launches, so the host is not the bottleneck. Processes win
+  as soon as data has to move, because they can use collectives.
+
+### Transfers and collectives
+
+| | rate |
+|---|---|
+| host → device, from 1 thread, 4 threads, or 4 processes at once | 12.5–13.0 GB/s total |
+| device → host, `copy_` into a reused / pinned buffer | 13.0–13.3 GB/s |
+| device → host, `.cpu()` or into fresh memory (> 64 MB) | 2.8–3.1 GB/s |
+| all-gather 4 × 147 MB / broadcast 588 MB / reduce-scatter 680 MB | 5–6 / 10 / 12 ms |
+
 ## DF-MP2 end-to-end — Trainium1 vs NVIDIA A10G
 
 Synthetic inputs, same seed, same three shapes on both platforms.

@@ -1124,6 +1124,12 @@ def nki_batched_pair_energy(
     if not _use_nki():
         return _torch_batched_pair_energy(B, eps_occ, eps_vir)
     route = _pair_energy_route(B)
+    if route in ("sym", "aten"):
+        from .multicore import pair_energy_devices, pair_energy_multicore
+
+        devices = pair_energy_devices(B)
+        if devices is not None:
+            return pair_energy_multicore(B, eps_occ, eps_vir, route, devices)
     if route == "aten":
         return _torch_chunked_pair_energy(B, eps_occ, eps_vir)
     if route == "sym":
