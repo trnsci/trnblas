@@ -1143,7 +1143,7 @@ def nki_batched_pair_energy(
         return _torch_batched_pair_energy(B, eps_occ, eps_vir)
 
 
-# ── Native batched-pair energy: symmetric, LNC=2 kernel (`_pair_energy_sym_kernel`) ──
+# ── Native batched-pair energy: symmetric kernel, both cores at LNC=2 (`_pair_energy_sym_kernel`) ──
 #
 # On device-resident inputs on the native path, `nki_batched_pair_energy` picks
 # between the LNC=2 symmetric kernel and aten (chunked GEMM + torch reduction):
@@ -2522,12 +2522,16 @@ if HAS_NKI:
 
     @nki.jit
     def _pair_energy_sym_kernel(bt_i, Bw, eps_occ_i, eps_occ_w, eps_vir_col, eps_vir_row):
-        """DF-MP2 pair energies for one occupied row i over a window of j (native, LNC=2).
+        """DF-MP2 pair energies for one occupied row i over a window of j (native).
 
-        Launched as ``_pair_energy_sym_kernel[2](...)``: the two programs are the
-        two physical cores of a Trn2 LNC=2 logical core, each taking half of the
-        j window. The standalone GEMM kernels above run as one program, which is
-        most of why aten `matmul` (which uses both cores) beats them.
+        Launched gridless. At LNC=2 (the Trn2 default) NKI traces it once per
+        physical core of the logical core (`num_programs() == 2`) and each core
+        takes half of the j window; at LNC=1 there is one program and it takes
+        the whole window. The logical-core size comes from
+        NEURON_LOGICAL_NC_CONFIG, so the same launch works at both (an explicit
+        `kernel[2]` grid fails to compile at LNC=1 with NCC_EVRF066). The
+        standalone GEMM kernels above run as one program, which is most of why
+        aten `matmul` (which uses both cores) beats them.
 
         bt_i:        (NAUX, NVIR) = B[i].T, so Tensor Engine operands are plain
                      loads (no DMA transposes). Loaded into SBUF once per launch.
@@ -2552,8 +2556,11 @@ if HAS_NKI:
         NA = NVIR // TILE
         NB = NVIR // TN
         NK = NAUX // TILE
-        pid = nl.program_id(0)
-        NJ = ND // 2
+        n_prog = nl.num_programs() if nl.program_ndim() > 0 else 1
+        if ND % n_prog != 0:  # ND is even, so this only guards n_prog > 2
+            n_prog = 1
+        pid = nl.program_id(0) if n_prog > 1 else 0
+        NJ = ND // n_prog
         e_partial = nl.ndarray((TILE, ND), dtype=nl.float32, buffer=nl.shared_hbm)
         eps_i = nl.load(eps_occ_i[0:1, 0:1])
         ev_row = nl.load(eps_vir_row[0:1, 0:NVIR])

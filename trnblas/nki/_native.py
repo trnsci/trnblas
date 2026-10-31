@@ -163,8 +163,10 @@ def pair_energy_sym(
     eps_vir_col: torch.Tensor,
     eps_vir_row: torch.Tensor,
 ) -> torch.Tensor:
-    # Grid of 2: one program per physical core of the LNC=2 logical core.
-    return _d._pair_energy_sym_kernel[2](bt_i, Bw, eps_occ_i, eps_occ_w, eps_vir_col, eps_vir_row)
+    # Gridless: at LNC=2 NKI runs one program per physical core and the kernel
+    # splits the j window by program_id; at LNC=1 one program does it all.
+    # (`kernel[2]` fails to compile at LNC=1: NCC_EVRF066.)
+    return _d._pair_energy_sym_kernel(bt_i, Bw, eps_occ_i, eps_occ_w, eps_vir_col, eps_vir_row)
 
 
 # Keyed by the short op name used in `dispatch._launch` / `_call_kernel`.
