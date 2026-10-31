@@ -227,6 +227,41 @@ class TestNativeDevicePolicy:
         assert float(e) == pytest.approx(_pair_reference(B, eps_occ, eps_vir), rel=1e-5)
 
 
+def _visible_cores() -> int:
+    try:
+        import torch_neuronx
+
+        return int(torch_neuronx.device_count())
+    except Exception:
+        return 0
+
+
+class TestNativeMultiCorePairEnergy:
+    """The #24 row split; needs NEURON_RT_VISIBLE_CORES covering 2+ logical cores."""
+
+    @pytest.fixture(autouse=True)
+    def _cores(self):
+        if _visible_cores() < 2:
+            pytest.skip("needs 2+ visible logical NeuronCores")
+        yield
+        trnblas.set_cores(None)
+
+    @pytest.mark.parametrize("route", ["sym", "aten"])
+    @pytest.mark.parametrize("nocc,nvir,naux", [(5, 19, 71), (9, 130, 129), (16, 256, 384)])
+    def test_split_matches_single_core(self, require_nki, monkeypatch, route, nocc, nvir, naux):
+        monkeypatch.setenv("TRNBLAS_PAIR_ENERGY", route)
+        B = 0.1 * _host(nocc, nvir, naux)
+        eps_occ = -1.0 - torch.rand(nocc, generator=torch.Generator().manual_seed(2))
+        eps_vir = 0.5 + torch.rand(nvir, generator=torch.Generator().manual_seed(3))
+        args = (B.to(DEV), eps_occ.to(DEV), eps_vir.to(DEV))
+        ref = _pair_reference(B, eps_occ, eps_vir)
+        for k in sorted({2, min(4, _visible_cores())}):
+            trnblas.set_cores(k)
+            e = trnblas.nki.nki_batched_pair_energy(*args)
+            assert e.device == args[0].device
+            assert float(e) == pytest.approx(ref, rel=1e-5)
+
+
 class TestNativeMetricInvHalf:
     """`metric_inv_half` on a device-resident J: host LAPACK route vs device route."""
 
