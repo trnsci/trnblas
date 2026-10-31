@@ -104,8 +104,9 @@ _KERNELS = {
     "pair_energy_sym": (lambda d: d._pair_energy_sym_kernel, _pair_sym_inputs),
 }
 
-# Kernels launched as an LNC=2 grid (one program per physical core): verified
-# with lnc=2 on trn2 only, which is the only target they are dispatched on.
+# Native-only kernels that split work across the cores of an LNC=2 logical
+# core by program_id (and degrade to one program at LNC=1): verified on trn2
+# at both lnc=1 and lnc=2, the only target they are dispatched on.
 _LNC2 = {"pair_energy_sym"}
 
 
@@ -134,6 +135,17 @@ def test_kernel_mlir_verifies(kernel_id, target):
         frontend=FrontendKind.TRACER,
     )
     result.verify()
+
+
+@pytest.mark.parametrize("kernel_id", sorted(_LNC2))
+def test_lnc_split_kernel_verifies_at_lnc1(kernel_id):
+    """The program_id split degrades to one program at LNC=1 (trnblas#50)."""
+    from trnblas.nki import dispatch
+
+    get_kernel, make_inputs = _KERNELS[kernel_id]
+    source_to_mlir(
+        get_kernel(dispatch), *make_inputs(), target="trn2", lnc=1, frontend=FrontendKind.TRACER
+    ).verify()
 
 
 def test_every_kernel_is_covered():

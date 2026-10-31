@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`trnblas::pair_energy_sym` now compiles and runs at LNC=1**
+  (`NEURON_LOGICAL_NC_CONFIG=1`). It was launched as an explicit
+  `kernel[2]` grid, which neuronx-cc rejects at LNC=1 with `NCC_EVRF066`
+  ("configured with LNC=2, but neuronx-cc is using LNC=1"). It now launches
+  gridless and splits the j window by `nl.num_programs()`, falling back to
+  one program. Warm time at 64/448/1536 is unchanged at LNC=2 (119.7 vs
+  119.9 ms); at LNC=1 it is 231 ms on one core (#50).
+
 ## [0.7.0] — 2026-10-30
 
 Native TorchNeuron dispatch (Trn2/Trn3) alongside the PyTorch/XLA path (Trn1, maintenance); validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0) — see trnsci/trnsci#35.
