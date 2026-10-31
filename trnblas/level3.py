@@ -17,6 +17,47 @@ from __future__ import annotations
 import torch
 
 
+def _owned_inplace_ok(result: torch.Tensor) -> bool:
+    """True when `result` (a fresh tensor the wrapper owns) may be updated in place.
+
+    Not under autograd, and only for contiguous floating/complex results, so
+    the returned tensor keeps the dense layout and dtype that `alpha * result`
+    gave.
+    """
+    return (
+        not (torch.is_grad_enabled() and result.requires_grad)
+        and result.is_contiguous()
+        and (result.is_floating_point() or result.is_complex())
+    )
+
+
+def _scale_add(
+    result: torch.Tensor, alpha: float, beta: float, C: torch.Tensor | None
+) -> torch.Tensor:
+    """`alpha * result + beta * C` for a fresh `result` the wrapper owns.
+
+    Written in place when that gives the same tensor: for host results, each
+    out-of-place step is another pass into freshly allocated memory, which is
+    bound by page faults (~4.6 GB/s on trn2, #61), not by the arithmetic.
+    """
+    add = C is not None and beta != 0.0
+    inplace = _owned_inplace_ok(result)
+    if inplace and add:
+        inplace = (
+            C.dtype == result.dtype
+            and C.device == result.device
+            and torch.broadcast_shapes(result.shape, C.shape) == result.shape
+        )
+    if not inplace:
+        result = alpha * result
+        return result + beta * C if add else result
+    if alpha != 1.0:
+        result.mul_(alpha)
+    if add:
+        result.add_(C, alpha=beta)
+    return result
+
+
 def gemm(
     alpha: float,
     A: torch.Tensor,
@@ -44,14 +85,11 @@ def gemm(
     a = _neuron_mm_lhs(a, b)
 
     if _use_nki() and a.dim() == 2 and b.dim() == 2:
-        result = alpha * nki_gemm(a, b)
+        result = nki_gemm(a, b)
     else:
-        result = alpha * torch.matmul(a, b)
+        result = torch.matmul(a, b)
 
-    if C is not None and beta != 0.0:
-        result = result + beta * C
-
-    return result
+    return _scale_add(result, alpha, beta, C)
 
 
 def batched_gemm(
@@ -74,10 +112,7 @@ def batched_gemm(
 
     a = A.transpose(-2, -1) if transA else A
     b = B.transpose(-2, -1) if transB else B
-    result = alpha * nki_batched_gemm(a, b)
-    if C is not None and beta != 0.0:
-        result = result + beta * C
-    return result
+    return _scale_add(nki_batched_gemm(a, b), alpha, beta, C)
 
 
 def symm(
@@ -130,16 +165,16 @@ def syrk(
     `gemm(A, A.T)` call pattern.
     """
     from .nki import nki_syrk
+    from .nki.dispatch import _symmetrize
 
     A_eff = A.T.contiguous() if trans else A
-    result = alpha * nki_syrk(A_eff)
-
-    if C is not None and beta != 0.0:
-        result = result + beta * C
-
     # Symmetrize (fp32 reduction-order rounding can leave tiny asymmetry).
-    result = 0.5 * (result + result.T)
-    return result
+    # Without C, symmetrize A A^T before scaling: alpha * sym(S) is exactly
+    # symmetric, and a large host-input result is symmetrised on the device
+    # (#61). With C, symmetrize the sum, as before.
+    add = C is not None and beta != 0.0
+    result = _scale_add(nki_syrk(A_eff, symmetrize=not add), alpha, beta, C)
+    return _symmetrize(result) if add else result
 
 
 def trsm(

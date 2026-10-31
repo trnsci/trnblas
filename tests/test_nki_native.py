@@ -288,3 +288,49 @@ class TestNativeMetricInvHalf:
     def test_auto_takes_host_below_crossover(self, require_nki, monkeypatch):
         monkeypatch.delenv("TRNBLAS_METRIC_SOLVE", raising=False)
         assert D._metric_solve_route(torch.eye(71).to(DEV)) == "host"
+
+
+class TestNativeHostOutput:
+    """Host results come from the caching host allocator, fresh per call (#61)."""
+
+    def test_large_host_gemm_result_is_cached_host_memory(self, require_nki, monkeypatch):
+        monkeypatch.delenv("TRNBLAS_PINNED_OUTPUT", raising=False)
+        A, B = _host(1024, 512), _host(512, 1024, seed=1)  # 4 MiB result
+        C1 = trnblas.gemm(1.0, A, B)
+        C2 = trnblas.gemm(2.0, A, B)
+        assert C1.device.type == "cpu" and C1.is_pinned() and C1.is_contiguous()
+        assert C1.data_ptr() != C2.data_ptr()
+        ref = A.double() @ B.double()
+        assert _rel(C1, ref) < 1e-5
+        assert _rel(C2, 2.0 * ref) < 1e-5
+        # A freed result's block is recycled, and the live one is untouched.
+        del C2
+        C3 = trnblas.gemm(3.0, A, B)
+        assert _rel(C1, ref) < 1e-5
+        assert _rel(C3, 3.0 * ref) < 1e-5
+
+    def test_env_off_returns_pageable(self, require_nki, monkeypatch):
+        monkeypatch.setenv("TRNBLAS_PINNED_OUTPUT", "0")
+        A, B = _host(1024, 512), _host(512, 1024, seed=1)
+        C = trnblas.gemm(1.0, A, B)
+        assert not C.is_pinned()
+        assert _rel(C, A.double() @ B.double()) < 1e-5
+
+    def test_small_result_skips_cache(self, require_nki):
+        A, B = _host(64, 64), _host(64, 64, seed=1)
+        assert not trnblas.gemm(1.0, A, B).is_pinned()
+
+    def test_host_syrk_batched_trsm(self, require_nki):
+        A = _host(1024, 256)
+        S = trnblas.syrk(1.0, A)
+        assert S.is_pinned() and torch.equal(S, S.T)
+        assert _rel(S, A.double() @ A.double().T) < 1e-5
+        X, Y = _host(4, 512, 256), _host(4, 256, 512, seed=1)
+        Z = trnblas.batched_gemm(0.5, X, Y)
+        assert Z.is_pinned()
+        assert _rel(Z, 0.5 * (X.double() @ Y.double())) < 1e-5
+        n = 512
+        L = torch.tril(_host(n, n)) * 0.01 + 3 * torch.eye(n)
+        R = _host(n, 1024, seed=2)
+        T = trnblas.trsm(1.0, L, R, uplo="lower")
+        assert _rel(L.double() @ T.double(), R.double()) < 1e-5
