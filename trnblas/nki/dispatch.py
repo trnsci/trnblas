@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import math
 import os
 import warnings
 from pathlib import Path
@@ -273,9 +274,17 @@ def nki_batched_gemm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     natural use case is one batched_gemm with batch=N_aux per orbital
     pair — exactly this loop's sweet spot.
     """
-    if not _use_nki() or _gemm_via_aten(A, B):
+    if not _use_nki() or _gemm_via_aten(A, B) or A.shape[0] == 0:
         return torch.matmul(A, B)
-    return torch.stack([_nki_gemm_impl(A[i], B[i]) for i in range(A.shape[0])])
+    # Each slice is copied into one preallocated result as it arrives (a
+    # `torch.stack` would be one more pass into fresh host memory, #61).
+    out = None
+    for i in range(A.shape[0]):
+        c = _nki_gemm_impl(A[i], B[i])
+        if out is None:
+            out = _host_empty((A.shape[0], *c.shape), c.dtype, c.device)
+        out[i].copy_(c)
+    return out
 
 
 def _torch_mp2_energy(
@@ -385,7 +394,7 @@ def nki_gemm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     return torch.matmul(A, B)
 
 
-def nki_syrk(A: torch.Tensor) -> torch.Tensor:
+def nki_syrk(A: torch.Tensor, symmetrize: bool = False) -> torch.Tensor:
     """SYRK via single-operand NKI matmul. Returns A @ A.T.
 
     On NKI: dispatches `_syrk_kernel`, which loads A directly for both
@@ -393,10 +402,15 @@ def nki_syrk(A: torch.Tensor) -> torch.Tensor:
     happen if we just called `nki_gemm(A, A.T)`).
 
     On PyTorch: falls back to `torch.matmul(A, A.T)`.
+
+    ``symmetrize=True`` returns ``0.5 * (C + C.T)`` (bitwise the same values),
+    which is exactly symmetric. On the native path a large host-input result
+    is symmetrised on the device before it comes down (#61).
     """
     if _use_nki() and not _gemm_via_aten(A):
-        return _nki_syrk_impl(A)
-    return torch.matmul(A, A.T)
+        return _nki_syrk_impl(A, symmetrize=symmetrize)
+    r = torch.matmul(A, A.T)
+    return _symmetrize(r) if symmetrize else r
 
 
 def nki_trsm(
@@ -494,7 +508,9 @@ def _nki_trsm_left(
         X = torch.linalg.solve_triangular(mat, B, upper=eff_upper, unitriangular=unit)
         return alpha * X
 
-    X = B.clone()
+    # In place throughout: on host operands every out-of-place step would be
+    # another pass into fresh, page-faulting memory (#61).
+    X = _host_empty_like(B).copy_(B)
     if not eff_upper:
         # Lower triangular: forward substitution.
         for k in range(0, M, block):
@@ -506,7 +522,7 @@ def _nki_trsm_left(
                 unitriangular=unit,
             )
             if ke < M:
-                X[ke:] = X[ke:] - nki_gemm(mat[ke:, k:ke].contiguous(), X[k:ke])
+                X[ke:].sub_(nki_gemm(mat[ke:, k:ke].contiguous(), X[k:ke]))
     else:
         # Upper triangular: back substitution.
         for k in range(M, 0, -block):
@@ -518,8 +534,8 @@ def _nki_trsm_left(
                 unitriangular=unit,
             )
             if ks > 0:
-                X[:ks] = X[:ks] - nki_gemm(mat[:ks, ks:k].contiguous(), X[ks:k])
-    return alpha * X
+                X[:ks].sub_(nki_gemm(mat[:ks, ks:k].contiguous(), X[ks:k]))
+    return X.mul_(alpha) if alpha != 1.0 else X
 
 
 # ── DF metric factor J^-1/2 = L^-T: host LAPACK vs device ────────────────────
@@ -739,6 +755,72 @@ def _to_device(*tensors):
     return _to_xla(*tensors)
 
 
+# ── Host-link downloads (#61) ────────────────────────────────────────────────
+#
+# Copying device -> host into fresh host memory is bound by first-touch page
+# faults, not by the link. Measured on trn2 (SDK 2.33, one logical core,
+# 2 host threads), one copy down:
+#
+#   destination                                     64 MB   256 MB    1 GB
+#   `.cpu()` / `.to("cpu")` / `torch.empty` + copy_   3.8     3.9      4.1 GB/s
+#   `torch.empty` + `zero_()` (prefault) + copy_      3.6     3.8      4.0
+#   fresh mmap with MADV_HUGEPAGE + copy_             7.6     8.0      8.0
+#   reused host buffer, copy_                        12.9    13.8     14.2
+#   fresh `torch.empty(pin_memory=True)` + copy_     12.8    13.9     14.2
+#
+# `pin_memory=True` goes through the accelerator's caching host allocator.
+# Each call still gets a fresh tensor, and a block is recycled only after the
+# tensor that owned it has been freed, so results never alias. The memory
+# comes back already faulted in. Uploads from pageable memory already run at
+# the link rate (13.5-13.8 GB/s), so uploads are unchanged.
+#
+# Costs: blocks are rounded up to a power of two, and freed blocks stay cached
+# until `torch.accelerator.empty_host_cache()`. TRNBLAS_PINNED_OUTPUT=0 turns
+# this off (plain `.to(device)`). Results under `_PINNED_OUTPUT_MIN_BYTES`
+# always take `.to(device)`. The XLA path and the simulator are unchanged.
+_PINNED_OUTPUT_MIN_BYTES = 1 << 20
+
+
+def _pinned_output_enabled() -> bool:
+    value = os.environ.get("TRNBLAS_PINNED_OUTPUT", "1").strip().lower()
+    return value not in ("0", "false", "no", "off")
+
+
+def _use_host_cache(device, nbytes: int) -> bool:
+    """True when a CPU result of `nbytes` should come from the caching host
+    allocator: native path, CPU destination, large enough, not disabled."""
+    return (
+        torch.device(device).type == "cpu"
+        and nbytes >= _PINNED_OUTPUT_MIN_BYTES
+        and _pinned_output_enabled()
+        and not _use_simulator()
+        and _get_dispatch_path() == "native"
+    )
+
+
+def _host_empty(shape, dtype: torch.dtype, device) -> torch.Tensor:
+    """`torch.empty(shape, dtype=dtype, device=device)`; a large CPU tensor on the
+    native path comes from the caching host allocator (fresh, already faulted in)."""
+    shape = tuple(shape)
+    nbytes = math.prod(shape) * torch.empty((), dtype=dtype).element_size()
+    if _use_host_cache(device, nbytes):
+        return torch.empty(shape, dtype=dtype, pin_memory=True)
+    return torch.empty(shape, dtype=dtype, device=device)
+
+
+def _host_empty_like(t: torch.Tensor) -> torch.Tensor:
+    """Contiguous `_host_empty` with `t`'s shape, dtype and device."""
+    return _host_empty(t.shape, t.dtype, t.device)
+
+
+def _to_host(t: torch.Tensor, device) -> torch.Tensor:
+    """`t.to(device)`. A large device -> CPU copy lands in a fresh tensor from
+    the caching host allocator, about 3.5x faster than `.to("cpu")` (#61)."""
+    if t.device.type == "cpu" or not _use_host_cache(device, t.numel() * t.element_size()):
+        return t.to(device)
+    return _host_empty(t.shape, t.dtype, device).copy_(t)
+
+
 def _call_kernel(kernel, op_name: str, *device_tensors: torch.Tensor) -> torch.Tensor:
     """Run one kernel on tensors already on the kernel device (see `_to_device`).
 
@@ -756,7 +838,7 @@ def _launch(kernel, op_name: str, *tensors: torch.Tensor) -> torch.Tensor:
     through `_to_device` + `_call_kernel` when operands stay resident across
     several launches)."""
     xs, orig = _to_device(*tensors)
-    return _call_kernel(kernel, op_name, *xs).to(orig)
+    return _to_host(_call_kernel(kernel, op_name, *xs), orig)
 
 
 def _device_synchronize() -> None:
@@ -1678,7 +1760,42 @@ def _nki_fused_gemm_energy_impl(
     return partial.sum()
 
 
-def _nki_syrk_impl(A: torch.Tensor) -> torch.Tensor:
+# Host-side 0.5 * (C + C.T) reads C transposed, which is cache-hostile. For
+# 8192^2 fp32 on 2 threads (trn2 host) it takes 726 ms out of place, 596 ms
+# into cached memory and 224 ms blocked in place; at 1024^2 it takes 5.0 /
+# 1.6 ms. On the device it takes 2.9 ms at 8192^2 and 0.4 ms at 1024^2, plus
+# a one-off compile of up to ~2.5 s per shape, cached on disk afterwards.
+# Results with n >= this go through the device; smaller ones use the blocked
+# host version. Both give bitwise the same values as `0.5 * (C + C.T)`.
+_SYRK_DEVICE_SYM_MIN_N = 1024
+_SYM_BLOCK = 512
+
+
+def _symmetrize(r: torch.Tensor) -> torch.Tensor:
+    """`0.5 * (r + r.T)`. A fresh, owned, dense CPU `r` is updated in place, in
+    blocks (no fresh host memory, cache-friendly transposes)."""
+    if not (
+        r.device.type == "cpu"
+        and r.dim() == 2
+        and r.is_contiguous()
+        and r.is_floating_point()
+        and not (torch.is_grad_enabled() and r.requires_grad)
+    ):
+        return 0.5 * (r + r.T)
+    n, bs = r.shape[0], _SYM_BLOCK
+    for i in range(0, n, bs):
+        ie = min(i + bs, n)
+        d = r[i:ie, i:ie]
+        d.copy_(0.5 * (d + d.T))
+        for j in range(ie, n, bs):
+            je = min(j + bs, n)
+            up, lo = r[i:ie, j:je], r[j:je, i:ie]
+            up.add_(lo.T).mul_(0.5)
+            lo.copy_(up.T)
+    return r
+
+
+def _nki_syrk_impl(A: torch.Tensor, symmetrize: bool = False) -> torch.Tensor:
     """NKI SYRK implementation. Returns A @ A.T for A of shape (M, K).
 
     Pads M to TILE_M and K to TILE_K multiples. For M > TILE_N, pads to
@@ -1709,13 +1826,26 @@ def _nki_syrk_impl(A: torch.Tensor) -> torch.Tensor:
             out_np = nki.simulate(_syrk_kernel)(A_feed.cpu().numpy())
             result = torch.from_numpy(np.asarray(out_np)).to(A.device)
         else:
-            result = _launch(_syrk_kernel, "syrk", A_feed)
-        return result[:M, :M] if needs_pad else result
+            (a,), orig = _to_device(A_feed)
+            result = _call_kernel(_syrk_kernel, "syrk", a)
+            if symmetrize and M >= _SYRK_DEVICE_SYM_MIN_N:
+                # Symmetrise on the device, before the result comes down.
+                r = result[:M, :M] if needs_pad else result
+                return _to_host(0.5 * (r + r.T), orig)
+            result = _to_host(result, orig)
+        if needs_pad:
+            result = result[:M, :M]
+        if not symmetrize:
+            return result
+        if not result.is_contiguous():
+            result = _host_empty_like(result).copy_(result)
+        return _symmetrize(result)
     except Exception as exc:
         if _REQUIRE_NKI:
             raise
         _warn_fallback(exc)
-        return torch.matmul(A, A.T)
+        r = torch.matmul(A, A.T)
+        return _symmetrize(r) if symmetrize else r
 
 
 if HAS_NKI:

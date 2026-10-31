@@ -127,6 +127,7 @@ pytest tests/ -v
 | `TRNBLAS_BATCHED_PAIR_CHUNK_THRESHOLD=<n>` | Overrides the batched-pair full-batch vs chunked routing threshold (default 4096 on XLA, 3072 on native). For re-benchmarking. |
 | `TRNBLAS_NATIVE_GEMM=auto\|nki` | Native path only. `auto` (default): `gemm` / `batched_gemm` / `syrk` / `trsm` updates on tensors already on the `neuron` device run as aten `matmul`, which is faster there. `nki` forces the NKI GEMM kernels. |
 | `TRNBLAS_PAIR_ENERGY=auto\|sym\|aten\|legacy` | Native path, device-resident inputs only. Picks the `nki_batched_pair_energy` implementation: the LNC=2 symmetric kernel, aten (chunked GEMM + reduction), or the full-batch / chunked kernels. `auto` takes `sym` above 3 GFLOP per row launch. |
+| `TRNBLAS_PINNED_OUTPUT=1\|0` | Native path only. `1` (default): host results of 1 MiB or more from the device (`gemm`, `batched_gemm`, `syrk`, `trsm` and the other host-input wrappers) are copied into a fresh tensor from the accelerator's caching host allocator (`pin_memory=True`). That is about 3.5x faster than `.to("cpu")`, which page-faults fresh memory. Freed blocks stay cached, rounded up to a power of two, until `torch.accelerator.empty_host_cache()`. `0` returns plain `.to("cpu")` results. |
 | `NKI_ENABLE_TRACE_CACHE=0` | TorchNeuron (not trnblas) setting. Turns off the cross-process NKI kernel cache, which cannot version editable installs. |
 
 ## Requirements

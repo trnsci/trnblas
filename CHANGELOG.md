@@ -40,6 +40,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `scripts/bench_parallel.py` and `scripts/bench_multicore.py`, and a
   multi-core section in `docs/benchmarks.md`.
 
+#### Host results at the host-link rate (#61)
+
+- **Host-input wrappers return results in cached host memory.** On the
+  native path, a device result of 1 MiB or more copies into a fresh tensor
+  from the accelerator's caching host allocator (`pin_memory=True`), not
+  through `.to("cpu")`. The memory is already faulted in, so the copy runs at
+  13-14 GB/s, not 4 GB/s. Every call still returns a fresh tensor: a block
+  is recycled only after its owner is freed. `TRNBLAS_PINNED_OUTPUT=0`
+  restores `.to("cpu")`. Freed blocks stay cached, rounded up to a power of
+  two, until `torch.accelerator.empty_host_cache()`.
+- **In-place epilogues** in `gemm`, `batched_gemm`, `syrk` and the blocked
+  `trsm`. `alpha`, `beta * C`, the batch stack, the SYRK symmetrisation and
+  the TRSM updates no longer allocate another fresh host tensor each. Each of
+  those was a page-fault-bound pass at about 4.6 GB/s. The out-of-place form
+  is kept under autograd, for dtype promotion and for broadcasts that grow
+  the result.
+- Helpers `_to_host` / `_host_empty` in `trnblas/nki/dispatch.py`.
+  `scripts/bench_host_link.py` (transfer options) and
+  `scripts/bench_host_wrappers.py` (wrappers end to end).
+
 ### Not changed
 
 - **`trnblas.gemm` stays single-core.** Splitting a GEMM whose operands sit on
