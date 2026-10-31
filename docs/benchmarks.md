@@ -366,6 +366,71 @@ host-input split runs 42–61 ms and the staged split 53–173 ms.
 | device → host, `.cpu()` or into fresh memory (> 64 MB) | 2.8–3.1 GB/s |
 | all-gather 4 × 147 MB / broadcast 588 MB / reduce-scatter 680 MB | 5–6 / 10 / 12 ms |
 
+## Native `auto` routing of the GEMM family (#62, #63)
+
+trn2.3xlarge, SDK 2.33 (native TorchNeuron), one LNC=2 logical core, host
+threads pinned to 2 CPUs (`taskset -c 4,5`, `OMP_NUM_THREADS=2`), warm
+medians in ms, inputs built on the host. Every candidate route was timed
+with `scripts/bench_auto_routes.py <op> <dtype>`; "`auto` before" is the
+v0.8 routing (host operands → upload + NKI kernel), "after" is this
+routing. The host CPUs share physical cores with another job on this box, so
+host-CPU times varied by up to 2-5x between runs (bf16 most); the
+thresholds were fitted to the quieter run.
+
+Host operands, host result:
+
+| op, fp32 | host CPU | upload+aten | upload+NKI | `auto` before | `auto` after |
+|---|---|---|---|---|---|
+| gemm 128³ | **0.02** | 0.27 | 0.46 | 0.43 | 0.04 |
+| gemm 384³ | **0.47** | 0.68 | 0.84 | 0.81 | 0.58 |
+| gemm 512³ | 0.87 | **0.54** | 0.67 | 0.73 | 0.79 |
+| gemm 4096³ | 438 | **19.5** | 27.6 | 27.5 | 19.6 |
+| gemm 8192³ | 3126 | **88.4** | 182 | 182 | 87.2 |
+| gemm 16×128×49152 | **1.05** | 2.70 | 2.69 | 2.71 | 1.50 |
+| gemm 32×256×196608 | 30.1 | **18.6** | 19.0 | 18.8 | 18.5 |
+| batched 16×112×128×384 | 1.51 | **1.12** | 66.7 | 18.4 | 1.20 |
+| batched 32×224×768×768 | 31.0 | **10.2** | 101 | 125 | 9.86 |
+| syrk 256×256 | **0.34** | 0.55 | 0.80 | 0.77 | 0.57 |
+| syrk 8192×2048 | 1077 | **34.9** | 58.6 | 58.1 | 35.1 |
+| symm 4096² | 606 | **20.5** | – | 636 | 21.4 |
+| trsm n=768, 768 rhs | **2.69** | 12.5 | 11.7 | 8.72 | 5.75 |
+| trsm n=2304, 2304 rhs | **59.9** | 96.9 | 100 | 121 | 77.2 |
+| trsm n=1024, 16384 rhs | 150 | 211 | **127** | 113 | 163 |
+
+- Device-resident operands go to aten, as before: aten beat the NKI kernel at
+  every GEMM, batched and SYRK shape and dtype, by 1.1x (32×256×196608) to 6x
+  (8192³ bf16: 7.7 vs 47 ms), and 20-310x for batched GEMM, which launches
+  the kernel once per slice. `set_backend("nki")` still runs the kernel.
+- bf16 moves the host/device crossover up: the host's bf16 matmul (AMX) ran
+  4096³ in 115 ms and 32×256×196608 in 4.0 ms (upload + aten: 10.2 ms).
+- The TRSM device routes are bound by the diagonal-panel solves (aten and
+  NKI updates cost the same), so host operands solve with LAPACK. The one
+  loss is a wide right-hand side, 1024 × 16384, where the old host-panel +
+  NKI-update path was faster.
+- The rule is `macs < threads/2 · (fixed + per_byte · link_bytes)` per (op,
+  dtype); see `_HOST_GEMM_MODEL` in `trnblas/nki/dispatch.py`.
+
+Umbrella DF-MP2 profile (`examples/quantum_chemistry/df_mp2_profile.py` from
+trnsci/trnsci main, `--modes cpu,host-auto,neuron`), warm total in ms. "before"
+is v0.8 in the same session, run right after the "after" rows:
+
+| size (ao/aux/occ), pipeline | cpu (after / before session) | host-auto before | host-auto after | neuron after |
+|---|---|---|---|---|
+| m (128/384/16), example | 41.3 / 62.8 | 153.2 | 29.0 | 21.9 |
+| m (128/384/16), fused | 24.1 / 24.3 | 29.8 | 28.9 | 13.2 |
+| l (256/768/32), example | 801 / 811 | 1516 | 710 | 55.3 |
+| l (256/768/32), fused | 878 / 845 | 754 | 798 | 46.7 |
+
+- host-auto at l, example: half-transform 137 → 23 ms, metric 187 → 15 ms.
+  The energy step (trntensor, on the host in both runs) also went from 1208
+  to 673 ms; its cause was not isolated.
+- At xs and s (32-64 AOs) host-auto now matches cpu (1.0 / 2.5 ms); an
+  earlier v0.8 run took 12.8 / 32.7 ms there.
+- The profile labels any non-kernel GEMM route "aten", including the host
+  route.
+- neuron mode (device-resident inputs) is unchanged within noise: v0.8 took
+  21.0 / 17.1 ms (m) and 57.6 / 47.9 ms (l).
+
 ## DF-MP2 end-to-end — Trainium1 vs NVIDIA A10G
 
 Synthetic inputs, same seed, same three shapes on both platforms.

@@ -147,25 +147,77 @@ _RAGGED_ENABLED: bool = os.environ.get("TRNBLAS_GEMM_RAGGED", "1").lower() not i
     "false",
     "no",
 )
-# Native-path GEMM policy. The standalone NKI GEMM kernels here run as one
-# program and stage A through DMA transposes; a spike of the same loop as an
-# LNC=2 grid (`kernel[2]`, one program per physical core) with a pre-transposed
-# A came within 8-15% of aten at 2048^3 and above. Measured on trn2 (SDK 2.33,
-# fp32, device-resident, warm), aten is faster at every shape tried:
+# ── Native-path routing of the plain GEMM family (#62, #63) ──────────────────
 #
-#   M x K x N                 aten      NKI (ragged/128-128-512)
-#   1024^3                    0.20 ms   0.54 ms
-#   2048^3                    0.65 ms   2.06 ms
-#   4096^3                    4.09 ms   12.1 ms
-#   12928 x 1536 x 28672      32.2 ms   77.5 ms   (DF-MP2 energy chunk)
+# `gemm`, `batched_gemm`, `syrk`, `symm` and left `trsm` have three candidate
+# routes on the native path: the NKI kernel, aten on the `neuron` device, and
+# (for host inputs) the op in torch on the host CPU. `_gemm_route` picks one
+# from measured times (scripts/bench_auto_routes.py; tables in #63 / #62):
 #
-# so there is no crossover to route on: plain GEMM-family calls (`gemm`,
-# `batched_gemm`, `syrk`, and the trailing updates inside `trsm`) on tensors
-# that already live on the `neuron` device go to aten. Host tensors keep the
-# NKI path (aten there would mean the CPU). The fused kernels (MP2 energy,
-# batched pair) are not affected. TRNBLAS_NATIVE_GEMM=nki restores the NKI
-# kernels for device-resident operands (for validation and re-benchmarking).
-_NATIVE_GEMM_CHOICES = ("auto", "nki")
+# trn2.3xlarge, SDK 2.33, one LNC=2 logical core, 2 pinned host threads, warm
+# medians in ms. Host operands, host result (upload + op + download):
+#
+#   op / shape (fp32)          host CPU   upload+aten   upload+NKI
+#   gemm 256^3                    0.12        0.33         0.42
+#   gemm 384^3                    0.47        0.68         0.84
+#   gemm 512^3                    0.87        0.54         0.67
+#   gemm 4096^3                    438        19.5         27.6
+#   gemm 8192^3                   3126        88.4          182
+#   gemm 16x128x49152             1.05        2.70         2.69
+#   gemm 32x256x196608            30.1        18.6         19.0
+#   batched 16x112x128x384        1.51        1.12         66.7
+#   batched 16x1024^3              131        17.7         99.6
+#   syrk 256x256                  0.34        0.55         0.81
+#   syrk 8192x2048                1077        34.9         58.6
+#   symm 4096^2                    606        20.5            -
+#   trsm 768, 768 rhs             2.69        12.5         11.7
+#   trsm 2304, 2304 rhs           59.9        96.9          100
+#
+# bf16 moves the host/device crossover up 2-30x: the host's bf16 matmul
+# (AMX) ran 4096^3 in 115 ms and 32x256x196608 in 4.0 ms (device 10.2 ms).
+# Device-resident operands: aten beat the NKI kernel at every GEMM, batched
+# and SYRK shape and dtype measured, by 1.1x (32x256x196608, syrk 1024x256)
+# to 6x (8192^3 bf16: 7.7 vs 47 ms; fp32 29.4 vs 116 ms), and by 20-310x for
+# batched_gemm (one kernel launch per slice); there is no crossover. The NKI
+# GEMM stays reachable through `set_backend("nki")` / TRNBLAS_NATIVE_GEMM=nki.
+# TRSM: see `_trsm_route`.
+#
+# The host CPUs on the measurement box share physical cores with other jobs,
+# and host-CPU times swung 2-5x between runs (bf16 most). The thresholds are
+# fitted to the quieter run; on a contended host the device route is better
+# than they predict near the crossover.
+#
+# TRNBLAS_NATIVE_GEMM=auto|nki|aten|host overrides `auto` (for validation and
+# re-benchmarking; `host` applies to all-host inputs only). An explicit
+# `set_backend("nki")` always runs the NKI kernels. The XLA path, the simulator
+# and the "cpu" dispatch path keep the kernel route, as before. The fused
+# kernels (MP2 energy, batched pair, pair_energy_sym) are not affected.
+_NATIVE_GEMM_CHOICES = ("auto", "nki", "aten", "host")
+
+# Host-vs-device model: for all-host operands, the host CPU wins when
+#   macs < scale * (fixed + per_byte * link_bytes)
+# with link_bytes = upload + download bytes and scale = host threads /
+# _HOST_GEMM_MODEL_THREADS (the CPU side is compute-bound and scales with
+# threads; it was measured on 2). `fixed` is the ~0.3 ms launch-and-transfer
+# floor of the device route in host multiply-adds; `per_byte` prices the link
+# against the CPU. Fitted per (op, dtype) to the sweep; bf16 has its own row
+# because the host's bf16 matmul (AMX) is 4-6x faster than its fp32 one.
+# float16 uses the fp32 row (not measured).
+_HOST_GEMM_MODEL_THREADS = 2
+_HOST_GEMM_MODEL: dict[tuple[str, str], tuple[float, float]] = {
+    ("gemm", "fp32"): (6.0e7, 4.0),
+    ("gemm", "bf16"): (2.5e8, 25.0),
+    ("batched_gemm", "fp32"): (6.0e7, 4.0),
+    ("batched_gemm", "bf16"): (2.5e8, 100.0),
+    ("syrk", "fp32"): (6.0e7, 4.0),
+    ("syrk", "bf16"): (1.5e8, 25.0),
+    ("symm", "fp32"): (6.0e7, 4.0),
+    ("symm", "bf16"): (2.5e8, 25.0),
+}
+# Only these dtypes have a device route under `auto`; anything else on the
+# host (float64, complex, integer) stays on the host, where it ran correctly
+# before (Trainium has no float64 matmul).
+_DEVICE_GEMM_DTYPES = {torch.float32: "fp32", torch.bfloat16: "bf16", torch.float16: "fp32"}
 
 
 def _native_gemm_policy() -> str:
@@ -181,11 +233,95 @@ def _on_neuron_device(*tensors: torch.Tensor) -> bool:
     return all(t.device.type == "neuron" for t in tensors)
 
 
+def _on_host(*tensors: torch.Tensor) -> bool:
+    return all(t.device.type == "cpu" for t in tensors)
+
+
+def _upload_nbytes(t: torch.Tensor) -> int:
+    """Bytes `_upload(t)` sends over the host link (0 if already on the device)."""
+    if t.device.type == "neuron":
+        return 0
+    if t.dim() >= 3 and t.stride(0) == 0:
+        return _upload_nbytes(t[0])
+    return t.numel() * t.element_size()
+
+
+def _upload(t: torch.Tensor) -> torch.Tensor:
+    """`t` on the `neuron` device, sending each distinct byte once.
+
+    A strided upload is far slower than a dense one on trn2 (~60x for the
+    column-major metric factor, see `_host_inv_chol_factor`), and a host-side
+    `.contiguous()` is a page-fault-bound pass. So a transposed view uploads
+    its dense base and is transposed back on the device, and a batch-broadcast
+    operand (stride 0 on the batch dim, e.g. `C.T.expand(nocc, ...)`) uploads
+    one slice and is expanded on the device.
+    """
+    if t.device.type == "neuron":
+        return t
+    if t.is_contiguous():
+        return t.to(_NEURON_DEVICE)
+    if t.dim() >= 3 and t.stride(0) == 0:
+        return _upload(t[0]).unsqueeze(0).expand(t.shape)
+    if t.dim() >= 2:
+        tt = t.transpose(-2, -1)
+        if tt.is_contiguous():
+            return tt.to(_NEURON_DEVICE).transpose(-2, -1)
+    return t.contiguous().to(_NEURON_DEVICE)
+
+
+def _host_gemm_wins(op: str, macs: float, nbytes: int, dtype: torch.dtype) -> bool:
+    """True when `op` on all-host operands is faster on the host CPU than
+    upload + aten + download (see `_HOST_GEMM_MODEL`)."""
+    kind = _DEVICE_GEMM_DTYPES.get(dtype)
+    if kind is None:
+        return True
+    fixed, per_byte = _HOST_GEMM_MODEL[(op, kind)]
+    scale = max(1, torch.get_num_threads()) / _HOST_GEMM_MODEL_THREADS
+    return macs < scale * (fixed + per_byte * nbytes)
+
+
+def _gemm_route(
+    *tensors: torch.Tensor, op: str = "gemm", macs: float | None = None, nbytes: int | None = None
+) -> str:
+    """'torch', 'nki', 'aten' or 'host' for a plain GEMM-family call.
+
+    'torch' is the pytorch backend (torch on whatever device the data is on).
+    `macs` / `nbytes` (multiply-adds and host-link bytes) are needed only for
+    all-host operands under `auto`; they default to `tensors[0] @ tensors[1]`.
+    """
+    if not _use_nki():
+        return "torch"
+    if _backend == "nki" or _use_simulator() or _get_dispatch_path() != "native":
+        return "nki"
+    policy = _native_gemm_policy()
+    if policy in ("nki", "aten"):
+        return policy
+    if not _on_host(*tensors):
+        return "aten"  # device-resident (or mixed): aten at every measured shape
+    if policy == "host":
+        return "host"
+    if macs is None:
+        a, b = tensors[0], tensors[1]
+        macs = a.shape[-2] * a.shape[-1] * b.shape[-1] * max(1, math.prod(a.shape[:-2]))
+        nbytes = (
+            sum(_upload_nbytes(t) for t in tensors[:2])
+            + (macs // max(1, a.shape[-1])) * a.element_size()
+        )
+    return "host" if _host_gemm_wins(op, macs, nbytes, tensors[0].dtype) else "aten"
+
+
 def _gemm_via_aten(*tensors: torch.Tensor) -> bool:
-    """True when a plain GEMM on these operands should run as aten on the device."""
-    if _use_simulator() or not _on_neuron_device(*tensors):
-        return False
-    return _native_gemm_policy() == "auto"
+    """True when a plain GEMM on these operands does not run the NKI kernel
+    (aten on the device, or torch on the host). Kept for callers that only
+    distinguish kernel from not-kernel (e.g. the umbrella DF-MP2 profile)."""
+    return _gemm_route(*tensors) in ("aten", "host")
+
+
+def _aten_on_device(fn, *tensors: torch.Tensor) -> torch.Tensor:
+    """`fn(*tensors)` as aten on the `neuron` device; the result is returned on
+    the device of the first input (host results come down through `_to_host`)."""
+    orig = tensors[0].device
+    return _to_host(fn(*[_upload(t) for t in tensors]), orig)
 
 
 # aten::mm on the native `neuron` device aborts (execution timeout, then
@@ -274,8 +410,13 @@ def nki_batched_gemm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     natural use case is one batched_gemm with batch=N_aux per orbital
     pair — exactly this loop's sweet spot.
     """
-    if not _use_nki() or _gemm_via_aten(A, B) or A.shape[0] == 0:
+    if A.shape[0] == 0:
         return torch.matmul(A, B)
+    route = _gemm_route(A, B, op="batched_gemm")
+    if route in ("torch", "host"):
+        return torch.matmul(A, B)
+    if route == "aten":
+        return _aten_on_device(torch.matmul, A, B)
     # Each slice is copied into one preallocated result as it arrives (a
     # `torch.stack` would be one more pass into fresh host memory, #61).
     out = None
@@ -389,8 +530,11 @@ def nki_gemm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     For DF-MP2 tensor contractions where A is the MO coefficient matrix
     (reused across auxiliary basis indices), this cuts SBUF loads in half.
     """
-    if _use_nki() and not _gemm_via_aten(A, B):
+    route = _gemm_route(A, B)
+    if route == "nki":
         return _nki_gemm_impl(A, B)
+    if route == "aten":
+        return _aten_on_device(lambda a, b: torch.matmul(_neuron_mm_lhs(a, b), b), A, B)
     return torch.matmul(A, B)
 
 
@@ -407,9 +551,20 @@ def nki_syrk(A: torch.Tensor, symmetrize: bool = False) -> torch.Tensor:
     which is exactly symmetric. On the native path a large host-input result
     is symmetrised on the device before it comes down (#61).
     """
-    if _use_nki() and not _gemm_via_aten(A):
+    M, K = A.shape
+    route = _gemm_route(A, op="syrk", macs=M * M * K, nbytes=(M * K + M * M) * A.element_size())
+    if route == "nki":
         return _nki_syrk_impl(A, symmetrize=symmetrize)
-    r = torch.matmul(A, A.T)
+    if route == "aten" and A.device.type != "neuron":
+        a = _upload(A)
+        r = torch.matmul(a, a.T)
+        if symmetrize:
+            # Symmetrise on the device, before the result comes down (#61):
+            # a few aten ops there, no kernel compile, bitwise 0.5 * (C + C.T).
+            return _to_host(0.5 * (r + r.T), A.device)
+        r = _to_host(r, A.device)
+    else:
+        r = torch.matmul(A, A.T)
     return _symmetrize(r) if symmetrize else r
 
 
@@ -433,16 +588,71 @@ def nki_trsm(
 
     Falls back to torch for side='right' (uncommon in chemistry hot
     paths) or when _use_nki() is False.
+
+    On the native path `auto` picks the route for the whole solve
+    (`_trsm_route`): host operands solve with LAPACK on the host, and
+    device-resident operands run the blocked solve with aten updates on the
+    device. `TRNBLAS_NATIVE_GEMM=aten` uploads host operands once and runs
+    the blocked solve on the device. The NKI route (explicit
+    `set_backend("nki")`, the XLA path) uses the NKI GEMM for every update.
     """
-    if side != "left" or not _use_nki():
+    if side != "left" or not _use_nki() or B.dim() != 2:
         return _trsm_torch(alpha, A, B, side, uplo, trans, diag)
+    route = _trsm_route(A, B)
+    if route == "host":
+        return _trsm_on_host(alpha, A, B, uplo, trans, diag)
     try:
-        return _nki_trsm_left(A, B, uplo, trans, diag, alpha)
+        if route == "aten":
+            if _on_neuron_device(A, B):
+                return _nki_trsm_left(A, B, uplo, trans, diag, alpha, mm=torch.matmul)
+            X = _nki_trsm_left(_upload(A), _upload(B), uplo, trans, diag, alpha, mm=torch.matmul)
+            return _to_host(X, B.device)
+        return _nki_trsm_left(A, B, uplo, trans, diag, alpha, mm=_nki_gemm_impl)
     except Exception as exc:
         if _REQUIRE_NKI:
             raise
         _warn_fallback(exc)
         return _trsm_torch(alpha, A, B, side, uplo, trans, diag)
+
+
+# TRSM on the native path (#62, #63). The blocked solve on the device is
+# bound by its diagonal-panel `solve_triangular` launches, not by the GEMM
+# updates: with aten or NKI updates it costs the same (fp32, device-resident:
+# 12 ms at n = 768, 91 ms at 2304, 200 ms at 1024 x 16384 rhs). From host
+# operands, LAPACK on 2 host threads was 1.6-30x faster than every device
+# route up to n = 2304 in the quieter run, and within noise of the best device
+# route on wide right-hand sides (1024 x 16384: 150-160 ms vs 127-153 ms for
+# host panels + NKI updates); 2048 x 8192 favoured upload + blocked aten (215
+# vs 258 ms). With the host CPUs contended (see above), the device route won
+# from n = 1536 (41 vs 55 ms) and on wide right-hand sides (1024 x 16384: 197
+# vs 275 ms). So `auto` solves host operands on the host, and keeps
+# device-resident operands on the device (copying them down to solve was
+# within noise of the device route, sometimes slower). bf16/fp16 host
+# operands solve in fp32 (LAPACK has no bf16 TRSM; `auto` used to raise).
+
+
+def _trsm_route(A: torch.Tensor, B: torch.Tensor) -> str:
+    """'nki', 'aten' or 'host' for a left TRSM (with `_use_nki()`)."""
+    if _backend == "nki" or _use_simulator() or _get_dispatch_path() != "native":
+        return "nki"
+    policy = _native_gemm_policy()
+    if policy in ("nki", "aten"):
+        return policy
+    return "host" if _on_host(A, B) else "aten"
+
+
+def _trsm_on_host(
+    alpha: float, A: torch.Tensor, B: torch.Tensor, uplo: str, trans: bool, diag: str
+) -> torch.Tensor:
+    """Left TRSM with LAPACK on the host; the result has B's device and dtype."""
+    dev, dt = B.device, B.dtype
+    cdt = torch.float32 if dt in (torch.bfloat16, torch.float16) else dt
+    Ah = A.detach().to(device="cpu", dtype=cdt)
+    Bh = B.detach().to(device="cpu", dtype=cdt)
+    X = _trsm_torch(alpha, Ah, Bh, "left", uplo, trans, diag)
+    if X.dtype != dt:
+        X = X.to(dt)
+    return X if dev.type == "cpu" else X.contiguous().to(dev)
 
 
 def _trsm_torch(
@@ -487,11 +697,14 @@ def _nki_trsm_left(
     diag: str,
     alpha: float,
     block: int = 128,
+    mm=None,
 ) -> torch.Tensor:
     """Blocked left-side TRSM. Diagonal panels solved via
     torch.linalg.solve_triangular (small, strictly sequential);
-    trailing updates via nki_gemm (dominant work for large M).
+    trailing updates via `mm` (dominant work for large M; default `nki_gemm`).
     """
+    if mm is None:
+        mm = nki_gemm
     if trans:
         mat = A.T.contiguous()
         eff_upper = uplo == "lower"
@@ -522,7 +735,7 @@ def _nki_trsm_left(
                 unitriangular=unit,
             )
             if ke < M:
-                X[ke:].sub_(nki_gemm(mat[ke:, k:ke].contiguous(), X[k:ke]))
+                X[ke:].sub_(mm(mat[ke:, k:ke].contiguous(), X[k:ke]))
     else:
         # Upper triangular: back substitution.
         for k in range(M, 0, -block):
@@ -534,7 +747,7 @@ def _nki_trsm_left(
                 unitriangular=unit,
             )
             if ks > 0:
-                X[:ks].sub_(nki_gemm(mat[:ks, ks:k].contiguous(), X[ks:k]))
+                X[:ks].sub_(mm(mat[:ks, ks:k].contiguous(), X[ks:k]))
     return X.mul_(alpha) if alpha != 1.0 else X
 
 

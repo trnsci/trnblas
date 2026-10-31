@@ -371,7 +371,15 @@ def native_stub(monkeypatch):
 
 
 class TestHostWrappersOnNativePath:
-    """Every host wrapper reaches its `trnblas::` op, never `_to_xla`."""
+    """Every host wrapper reaches its `trnblas::` op, never `_to_xla`.
+
+    Under an explicit `set_backend("nki")`; `auto` routes host GEMMs to the
+    host or to aten (see TestNativeGemmPolicy).
+    """
+
+    @pytest.fixture(autouse=True)
+    def explicit_nki(self, monkeypatch):
+        monkeypatch.setattr(dispatch, "_backend", "nki")
 
     def test_gemm_aligned_uses_default_tile_op(self, native_stub):
         A, B = torch.randn(256, 128), torch.randn(128, 512)
@@ -579,16 +587,18 @@ class TestLazyRegistration:
 
 
 class TestNativeGemmPolicy:
-    """Plain GEMM-family calls on device-resident operands route to aten (native path).
+    """`auto` routing of plain GEMM-family calls on the native path (#62, #63).
 
-    CPU tensors stand in for `neuron` tensors by patching `_on_neuron_device`.
+    CPU tensors stand in for `neuron` tensors by patching `_on_neuron_device`
+    and `_on_host`.
     """
 
     @pytest.fixture
     def nki_backend(self, monkeypatch):
         monkeypatch.setattr(dispatch, "HAS_NKI", True)
-        monkeypatch.setattr(dispatch, "_backend", "nki")
+        monkeypatch.setattr(dispatch, "_backend", "auto")
         monkeypatch.setattr(dispatch, "_use_simulator", lambda: False)
+        monkeypatch.setattr(dispatch, "_get_dispatch_path", lambda: "native")
         monkeypatch.delenv("TRNBLAS_NATIVE_GEMM", raising=False)
 
         def boom(*a, **k):
@@ -599,6 +609,8 @@ class TestNativeGemmPolicy:
 
     def test_device_resident_goes_to_aten(self, monkeypatch, nki_backend):
         monkeypatch.setattr(dispatch, "_on_neuron_device", lambda *t: True)
+        monkeypatch.setattr(dispatch, "_on_host", lambda *t: False)
+        monkeypatch.setattr(dispatch, "_upload", lambda t: t)
         A, B = torch.randn(7, 5), torch.randn(5, 3)
         torch.testing.assert_close(dispatch.nki_gemm(A, B), A @ B)
         torch.testing.assert_close(dispatch.nki_syrk(A), A @ A.T)
@@ -608,16 +620,117 @@ class TestNativeGemmPolicy:
         X = dispatch.nki_trsm(L, torch.eye(300), uplo="lower", trans=True)
         torch.testing.assert_close(L.T @ X, torch.eye(300), atol=1e-5, rtol=0)
 
-    def test_host_tensors_keep_nki(self, monkeypatch, nki_backend):
-        monkeypatch.setattr(dispatch, "_on_neuron_device", lambda *t: False)
-        with pytest.raises(AssertionError, match="NKI GEMM kernel launched"):
-            dispatch.nki_gemm(torch.randn(4, 4), torch.randn(4, 4))
+    def test_explicit_nki_backend_forces_kernel(self, monkeypatch, nki_backend):
+        monkeypatch.setattr(dispatch, "_backend", "nki")
+        for resident in (True, False):
+            monkeypatch.setattr(dispatch, "_on_neuron_device", lambda *t, r=resident: r)
+            monkeypatch.setattr(dispatch, "_on_host", lambda *t, r=resident: not r)
+            with pytest.raises(AssertionError, match="NKI GEMM kernel launched"):
+                dispatch.nki_gemm(torch.randn(4, 4), torch.randn(4, 4))
+            with pytest.raises(AssertionError, match="NKI GEMM kernel launched"):
+                dispatch.nki_syrk(torch.randn(4, 4))
 
     def test_env_nki_forces_kernel(self, monkeypatch, nki_backend):
         monkeypatch.setattr(dispatch, "_on_neuron_device", lambda *t: True)
+        monkeypatch.setattr(dispatch, "_on_host", lambda *t: False)
         monkeypatch.setenv("TRNBLAS_NATIVE_GEMM", "nki")
         with pytest.raises(AssertionError, match="NKI GEMM kernel launched"):
             dispatch.nki_gemm(torch.randn(4, 4), torch.randn(4, 4))
+
+    def test_small_host_gemm_stays_on_host(self, monkeypatch, nki_backend):
+        monkeypatch.setattr(dispatch, "_upload", lambda t: pytest.fail("uploaded"))
+        A, B = torch.randn(64, 64), torch.randn(64, 64)
+        assert dispatch._gemm_route(A, B) == "host"
+        torch.testing.assert_close(dispatch.nki_gemm(A, B), A @ B)
+        torch.testing.assert_close(dispatch.nki_syrk(A, symmetrize=True), A @ A.T)
+        Ab, Bb = torch.randn(4, 16, 8), torch.randn(4, 8, 16)
+        torch.testing.assert_close(dispatch.nki_batched_gemm(Ab, Bb), torch.bmm(Ab, Bb))
+        L = torch.tril(torch.randn(200, 200)) + 200 * torch.eye(200)
+        X = dispatch.nki_trsm(L, torch.eye(200), uplo="lower", trans=True)
+        torch.testing.assert_close(L.T @ X, torch.eye(200), atol=1e-5, rtol=0)
+
+    def test_large_host_gemm_uploads_to_aten(self, monkeypatch, nki_backend):
+        uploads = []
+        monkeypatch.setattr(dispatch, "_upload", lambda t: uploads.append(t.shape) or t)
+        monkeypatch.setattr(dispatch, "_host_gemm_wins", lambda *a: False)
+        A, B = torch.randn(64, 32), torch.randn(32, 48)
+        assert dispatch._gemm_route(A, B) == "aten"
+        torch.testing.assert_close(dispatch.nki_gemm(A, B), A @ B)
+        assert uploads == [(64, 32), (32, 48)]
+        uploads.clear()
+        torch.testing.assert_close(dispatch.nki_syrk(A, symmetrize=True), A @ A.T)
+        assert uploads == [(64, 32)]
+
+    def test_trsm_routes(self, monkeypatch, nki_backend):
+        L = torch.tril(torch.randn(300, 300)) + 300 * torch.eye(300)
+        eye = torch.eye(300)
+        # auto: host operands → LAPACK on the host; resident → blocked aten.
+        assert dispatch._trsm_route(L, eye) == "host"
+        monkeypatch.setattr(dispatch, "_on_host", lambda *t: False)
+        assert dispatch._trsm_route(L, eye) == "aten"
+        monkeypatch.undo()
+        # TRNBLAS_NATIVE_GEMM=aten: the whole blocked solve on the device,
+        # each operand uploaded once (not per block).
+        monkeypatch.setattr(dispatch, "HAS_NKI", True)
+        monkeypatch.setattr(dispatch, "_backend", "auto")
+        monkeypatch.setattr(dispatch, "_use_simulator", lambda: False)
+        monkeypatch.setattr(dispatch, "_get_dispatch_path", lambda: "native")
+        monkeypatch.setenv("TRNBLAS_NATIVE_GEMM", "aten")
+        uploads = []
+        monkeypatch.setattr(dispatch, "_upload", lambda t: uploads.append(t.shape) or t)
+        X = dispatch.nki_trsm(L, eye, uplo="lower", trans=True)
+        torch.testing.assert_close(L.T @ X, eye, atol=1e-5, rtol=0)
+        assert uploads == [(300, 300), (300, 300)]
+
+    def test_trsm_bf16_on_host_solves_in_fp32(self, nki_backend):
+        L = (torch.tril(torch.randn(64, 64)) * 0.1 + 4 * torch.eye(64)).bfloat16()
+        B = torch.randn(64, 8).bfloat16()
+        X = dispatch.nki_trsm(L, B, uplo="lower")
+        assert X.dtype == torch.bfloat16
+        ref = torch.linalg.solve_triangular(L.float(), B.float(), upper=False)
+        torch.testing.assert_close(X.float(), ref, atol=2e-2, rtol=2e-2)
+
+    def test_env_overrides(self, monkeypatch, nki_backend):
+        A, B = torch.randn(64, 64), torch.randn(64, 64)
+        monkeypatch.setenv("TRNBLAS_NATIVE_GEMM", "aten")
+        assert dispatch._gemm_route(A, B) == "aten"
+        monkeypatch.setenv("TRNBLAS_NATIVE_GEMM", "host")
+        assert dispatch._gemm_route(A, B) == "host"
+        monkeypatch.setattr(dispatch, "_on_host", lambda *t: False)
+        assert dispatch._gemm_route(A, B) == "aten"  # `host` applies to host inputs only
+
+    def test_host_threshold_scales_with_threads(self, monkeypatch, nki_backend):
+        fixed, per_byte = dispatch._HOST_GEMM_MODEL[("gemm", "fp32")]
+        macs = 1.5 * fixed
+        monkeypatch.setattr(dispatch.torch, "get_num_threads", lambda: 2)
+        assert not dispatch._host_gemm_wins("gemm", macs, 0, torch.float32)
+        monkeypatch.setattr(dispatch.torch, "get_num_threads", lambda: 4)
+        assert dispatch._host_gemm_wins("gemm", macs, 0, torch.float32)
+
+    def test_pytorch_backend_and_xla_path_unchanged(self, monkeypatch, nki_backend):
+        A, B = torch.randn(8, 8), torch.randn(8, 8)
+        monkeypatch.setattr(dispatch, "_get_dispatch_path", lambda: "xla")
+        assert dispatch._gemm_route(A, B) == "nki"
+        monkeypatch.setattr(dispatch, "_backend", "pytorch")
+        assert dispatch._gemm_route(A, B) == "torch"
+
+    def test_upload_sends_dense_bases(self, monkeypatch):
+        sent = []
+        real_to = torch.Tensor.to
+
+        def fake_to(self, *a, **k):
+            sent.append((tuple(self.shape), self.is_contiguous()))
+            return real_to(self, "cpu")
+
+        monkeypatch.setattr(torch.Tensor, "to", fake_to)
+        A = torch.randn(6, 4)
+        t = dispatch._upload(A.T)
+        assert torch.equal(t, A.T) and sent == [((6, 4), True)]
+        sent.clear()
+        E = A.T.unsqueeze(0).expand(5, -1, -1)
+        t = dispatch._upload(E)
+        assert torch.equal(t, E) and sent == [((6, 4), True)]
+        assert dispatch._upload_nbytes(E) == A.numel() * 4
 
     def test_env_rejects_unknown(self, monkeypatch, nki_backend):
         monkeypatch.setattr(dispatch, "_on_neuron_device", lambda *t: True)
@@ -761,7 +874,7 @@ class TestMetricInvHalf:
 
     def test_public_host_route_keeps_dtype_and_matches_device_route(self, native_nki, monkeypatch):
         J = self._spd(300, seed=3)
-        monkeypatch.setattr(dispatch, "_gemm_via_aten", lambda *t: True)
+        monkeypatch.setattr(dispatch, "_trsm_route", lambda *t: "aten")
         monkeypatch.setenv("TRNBLAS_METRIC_SOLVE", "host")
         X_host = trnblas.metric_inv_half(J)
         monkeypatch.setenv("TRNBLAS_METRIC_SOLVE", "device")

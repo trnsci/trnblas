@@ -183,6 +183,7 @@ class TestNativeDevicePolicy:
 
     def test_resident_gemm_skips_nki_kernel(self, require_nki, monkeypatch):
         monkeypatch.delenv("TRNBLAS_NATIVE_GEMM", raising=False)
+        monkeypatch.setattr(D, "_backend", "auto")
         monkeypatch.setattr(D, "_nki_gemm_impl", lambda *a: pytest.fail("NKI GEMM launched"))
         A, B = _host(300, 200), _host(200, 600, seed=1)
         C = trnblas.gemm(1.0, A.to(DEV), B.to(DEV))
@@ -260,6 +261,58 @@ class TestNativeMultiCorePairEnergy:
             e = trnblas.nki.nki_batched_pair_energy(*args)
             assert e.device == args[0].device
             assert float(e) == pytest.approx(ref, rel=1e-5)
+
+
+class TestNativeAutoRouting:
+    """`auto` on host inputs: small → host CPU, large → upload + aten (#62, #63);
+    an explicit `set_backend("nki")` still runs the kernel."""
+
+    @pytest.fixture
+    def auto(self, require_nki, monkeypatch):
+        monkeypatch.delenv("TRNBLAS_NATIVE_GEMM", raising=False)
+        monkeypatch.setattr(D, "_backend", "auto")
+        monkeypatch.setattr(D, "_nki_gemm_impl", lambda *a: pytest.fail("NKI GEMM launched"))
+        monkeypatch.setattr(D, "_nki_syrk_impl", lambda *a, **k: pytest.fail("NKI SYRK launched"))
+
+    def test_small_host_gemm_stays_on_host(self, auto, monkeypatch):
+        monkeypatch.setattr(D, "_upload", lambda t: pytest.fail("uploaded"))
+        A, B = _host(64, 64), _host(64, 64, seed=1)
+        C = trnblas.gemm(1.0, A, B)
+        assert C.device.type == "cpu"
+        assert _rel(C, A.double() @ B.double()) < 1e-5
+
+    def test_large_host_wrappers_run_aten(self, auto):
+        A, B = _host(1024, 1024), _host(1024, 1024, seed=1)
+        C = trnblas.gemm(1.0, A, B, transA=True)
+        assert C.device.type == "cpu" and C.is_pinned()
+        assert _rel(C, A.double().T @ B.double()) < 1e-5
+        S = trnblas.syrk(1.0, A)
+        assert torch.equal(S, S.T) and _rel(S, A.double() @ A.double().T) < 1e-5
+        # Batch-broadcast left operand, as in the DF-MP2 example's half-transform.
+        Cv = _host(256, 224, seed=2)
+        X = _host(8, 256, 768, seed=3)
+        Z = trnblas.batched_gemm(1.0, Cv.T.unsqueeze(0).expand(8, -1, -1), X)
+        assert _rel(Z, Cv.double().T @ X.double()) < 1e-5
+        n = 1024
+        L = torch.tril(_host(n, n)) * 0.01 + 3 * torch.eye(n)
+        R = _host(n, 2048, seed=4)
+        T = trnblas.trsm(1.0, L, R, uplo="lower", trans=True)
+        assert _rel(L.double().T @ T.double(), R.double()) < 1e-5
+        Sy = A + A.T
+        Y = trnblas.symm(1.0, Sy, B)
+        assert _rel(Y, Sy.double() @ B.double()) < 1e-5
+
+    def test_explicit_nki_runs_kernel_on_resident_and_host(self, require_nki, monkeypatch):
+        monkeypatch.delenv("TRNBLAS_NATIVE_GEMM", raising=False)
+        called = []
+        real = D._nki_gemm_impl
+        monkeypatch.setattr(D, "_nki_gemm_impl", lambda *a: called.append(1) or real(*a))
+        A, B = _host(300, 200), _host(200, 600, seed=1)
+        C = trnblas.gemm(1.0, A.to(DEV), B.to(DEV))
+        C2 = trnblas.gemm(1.0, A, B)
+        assert called == [1, 1]
+        assert _rel(C.cpu(), A.double() @ B.double()) < 1e-5
+        assert _rel(C2, A.double() @ B.double()) < 1e-5
 
 
 class TestNativeMetricInvHalf:
