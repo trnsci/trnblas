@@ -60,6 +60,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `scripts/bench_host_link.py` (transfer options) and
   `scripts/bench_host_wrappers.py` (wrappers end to end).
 
+### Changed
+
+#### Measured `auto` routing for the native GEMM family (#62, #63)
+
+- **`auto` picks host CPU, upload + aten, or aten on the device by measured
+  time**, for `gemm`, `batched_gemm`, `syrk`, `symm` and left `trsm` on the
+  native (TorchNeuron) path. Measured on trn2 across 24 GEMM, 8 batched, 10
+  SYRK, 12 TRSM and 5 SYMM shapes (square, ragged, skinny, DF-MP2), fp32 and
+  bf16 (`scripts/bench_auto_routes.py`).
+  - Device-resident operands: aten, as before. aten beat the NKI kernel at
+    every GEMM / batched / SYRK shape and dtype, by 1.1-6x (20-310x for
+    batched).
+  - Host operands: the host CPU below a per-(op, dtype) threshold on
+    multiply-adds and host-link bytes, scaled by `torch.get_num_threads()`;
+    above it, one upload, aten, and one download through the cached host
+    memory of #61. `gemm` 8192³: 182 → 87 ms; `batched_gemm` 32×224×768×768:
+    125 → 10 ms; `symm` 4096²: 636 → 21 ms; small GEMMs no longer pay the
+    ~0.4 ms upload/launch floor (64³: 0.38 → 0.02 ms).
+  - Transposed and batch-broadcast host operands upload their dense base
+    once and are transposed or expanded on the device.
+  - `trsm` on host operands solves with LAPACK on the host (1.5-12x faster
+    up to n = 2304); device-resident operands keep the blocked device solve.
+    Wide right-hand sides lose here: 1024 × 16384 was 113 ms with the old
+    host-panel + NKI-update path and is 150-163 ms on the host.
+  - `syrk` through aten symmetrises on the device at every size.
+- **`set_backend("nki")` now always runs the NKI kernels**, for
+  device-resident operands too (before, those went to aten). Use `auto` for
+  the measured routes.
+- `TRNBLAS_NATIVE_GEMM` takes `auto | nki | aten | host`.
+
+### Fixed
+
+- `trsm` on bf16 / fp16 host operands under `auto` raised
+  (`triangular_solve_cpu` has no bf16); it now solves in fp32 on the host and
+  returns the input dtype.
+
 ### Not changed
 
 - **`trnblas.gemm` stays single-core.** Splitting a GEMM whose operands sit on

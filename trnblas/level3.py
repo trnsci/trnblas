@@ -131,19 +131,32 @@ def symm(
     Used in Fock matrix construction: F = H_core + J - K
     where J and K involve symmetric density matrix contractions.
     """
-    if uplo == "upper":
-        sym = torch.triu(A) + torch.triu(A, diagonal=1).T
-    else:
-        sym = torch.tril(A) + torch.tril(A, diagonal=-1).T
+    from .nki.dispatch import _aten_on_device, _gemm_route, _on_neuron_device
 
-    if side == "left":
-        result = alpha * torch.matmul(sym, B)
-    else:
-        result = alpha * torch.matmul(B, sym)
+    def _symm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        if uplo == "upper":
+            sym = torch.triu(A) + torch.triu(A, diagonal=1).T
+        else:
+            sym = torch.tril(A) + torch.tril(A, diagonal=-1).T
+        return torch.matmul(sym, B) if side == "left" else torch.matmul(B, sym)
 
-    if C is not None and beta != 0.0:
-        result = result + beta * C
-    return result
+    n = A.shape[0]
+    out_numel = B.numel()
+    route = _gemm_route(
+        A,
+        B,
+        op="symm",
+        macs=n * out_numel,
+        nbytes=(A.numel() + B.numel() + out_numel) * A.element_size(),
+    )
+    # No NKI SYMM kernel: the "nki" route is torch on the operands' device,
+    # as before. On the native path, large host problems run as aten on the
+    # device (#62).
+    if route == "aten" and not _on_neuron_device(A, B):
+        result = _aten_on_device(_symm, A, B)
+    else:
+        result = _symm(A, B)
+    return _scale_add(result, alpha, beta, C)
 
 
 def syrk(
