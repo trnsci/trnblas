@@ -72,7 +72,8 @@ def gemm(
 ) -> torch.Tensor:
     """General matrix multiply: C = alpha * op(A) @ op(B) + beta * C
 
-    op(X) = X if trans=False, X^T if trans=True.
+    op(X) = X if trans=False, X^T if trans=True. For batched (>= 3-D)
+    operands, op() transposes the last two dimensions, as in `batched_gemm`.
 
     This is the workhorse for DF-MP2:
         (ia|P) = Σ_μν C_μi @ (μν|P) @ C_νa    → two GEMMs per aux index
@@ -86,8 +87,10 @@ def gemm(
     """
     from .nki.dispatch import _neuron_mm_lhs, _use_nki, nki_gemm
 
-    a = A.T if transA else A
-    b = B.T if transB else B
+    # `.mT`, not `.T`: on a batched operand `.T` reverses every dimension
+    # (#72). 1-D operands are left as they are (`.T` was a no-op there).
+    a = A.mT if transA and A.dim() >= 2 else A
+    b = B.mT if transB and B.dim() >= 2 else B
     a = _neuron_mm_lhs(a, b)
 
     if _use_nki() and a.dim() == 2 and b.dim() == 2:
