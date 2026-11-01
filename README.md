@@ -18,9 +18,9 @@ Part of the trnsci scientific computing suite ([github.com/trnsci](https://githu
 trnblas follows the [trnsci 5-phase roadmap](https://trnsci.dev/roadmap/). Active work is tracked in phase-labeled GitHub issues:
 
 - **[Phase 1 — correctness](https://github.com/trnsci/trnblas/issues/21)**: **complete as of v0.4.0** (GEMM, SYRK, MP2 energy reduction kernels hardware-validated on trn1; end-to-end DF-MP2 validated against PySCF at nanohartree tolerance).
-- **[Phase 2 — precision](https://github.com/trnsci/trnblas/issues/22)** (next): double-double FP64 GEMM for chemistry workloads. Unblocks [trnsolver#27](https://github.com/trnsci/trnsolver/issues/27) and [trntensor#28](https://github.com/trnsci/trntensor/issues/28).
-- **[Phase 3 — perf](https://github.com/trnsci/trnblas/issues/23)**: tile sweeps, fused DF-MP2 kernels, true 3D batched GEMM, NEFF cache reuse.
-- **[Phase 4 — multi-chip](https://github.com/trnsci/trnblas/issues/24)**: tensor-parallel GEMM across NeuronCores.
+- **[Phase 2 — precision](https://github.com/trnsci/trnblas/issues/22)** (deferred): double-double FP64 GEMM for chemistry workloads. FP32 measured sufficient for DF-MP2 through glycine/cc-pVDZ and H₂O/cc-pVTZ (see [Precision envelope](docs/architecture.md#precision-envelope)). Unblocks [trnsolver#27](https://github.com/trnsci/trnsolver/issues/27) and [trntensor#28](https://github.com/trnsci/trntensor/issues/28).
+- **[Phase 3 — perf](https://github.com/trnsci/trnblas/issues/23)**: **complete** (tile autotuner, fused DF-MP2 pair-energy kernels, NEFF cache reuse). On Trn2 the native path adds measured `auto` routing (v0.9.0) and the fused `pair_energy_sym` kernel, 1.8× faster than aten on the energy step at 96/672/2304.
+- **[Phase 4 — multi-chip](https://github.com/trnsci/trnblas/issues/24)**: **complete as of v0.9.0** for one Trn2 chip: [`trnblas.parallel`](docs/api/parallel.md) SPMD GEMM and DF-MP2 across NeuronCores (2.5–2.9× on 4 cores).
 - **[Phase 5 — generation](https://github.com/trnsci/trnblas/issues/25)**: trn2 FP16-accumulate GEMM path.
 
 Suite-wide tracker: [trnsci/trnsci#1](https://github.com/trnsci/trnsci/issues/1).
@@ -29,7 +29,7 @@ Suite-wide tracker: [trnsci/trnsci#1](https://github.com/trnsci/trnsci/issues/1)
 
 NVIDIA has cuBLAS with 152 optimized routines. Trainium has `torch.matmul`. That's fine for ML training but insufficient for scientific computing codes that need TRSM, SYRK, SYMM, and batched GEMM with specific transpose/scaling semantics.
 
-trnblas closes this gap — same BLAS API surface, NKI-accelerated GEMM on Trainium, PyTorch fallback everywhere else.
+trnblas closes this gap — same BLAS API surface, NKI kernels on Trainium, PyTorch fallback everywhere else. On Trn2/Trn3 (native TorchNeuron), `auto` routes each GEMM-family call by measured time: device-resident operands run as aten on the `neuron` device (the NKI GEMM is 2.4–3.2× slower there), host operands run on the host CPU below a size threshold and as upload + aten above it. The fused DF-MP2 pair-energy kernel (`pair_energy_sym`) still runs at large sizes, where it beats aten.
 
 ## Install
 
@@ -97,7 +97,7 @@ python examples/df_mp2.py --demo
 python examples/df_mp2.py --nbasis 100 --nocc 20
 ```
 
-The example demonstrates all core BLAS operations in a realistic quantum chemistry workflow: Cholesky factorization, triangular solve, half-transform GEMMs, metric contraction, and energy evaluation.
+The example demonstrates all core BLAS operations in a realistic quantum chemistry workflow: the metric factor J^-1/2 (`trnblas.metric_inv_half`, Cholesky + triangular solve; float64 LAPACK on the host for naux ≤ 1024 on the native path), half-transform GEMMs, metric contraction, and energy evaluation.
 
 ### Real-molecule validation (via PySCF)
 
@@ -133,13 +133,13 @@ Runs SCF + density fitting via PySCF, feeds the integrals through trnblas, and c
 ## Status
 
 - [x] Level 1-3 BLAS with PyTorch backend
-- [x] GEMM with NKI dispatch stub
-- [x] DF-MP2 example
-- [ ] NKI GEMM kernel validation on trn1/trn2
-- [ ] NKI GEMM with stationary tile reuse
-- [ ] Batched GEMM NKI kernel
+- [x] NKI GEMM kernel validation on trn1/trn2
+- [x] NKI GEMM with stationary tile reuse
+- [x] Batched GEMM NKI kernel
+- [x] Native TorchNeuron dispatch (Trn2/Trn3) with measured `auto` routing
+- [x] Multi-core DF-MP2 and GEMM (`trnblas.parallel`)
+- [x] Benchmarks vs cuBLAS
 - [ ] Double-double FP64 emulation
-- [ ] Benchmarks vs cuBLAS
 
 ## Related Projects
 
@@ -148,6 +148,8 @@ Runs SCF + density fitting via PySCF, feeds the integrals through trnblas, and c
 | [trnfft](https://github.com/trnsci/trnfft) | FFT + complex ops for Trainium |
 | [trnrand](https://github.com/trnsci/trnrand) | Random number generation (Philox/Sobol) for Trainium |
 | [trnsolver](https://github.com/trnsci/trnsolver) | Linear solvers and eigendecomposition |
+| [trnsparse](https://github.com/trnsci/trnsparse) | Sparse formats and SpMM |
+| [trntensor](https://github.com/trnsci/trntensor) | einsum and tensor decompositions |
 
 ## License
 

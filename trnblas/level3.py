@@ -10,6 +10,9 @@ These are the critical path for scientific computing on Trainium:
 - Metric contraction J^{-1/2} → SYRK
 
 NKI dispatch for GEMM provides stationary tile reuse on the Tensor Engine.
+On the native (TorchNeuron) path, `auto` routes the GEMM family by measured
+time instead: aten on the `neuron` device for device-resident operands, the
+host CPU or upload + aten for host operands.
 """
 
 from __future__ import annotations
@@ -76,7 +79,10 @@ def gemm(
         B_ia^P = (ia|Q) @ J^{-1/2}_{QP}        → one GEMM
         E_MP2 = Σ B_ia^P @ B_jb^P              → batched GEMM
 
-    On Trainium, dispatches to NKI GEMM with stationary tile reuse.
+    On the XLA path (Trn1) and under set_backend("nki"), dispatches to NKI
+    GEMM with stationary tile reuse. On the native path (Trn2/Trn3), `auto`
+    runs device-resident operands as aten on the device and host operands on
+    the host CPU or as upload + aten, by measured time.
     """
     from .nki.dispatch import _neuron_mm_lhs, _use_nki, nki_gemm
 
@@ -173,9 +179,10 @@ def syrk(
     Used in metric contraction for density fitting:
     J_{PQ} = Σ_μν (P|μν)(μν|Q) which is A^T @ A form.
 
-    On Trainium, dispatches to NKI SYRK — a single-operand matmul kernel
-    that avoids the materialised `A.T.contiguous()` copy of the naive
-    `gemm(A, A.T)` call pattern.
+    On the XLA path (Trn1) and under set_backend("nki"), dispatches to NKI
+    SYRK — a single-operand matmul kernel that avoids the materialised
+    `A.T.contiguous()` copy of the naive `gemm(A, A.T)` call pattern. On
+    the native path, `auto` routes it like `gemm`.
     """
     from .nki import nki_syrk
     from .nki.dispatch import _symmetrize
@@ -208,10 +215,12 @@ def trsm(
     Given J = L @ L^T, solve L @ X = (μν|P) for X,
     then B_ia^P = C^T @ X gives the DF coefficients.
 
-    On Trainium + side='left', dispatches to a blocked NKI path: tiny
-    diagonal panels solve on torch.linalg.solve_triangular; the trailing
-    off-diagonal updates run through nki_gemm. side='right' and the
-    non-NKI path both use torch.linalg.solve_triangular directly.
+    On Trainium + side='left', dispatches to a blocked path: tiny diagonal
+    panels solve on torch.linalg.solve_triangular; the trailing off-diagonal
+    updates run through nki_gemm (XLA path, set_backend("nki")) or aten on
+    the device (native `auto`). On the native path, host operands solve with
+    LAPACK on the host. side='right' and the non-NKI path both use
+    torch.linalg.solve_triangular directly.
     """
     from .nki import nki_trsm
 
