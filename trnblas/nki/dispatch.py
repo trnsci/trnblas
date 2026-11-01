@@ -424,9 +424,10 @@ def _use_nki() -> bool:
 
 
 def nki_batched_gemm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
-    """Batched GEMM. A: (batch, M, K), B: (batch, K, N) → C: (batch, M, N).
+    """Batched GEMM with torch.matmul batch semantics: A (..., M, K) and
+    B (..., K, N) broadcast their batch dims → C (*batch, M, N).
 
-    Loops over the batch dim, dispatching the 2D `_nki_gemm_impl` per
+    Loops over the broadcast batch index, dispatching the 2D `_nki_gemm_impl` per
     slice. Every slice after the first hits the NEFF cache (identical
     kernel signature), so per-slice cost is HBM transfer + Tensor Engine
     dispatch only. A true 3D-batched NKI kernel is a future optimisation
@@ -436,21 +437,29 @@ def nki_batched_gemm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     natural use case is one batched_gemm with batch=N_aux per orbital
     pair — exactly this loop's sweet spot.
     """
-    if A.shape[0] == 0:
+    if A.dim() < 2 or B.dim() < 2:
+        return torch.matmul(A, B)
+    # torch.matmul batch semantics: the batch dims broadcast, and either
+    # operand may be 2-D or have several batch dims (#84).
+    batch = torch.broadcast_shapes(A.shape[:-2], B.shape[:-2])
+    if math.prod(batch) == 0:
         return torch.matmul(A, B)
     route = _gemm_route(A, B, op="batched_gemm")
     if route in ("torch", "host"):
         return torch.matmul(A, B)
     if route == "aten":
         return _aten_on_device(torch.matmul, A, B)
-    # Each slice is copied into one preallocated result as it arrives (a
+    # Loop over the broadcast batch index on expanded views (no copies). Each
+    # slice is copied into one preallocated result as it arrives (a
     # `torch.stack` would be one more pass into fresh host memory, #61).
+    a = A.expand(*batch, *A.shape[-2:])
+    b = B.expand(*batch, *B.shape[-2:])
     out = None
-    for i in range(A.shape[0]):
-        c = _nki_gemm_impl(A[i], B[i])
+    for idx in np.ndindex(*batch):
+        c = _nki_gemm_impl(a[idx], b[idx])
         if out is None:
-            out = _host_empty((A.shape[0], *c.shape), c.dtype, c.device)
-        out[i].copy_(c)
+            out = _host_empty((*batch, *c.shape), c.dtype, c.device)
+        out[idx].copy_(c)
     return out
 
 
