@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`batched_gemm` on the NKI route follows torch.matmul batch broadcasting (#84).**
+  The per-slice NKI loop indexed `A[i], B[i]` over `A.shape[0]`. With
+  `set_backend("nki")` on Trainium, a broadcast batch `(1, M, K) x (B, K, N)`
+  silently returned only `A[0] @ B[0]` with shape `(1, M, N)`, and 2-D or 4-D
+  operands raised `ValueError`. The pytorch and aten routes were correct.
+  Affects 0.3.0 through 0.9.1. The loop now runs over the broadcast batch
+  index on expanded views, with no copies. Found by the conformance suite on
+  Trn2 (trnsci/trnsci#35).
+
 ### Added
 
 - **Reference-conformance suite (trnsci/trnsci#105).** `tests/test_conformance.py`

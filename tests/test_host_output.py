@@ -171,6 +171,31 @@ class TestWrappersThroughCache:
         out = trnblas.batched_gemm(1.0, torch.randn(0, 3, 4), torch.randn(0, 4, 5))
         assert out.shape == (0, 3, 5)
 
+    @pytest.mark.parametrize(
+        "a_shape, b_shape",
+        [
+            ((1, 4, 5), (3, 5, 6)),  # broadcast A's batch (was silently (1, 4, 6))
+            ((3, 4, 5), (1, 5, 6)),
+            ((3, 4, 5), (5, 6)),  # 2-D B (raised)
+            ((4, 5), (3, 5, 6)),
+            ((2, 3, 4, 5), (2, 3, 5, 6)),  # two batch dims (raised)
+            ((2, 1, 4, 5), (3, 5, 6)),
+        ],
+    )
+    @pytest.mark.parametrize("transA, transB", [(False, False), (True, True)])
+    def test_batched_gemm_broadcast_matches_matmul(
+        self, fake_kernels, a_shape, b_shape, transA, transB
+    ):
+        """The NKI route follows torch.matmul batch broadcasting (#84)."""
+        g = torch.Generator().manual_seed(5)
+        A, B = torch.randn(a_shape, generator=g), torch.randn(b_shape, generator=g)
+        a = A.transpose(-2, -1).contiguous() if transA else A
+        b = B.transpose(-2, -1).contiguous() if transB else B
+        out = trnblas.batched_gemm(1.5, a, b, transA=transA, transB=transB)
+        want = 1.5 * torch.matmul(A, B)
+        assert out.shape == want.shape
+        torch.testing.assert_close(out, want)
+
     @pytest.mark.parametrize("alpha", [1.0, 0.3])
     def test_syrk_symmetric(self, fake_kernels, alpha):
         A = torch.randn(1024, 64)
