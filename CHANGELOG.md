@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Reference-conformance suite (trnsci/trnsci#105).** `tests/test_conformance.py`
+  checks every public op against independent float64 torch formulas at sizes
+  0/1/127/129/1000, fp32/fp64/complex (bf16/fp16 for the GEMM family), every
+  flag value and BLAS letter, non-contiguous and stride-0 inputs, batch
+  broadcast, beta=0 with NaN in C/y, input mutation and output aliasing, and
+  fp64 gradcheck. About 6500 cases, under 10 s on CPU. Needs-decision
+  behaviour is `xfail(strict=True)` (#74, #75). `--backend nki|auto
+  --conformance-device neuron` runs the same cases on Trainium.
 - **Guard against the NKI trace-cache closure bug ([aws-neuron/aws-neuron-sdk#1454](https://github.com/aws-neuron/aws-neuron-sdk/issues/1454),
   trnsci/trnsci#35).** `tests/test_trace_cache_safety.py` (CPU) finds every
   `@nki.jit` kernel and fails if its body, or a helper it calls, reads a

@@ -26,6 +26,25 @@ import pytest
 import torch
 
 
+def pytest_addoption(parser):
+    # Reference-conformance suite (tests/test_conformance.py, trnsci/trnsci#105).
+    # On CPU CI it runs with the defaults; on a Trainium box the same cases run
+    # through the NKI paths with e.g. `--backend nki --conformance-device neuron`.
+    parser.addoption(
+        "--backend",
+        action="store",
+        default="pytorch",
+        choices=("pytorch", "nki", "auto"),
+        help="trnblas backend for tests/test_conformance.py (default: pytorch)",
+    )
+    parser.addoption(
+        "--conformance-device",
+        action="store",
+        default="cpu",
+        help="device for tests/test_conformance.py inputs, e.g. 'neuron' (default: cpu)",
+    )
+
+
 def pytest_configure(config):
     config.addinivalue_line("markers", "neuron: requires Neuron hardware")
     config.addinivalue_line("markers", "pyscf: requires PySCF (optional dep)")
