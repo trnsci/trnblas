@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import torch
 
+from ._flags import diag_flag, trans_flag, uplo_flag
+
 
 def gemv(
     alpha: float,
@@ -21,6 +23,7 @@ def gemv(
 
     op(A) = A if trans=False, A^T if trans=True.
     """
+    trans = trans_flag(trans)
     mat = A.T if trans else A
     result = alpha * torch.mv(mat, x)
     if y is not None and beta != 0.0:
@@ -40,6 +43,7 @@ def symv(
 
     A is symmetric; only the upper or lower triangle is referenced.
     """
+    uplo = uplo_flag(uplo)
     if uplo == "upper":
         sym = torch.triu(A) + torch.triu(A, diagonal=1).T
     else:
@@ -62,6 +66,7 @@ def trmv(
     uplo: 'upper' or 'lower'
     diag: 'unit' or 'nonunit'
     """
+    uplo, diag, trans = uplo_flag(uplo), diag_flag(diag), trans_flag(trans)
     if uplo == "upper":
         tri = torch.triu(A)
     else:

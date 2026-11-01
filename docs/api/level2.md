@@ -11,7 +11,7 @@ General matrix-vector multiply: `y = α·op(A)·x + β·y`.
 
 Symmetric matrix-vector multiply (A symmetric, only `uplo` triangle referenced).
 
-## `trmv(A, x, uplo="upper", trans=False, unit=False)`
+## `trmv(A, x, uplo="upper", trans=False, diag="nonunit")`
 
 Triangular matrix-vector multiply: `x = op(A)·x`.
 

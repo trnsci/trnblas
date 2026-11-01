@@ -22,6 +22,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - README: known platform issue note for #1454.
 ### Fixed
 
+- **BLAS flag spellings silently ran the opposite operation** (silent). Each
+  wrapper compared `uplo` / `side` / `diag` against one word and took the other
+  branch for anything else, and `trans*` used truthiness: `uplo="U"` ran the
+  lower triangle, `diag="U"` a non-unit diagonal, `trans="N"` the transpose
+  (rel. err 0.04–2.4 in `symv`, `symm`, `trmv`, `trmm`, `trsm`, `syrk`, `gemv`,
+  `gemm`, `batched_gemm`). The documented words and the BLAS letters are now
+  accepted case-insensitively and anything else raises `ValueError`. Every
+  spelling that was correct before gives the same result. Affects every
+  release, 0.2.0–0.9.1, on every backend (#73). The API docs listed a
+  non-existent `unit=` keyword for `trmv` / `trmm`; it is `diag=`.
 - **`gemm(..., transA=True)` / `transB=True` on batched (>= 3-D) operands
   reversed every dimension** (silent). `op(X)` was built with `X.T`, which on a
   non-2-D tensor turns `(b, m, k)` into `(k, m, b)`; `torch.matmul` then
