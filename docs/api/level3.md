@@ -41,6 +41,15 @@ through `nki_gemm`. Covers all combinations of `uplo ∈ {"upper", "lower"}`,
 `trans ∈ {True, False}`, `diag ∈ {"unit", "nonunit"}`. `side="right"`
 falls back to direct `torch.linalg.solve_triangular`.
 
-## `trmm(alpha, A, B, side="left", uplo="upper", trans=False, unit=False)`
+## `trmm(alpha, A, B, side="left", uplo="upper", trans=False, diag="nonunit")`
 
 Triangular matrix-matrix multiply: `B = α·op(A)·B`.
+
+## Flag values
+
+`uplo` takes `"upper"` / `"lower"`, `side` takes `"left"` / `"right"` and
+`diag` takes `"unit"` / `"nonunit"`; the BLAS letters (`"U"`/`"L"`,
+`"L"`/`"R"`, `"U"`/`"N"`) are accepted too, in either case. `trans`,
+`transA` and `transB` are bools; the BLAS characters `"N"` / `"T"` are
+accepted. Any other value raises `ValueError` (the same rules apply to the
+Level 2 ops).

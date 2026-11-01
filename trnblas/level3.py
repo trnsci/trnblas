@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import torch
 
+from ._flags import diag_flag, side_flag, trans_flag, uplo_flag
+
 
 def _owned_inplace_ok(result: torch.Tensor) -> bool:
     """True when `result` (a fresh tensor the wrapper owns) may be updated in place.
@@ -80,6 +82,7 @@ def gemm(
     """
     from .nki.dispatch import _neuron_mm_lhs, _use_nki, nki_gemm
 
+    transA, transB = trans_flag(transA, "transA"), trans_flag(transB, "transB")
     a = A.T if transA else A
     b = B.T if transB else B
     a = _neuron_mm_lhs(a, b)
@@ -110,6 +113,7 @@ def batched_gemm(
     """
     from .nki.dispatch import nki_batched_gemm
 
+    transA, transB = trans_flag(transA, "transA"), trans_flag(transB, "transB")
     a = A.transpose(-2, -1) if transA else A
     b = B.transpose(-2, -1) if transB else B
     return _scale_add(nki_batched_gemm(a, b), alpha, beta, C)
@@ -132,6 +136,8 @@ def symm(
     where J and K involve symmetric density matrix contractions.
     """
     from .nki.dispatch import _aten_on_device, _gemm_route, _on_neuron_device
+
+    side, uplo = side_flag(side), uplo_flag(uplo)
 
     def _symm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
         if uplo == "upper":
@@ -180,6 +186,8 @@ def syrk(
     from .nki import nki_syrk
     from .nki.dispatch import _symmetrize
 
+    trans = trans_flag(trans)
+    uplo_flag(uplo)  # validated; the result is the full symmetric matrix (#74)
     A_eff = A.T.contiguous() if trans else A
     # Symmetrize (fp32 reduction-order rounding can leave tiny asymmetry).
     # Without C, symmetrize A A^T before scaling: alpha * sym(S) is exactly
@@ -215,6 +223,8 @@ def trsm(
     """
     from .nki import nki_trsm
 
+    side, uplo, diag = side_flag(side), uplo_flag(uplo), diag_flag(diag)
+    trans = trans_flag(trans)
     return nki_trsm(A, B, side=side, uplo=uplo, trans=trans, diag=diag, alpha=alpha)
 
 
@@ -247,6 +257,8 @@ def trmm(
     """Triangular matrix multiply: B = alpha * op(A) @ B  (side='left')
     or B = alpha * B @ op(A)  (side='right')
     """
+    side, uplo, diag = side_flag(side), uplo_flag(uplo), diag_flag(diag)
+    trans = trans_flag(trans)
     if uplo == "upper":
         tri = torch.triu(A)
     else:
