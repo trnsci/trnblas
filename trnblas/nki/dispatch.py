@@ -280,6 +280,26 @@ def _host_gemm_wins(op: str, macs: float, nbytes: int, dtype: torch.dtype) -> bo
     return macs < scale * (fixed + per_byte * nbytes)
 
 
+def _kernel_dtypes_ok(*tensors: torch.Tensor) -> bool:
+    """True when every operand has a dtype the NKI GEMM kernels compute."""
+    return all(t.dtype in _DEVICE_GEMM_DTYPES for t in tensors)
+
+
+def _no_kernel_for_dtype(what: str, *tensors: torch.Tensor) -> None:
+    """Under TRNBLAS_REQUIRE_NKI, refuse a dtype the kernels do not take.
+
+    Without it the caller runs torch instead. Before 0.9.1 float64 operands
+    went into the FP32 kernels under ``set_backend("nki")`` and came back
+    non-finite, with no error (#68).
+    """
+    if _REQUIRE_NKI:
+        dts = sorted({str(t.dtype) for t in tensors})
+        raise NotImplementedError(
+            f"trnblas {what}: the NKI kernels take float32/bfloat16/float16, got {dts}. "
+            "Unset TRNBLAS_REQUIRE_NKI to compute in torch."
+        )
+
+
 def _gemm_route(
     *tensors: torch.Tensor, op: str = "gemm", macs: float | None = None, nbytes: int | None = None
 ) -> str:
@@ -292,8 +312,14 @@ def _gemm_route(
     if not _use_nki():
         return "torch"
     if _backend == "nki" or _use_simulator() or _get_dispatch_path() != "native":
+        if not _kernel_dtypes_ok(*tensors):
+            _no_kernel_for_dtype(op, *tensors)
+            return "torch"
         return "nki"
     policy = _native_gemm_policy()
+    if policy == "nki" and not _kernel_dtypes_ok(*tensors):
+        _no_kernel_for_dtype(op, *tensors)
+        return "torch"
     if policy in ("nki", "aten"):
         return policy
     if not _on_host(*tensors):
@@ -634,11 +660,16 @@ def nki_trsm(
 def _trsm_route(A: torch.Tensor, B: torch.Tensor) -> str:
     """'nki', 'aten' or 'host' for a left TRSM (with `_use_nki()`)."""
     if _backend == "nki" or _use_simulator() or _get_dispatch_path() != "native":
-        return "nki"
-    policy = _native_gemm_policy()
-    if policy in ("nki", "aten"):
-        return policy
-    return "host" if _on_host(A, B) else "aten"
+        route = "nki"
+    else:
+        route = _native_gemm_policy()
+        if route not in ("nki", "aten"):
+            return "host" if _on_host(A, B) else "aten"
+    if route == "nki" and not _kernel_dtypes_ok(A, B):
+        # The NKI GEMM updates are FP32-only (#68): solve with torch instead.
+        _no_kernel_for_dtype("trsm", A, B)
+        return "host"
+    return route
 
 
 def _trsm_on_host(

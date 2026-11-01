@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Float64 GEMM / SYRK / TRSM under `set_backend("nki")` returned non-finite
+  values** (silent). Measured on **0.9.0** on Trn2. The `"nki"` route
+  had no dtype check in any release, so every release with the NKI GEMM path
+  is affected. `"auto"` and `"pytorch"` were correct, because `auto` keeps
+  float64 off the device. Float64 (and any other dtype the kernels do not
+  compute) now runs in torch on the operands' device, and TRSM on the host.
+  Under `TRNBLAS_REQUIRE_NKI=1` it raises `NotImplementedError` instead (#68).
+
 ## [0.9.0] — 2026-10-31
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
