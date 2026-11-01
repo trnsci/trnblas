@@ -156,25 +156,28 @@ def nki_stand_in(monkeypatch):
 def test_gemm_alpha_beta_trans_odd(nki_stand_in, transA, transB):
     torch.manual_seed(1)
     M, K, N = 131, 257, 515
-    A = torch.randn(K, M, dtype=torch.float64) if transA else torch.randn(M, K, dtype=torch.float64)
-    B = torch.randn(N, K, dtype=torch.float64) if transB else torch.randn(K, N, dtype=torch.float64)
-    C = torch.randn(M, N, dtype=torch.float64)
+    A = torch.randn(K, M, dtype=torch.float32) if transA else torch.randn(M, K, dtype=torch.float32)
+    B = torch.randn(N, K, dtype=torch.float32) if transB else torch.randn(K, N, dtype=torch.float32)
+    C = torch.randn(M, N, dtype=torch.float32)
     alpha, beta = 1.5, -0.75
     out = gemm(alpha, A, B, beta=beta, C=C, transA=transA, transB=transB)
     opA = A.T if transA else A
     opB = B.T if transB else B
-    torch.testing.assert_close(out, alpha * (opA @ opB) + beta * C)
+    # float32: float64 operands never take the kernel path (#68)
+    torch.testing.assert_close(out, alpha * (opA @ opB) + beta * C, rtol=1e-4, atol=1e-3)
     assert len(nki_stand_in) == 1  # really went through the padded path
 
 
 def test_batched_gemm_odd(nki_stand_in):
     torch.manual_seed(2)
     batch, M, K, N = 3, 100, 130, 600
-    A = torch.randn(batch, M, K, dtype=torch.float64)
-    B = torch.randn(batch, N, K, dtype=torch.float64)
-    C = torch.randn(batch, M, N, dtype=torch.float64)
+    A = torch.randn(batch, M, K, dtype=torch.float32)
+    B = torch.randn(batch, N, K, dtype=torch.float32)
+    C = torch.randn(batch, M, N, dtype=torch.float32)
     out = batched_gemm(2.0, A, B, beta=0.5, C=C, transB=True)
-    torch.testing.assert_close(out, 2.0 * torch.bmm(A, B.transpose(-2, -1)) + 0.5 * C)
+    torch.testing.assert_close(
+        out, 2.0 * torch.bmm(A, B.transpose(-2, -1)) + 0.5 * C, rtol=1e-4, atol=1e-3
+    )
     assert len(nki_stand_in) == batch
 
 

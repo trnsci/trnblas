@@ -925,3 +925,69 @@ class TestNeuronMmLhsWorkaround:
         A, B = torch.randn(6, 3), torch.randn(6, 5)
         torch.testing.assert_close(trnblas.gemm(1.0, A, B, transA=True), A.T @ B)
         assert seen == [torch.Size([3, 6])]
+
+
+class TestKernelDtypes:
+    """Float64 never reaches the FP32 NKI kernels (#68). Under
+    set_backend("nki") they returned non-finite values on Trn2 for gemm,
+    syrk and trsm with float64 operands."""
+
+    @pytest.fixture
+    def poisoned_kernels(self, monkeypatch):
+        from trnblas.nki import dispatch
+
+        seen = []
+
+        def gemm_impl(A, B):
+            seen.append(A.dtype)
+            assert A.dtype == B.dtype == torch.float32, "float64 reached the NKI GEMM kernel"
+            return A @ B
+
+        def syrk_impl(A, symmetrize=False):
+            seen.append(A.dtype)
+            assert A.dtype == torch.float32, "float64 reached the NKI SYRK kernel"
+            C = A @ A.T
+            return 0.5 * (C + C.T) if symmetrize else C
+
+        monkeypatch.setattr(dispatch, "_backend", "nki")
+        monkeypatch.setattr(dispatch, "_nki_gemm_impl", gemm_impl)
+        monkeypatch.setattr(dispatch, "_nki_syrk_impl", syrk_impl)
+        return seen
+
+    def test_float64_runs_torch(self, poisoned_kernels):
+        import trnblas
+
+        g = torch.Generator().manual_seed(0)
+        A = torch.randn(150, 140, generator=g, dtype=torch.float64)
+        B = torch.randn(140, 130, generator=g, dtype=torch.float64)
+        C = torch.randn(150, 130, generator=g, dtype=torch.float64)
+        torch.testing.assert_close(trnblas.gemm(0.7, A, B, beta=0.5, C=C), 0.7 * A @ B + 0.5 * C)
+        S = torch.randn(150, 150, generator=g, dtype=torch.float64)
+        S = S + S.T
+        torch.testing.assert_close(
+            trnblas.syrk(0.7, A, beta=0.5, C=S, uplo="lower").tril(),
+            (0.7 * A @ A.T + 0.5 * S).tril(),
+        )
+        T = torch.randn(300, 300, generator=g, dtype=torch.float64) * 0.05 + 2 * torch.eye(
+            300, dtype=torch.float64
+        )
+        R = torch.randn(300, 20, generator=g, dtype=torch.float64)
+        X = trnblas.trsm(0.7, T, R, side="left", uplo="lower")
+        torch.testing.assert_close(torch.tril(T) @ X, 0.7 * R)
+        assert poisoned_kernels == []
+
+    def test_float32_still_uses_kernels(self, poisoned_kernels):
+        import trnblas
+
+        A, B = torch.randn(150, 140), torch.randn(140, 130)
+        torch.testing.assert_close(trnblas.gemm(1.0, A, B), A @ B)
+        assert poisoned_kernels == [torch.float32]
+
+    def test_require_nki_raises(self, poisoned_kernels, monkeypatch):
+        import trnblas
+        from trnblas.nki import dispatch
+
+        monkeypatch.setattr(dispatch, "_REQUIRE_NKI", True)
+        A = torch.randn(150, 140, dtype=torch.float64)
+        with pytest.raises(NotImplementedError, match="float64"):
+            trnblas.gemm(1.0, A, A.T)
