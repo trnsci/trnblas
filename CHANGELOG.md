@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1] — 2026-11-01
+
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
+
+Headline: **correctness fix:** under `set_backend("nki")`, float64 `gemm` / `syrk` / `trsm` went into the FP32 NKI kernels and came back non-finite with no error (0.9.0 and earlier on the native path). They now compute in torch, or raise under `TRNBLAS_REQUIRE_NKI` (#69, #68). `auto` and `pytorch` were unaffected. Adds tail-tile regression tests (#67).
+
 ### Fixed
 
 - **Float64 GEMM / SYRK / TRSM under `set_backend("nki")` returned non-finite

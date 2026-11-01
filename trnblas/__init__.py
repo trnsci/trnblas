@@ -9,7 +9,7 @@ Target workloads: DF-MP2 tensor contractions, Fock matrix builds,
 Cholesky-based density fitting, and general scientific linear algebra.
 """
 
-__version__ = "0.9.0"
+__version__ = "0.9.1"
 
 # Level 1 — Vector operations
 from .level1 import asum, axpy, dot, iamax, nrm2, scal
