@@ -15,8 +15,11 @@ That's fine for ML training but insufficient for scientific computing codes
 that need TRSM, SYRK, SYMM, and batched GEMM with specific transpose/scaling
 semantics.
 
-trnblas closes this gap — same BLAS API surface, NKI-accelerated GEMM on
-Trainium, PyTorch fallback everywhere else.
+trnblas closes this gap — same BLAS API surface, NKI kernels on Trainium,
+PyTorch fallback everywhere else. On Trn2/Trn3 (native TorchNeuron), `auto`
+routes GEMM-family calls by measured time: device-resident operands run as
+aten on the `neuron` device, host operands on the host CPU or as upload +
+aten. See [NKI Backend](api/nki.md#backend-selection).
 
 ## Primary use case
 
@@ -36,4 +39,6 @@ python examples/df_mp2_pyscf.py --mol ch4 --basis cc-pvdz
 
 - [trnfft](https://github.com/trnsci/trnfft) — FFT + complex ops for Trainium.
 - [trnrand](https://github.com/trnsci/trnrand) — Random number generation (Philox/Sobol) for Trainium.
-- `trnsolver` *(planned)* — Linear solvers and eigendecomposition.
+- [trnsolver](https://github.com/trnsci/trnsolver) — Linear solvers and eigendecomposition.
+- [trnsparse](https://github.com/trnsci/trnsparse) — Sparse formats and SpMM.
+- [trntensor](https://github.com/trnsci/trntensor) — einsum and tensor decompositions.
