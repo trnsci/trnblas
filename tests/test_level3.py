@@ -52,6 +52,29 @@ class TestGemm:
         expected = alpha * torch.matmul(A, B)
         np.testing.assert_allclose(result.numpy(), expected.numpy(), atol=1e-3, rtol=1e-3)
 
+    @pytest.mark.parametrize(
+        "a_shape, b_shape, transA, transB",
+        [
+            ((4, 4, 4), (4, 4, 4), True, False),  # square: silently wrong before #72
+            ((4, 4, 4), (4, 4, 4), False, True),
+            ((3, 5, 4), (3, 5, 6), True, False),
+            ((3, 4, 5), (3, 6, 5), False, True),  # raised before #72
+            ((2, 3, 5, 4), (2, 3, 6, 5), True, True),
+        ],
+    )
+    def test_batched_operands_transpose_last_two_dims(self, a_shape, b_shape, transA, transB):
+        """op(X) on a batched operand is the last-two-dims transpose (#72)."""
+        g = torch.Generator().manual_seed(72)
+        A = torch.randn(*a_shape, generator=g, dtype=torch.float64)
+        B = torch.randn(*b_shape, generator=g, dtype=torch.float64)
+        a = A.transpose(-2, -1) if transA else A
+        b = B.transpose(-2, -1) if transB else B
+        result = trnblas.gemm(1.5, A, B, transA=transA, transB=transB)
+        torch.testing.assert_close(result, 1.5 * torch.matmul(a, b))
+        torch.testing.assert_close(
+            result, trnblas.batched_gemm(1.5, A, B, transA=transA, transB=transB)
+        )
+
 
 class TestBatchedGemm:
     def test_basic(self, random_matrix):

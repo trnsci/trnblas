@@ -8,10 +8,13 @@ trnblas/
 │   ├── __init__.py      # Re-exports all BLAS operations
 │   ├── level1.py        # axpy, dot, nrm2, scal, asum, iamax
 │   ├── level2.py        # gemv, symv, trmv, ger
-│   ├── level3.py        # gemm, batched_gemm, symm, syrk, trsm, trmm
+│   ├── level3.py        # gemm, batched_gemm, symm, syrk, trsm, trmm, metric_inv_half
+│   ├── parallel.py      # SPMD multi-core GEMM + DF-MP2 (torchrun, one process per core)
 │   └── nki/
 │       ├── __init__.py
-│       └── dispatch.py  # auto/pytorch/nki dispatch + NKI GEMM kernel
+│       ├── dispatch.py  # auto/pytorch/nki dispatch, NKI kernels, native/XLA path selection
+│       ├── _native.py   # TorchNeuron custom ops (nki_op), loaded lazily
+│       └── multicore.py # opt-in single-process pair-energy split (set_cores)
 ├── tests/
 ├── examples/df_mp2.py
 └── benchmarks/
@@ -25,10 +28,14 @@ The DF-MP2 algorithm maps directly to trnblas Level 3 operations:
 |--------------------|---------------------------------------|--------------------------------------------------|
 | Half-transform     | `(iν|P) = C_occ^T @ (μν|P)`           | `gemm(1.0, C_occ, eri, transA=True)`             |
 | MO transform       | `(ia|P) = C_vir^T @ (iν|P)`           | `gemm(1.0, C_vir, iv_P, transA=True)`            |
-| Cholesky           | `J = L @ L^T`                         | `torch.linalg.cholesky`                          |
-| Metric solve       | `L^T @ X = I`                         | `trsm(1.0, L, I, uplo="lower", trans=True)`      |
+| Cholesky + metric solve | `J = L @ L^T`, `L^T @ X = I`     | `metric_inv_half(J)` (float64 LAPACK on the host for naux ≤ 1024 on the native path; else `torch.linalg.cholesky` + `trsm`) |
 | Metric contract    | `B = (ia|Q) @ J^{-1/2}`               | `gemm(1.0, ia_P, J_inv_half)`                    |
 | Energy             | `T_ab = B_i @ B_j^T`                  | `gemm(1.0, B[i], B[j], transB=True)`             |
+
+On the native (TorchNeuron) path, `auto` runs the plain GEMMs in this table
+as aten on the `neuron` device, which beat the NKI GEMM by 2.4–3.2×, and the
+energy step through the fused `pair_energy_sym` kernel at large sizes (1.8×
+faster than aten at 96/672/2304). See [NKI Backend](api/nki.md#backend-selection).
 
 ## NKI GEMM strategy
 
@@ -46,14 +53,16 @@ since it's reused across all auxiliary basis indices `P`.
 
 - **Level 3 NKI coverage is partial.** `gemm`, `batched_gemm`, `syrk`, and
   `trsm` (left-side blocked) have NKI kernels. `symm` and `trmm` still
-  dispatch straight to PyTorch. Neither is in the DF-MP2 hot path.
+  dispatch straight to PyTorch. Neither is in the DF-MP2 hot path. On the
+  native path, `auto` sends device-resident GEMM-family calls to aten
+  rather than these kernels (v0.9.0).
 - **Batched-pair energy (v0.5.2–v0.5.4) solved the dispatch overhead.**
   `nki_batched_pair_energy`
   ([#43](https://github.com/trnsci/trnblas/issues/43),
   [#46](https://github.com/trnsci/trnblas/issues/46)) replaces the nocc²-loop
   dispatch with a single `@nki.jit` call (small shape) or chunked i-loop
   (medium/large). Warm: **3.6× faster than torch at small shape, 5.2× at
-  medium shape.**
+  medium shape.** (trn1, XLA path.)
 - **No FP64.** Trainium's Tensor Engine maxes out at FP32.
   **Decision (2026-04-18):** FP32 is sufficient — both gate cases are well
   below 1 µHartree.

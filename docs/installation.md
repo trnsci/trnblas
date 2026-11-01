@@ -72,11 +72,21 @@ processes. The cache only versions source that belongs to an installed
 wheel (a `site-packages` tree with `.dist-info`); an editable install is
 not tracked and can get a stale kernel after you edit `dispatch.py`. When
 developing with `pip install -e`, turn the cache off before starting
-Python (the test suite's `conftest.py` does this by default):
+Python:
 
 ```bash
 export NKI_ENABLE_TRACE_CACHE=0
 ```
+
+The test suite keeps the cache on, as users run it, but gives each session
+a fresh, empty cache directory (`NKI_TRACE_CACHE_URL`), so edits never hit
+a stale entry.
+
+The cache also ignores constants captured in a kernel's closure
+([aws-neuron/aws-neuron-sdk#1454](https://github.com/aws-neuron/aws-neuron-sdk/issues/1454));
+trnblas's kernels take every specialising value as an argument
+(`tests/test_trace_cache_safety.py`). Set `NKI_ENABLE_TRACE_CACHE=0` if
+you write NKI kernels that a factory specialises through a closure.
 
 See the TorchNeuron
 [environment variables](https://github.com/aws-neuron/torch-neuronx/blob/main/docs/environment_variables.md)
@@ -120,13 +130,15 @@ pytest tests/ -v
 
 | Variable | Effect |
 |----------|--------|
-| `TRNBLAS_REQUIRE_NKI=1` | Re-raise on NKI kernel errors instead of silently falling back to `torch.matmul`. Useful in the validation suite to surface kernel breakage. Unset (default): kernel exceptions fall back to PyTorch. |
+| `TRNBLAS_REQUIRE_NKI=1` | Re-raise on NKI kernel errors instead of silently falling back to `torch.matmul`. Useful in the validation suite to surface kernel breakage. Under `set_backend("nki")`, dtypes the kernels do not compute (float64, for example) raise `NotImplementedError` instead of running in torch (v0.9.1). Unset (default): kernel exceptions fall back to PyTorch. |
 | `TRNBLAS_USE_SIMULATOR=1` | Route kernel dispatch through `nki.simulate(kernel)(numpy_args)` on CPU. Bypasses `torch_xla` + NEFF compile; used for fast correctness iteration. Requires `nki>=0.3.0`. |
 | `TRNSCI_NKI_DISPATCH=auto\|native\|xla` | Suite-wide. Forces the native or XLA dispatch path; `auto` (default) detects. Forcing an unavailable path raises. |
 | `TRNSCI_XLA_DEPRECATION=1` | Suite-wide, off by default. The XLA path emits one `DeprecationWarning`. |
 | `TRNBLAS_BATCHED_PAIR_CHUNK_THRESHOLD=<n>` | Overrides the batched-pair full-batch vs chunked routing threshold (default 4096 on XLA, 3072 on native). For re-benchmarking. |
 | `TRNBLAS_NATIVE_GEMM=auto\|nki\|aten\|host` | Native path only. `auto` (default) routes `gemm` / `batched_gemm` / `syrk` / `symm` / `trsm` by measured time (#62, #63): device-resident operands run as aten on the `neuron` device; host operands run on the host CPU below a size threshold and as upload + aten + download above it; `trsm` solves with LAPACK on the host. `nki` forces the NKI kernels, `aten` forces aten on the device, `host` keeps host operands on the host. An explicit `set_backend("nki")` always runs the NKI kernels. |
 | `TRNBLAS_PAIR_ENERGY=auto\|sym\|aten\|legacy` | Native path, device-resident inputs only. Picks the `nki_batched_pair_energy` implementation: the LNC=2 symmetric kernel, aten (chunked GEMM + reduction), or the full-batch / chunked kernels. `auto` takes `sym` above 3 GFLOP per row launch. |
+| `TRNBLAS_METRIC_SOLVE=auto\|host\|device` | Native path. Where `metric_inv_half` factors the metric: `auto` (default) uses float64 LAPACK on the host for J on the `neuron` device with naux ≤ 1024; above that, and for host tensors, `torch.linalg.cholesky` + `trsm` (v0.8.0). |
+| `TRNBLAS_CORES=<n>\|auto` | Opt-in single-process split of the DF-MP2 pair energy across `n` visible cores (same as `trnblas.set_cores`). Unset: one core. See [Multi-core](api/parallel.md). |
 | `TRNBLAS_PINNED_OUTPUT=1\|0` | Native path only. `1` (default): host results of 1 MiB or more from the device (`gemm`, `batched_gemm`, `syrk`, `trsm` and the other host-input wrappers) are copied into a fresh tensor from the accelerator's caching host allocator (`pin_memory=True`). That is about 3.5x faster than `.to("cpu")`, which page-faults fresh memory. Freed blocks stay cached, rounded up to a power of two, until `torch.accelerator.empty_host_cache()`. `0` returns plain `.to("cpu")` results. |
 | `NKI_ENABLE_TRACE_CACHE=0` | TorchNeuron (not trnblas) setting. Turns off the cross-process NKI kernel cache, which cannot version editable installs. |
 

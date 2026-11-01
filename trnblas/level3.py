@@ -10,6 +10,9 @@ These are the critical path for scientific computing on Trainium:
 - Metric contraction J^{-1/2} → SYRK
 
 NKI dispatch for GEMM provides stationary tile reuse on the Tensor Engine.
+On the native (TorchNeuron) path, `auto` routes the GEMM family by measured
+time instead: aten on the `neuron` device for device-resident operands, the
+host CPU or upload + aten for host operands.
 """
 
 from __future__ import annotations
@@ -71,20 +74,26 @@ def gemm(
 ) -> torch.Tensor:
     """General matrix multiply: C = alpha * op(A) @ op(B) + beta * C
 
-    op(X) = X if trans=False, X^T if trans=True.
+    op(X) = X if trans=False, X^T if trans=True. For batched (>= 3-D)
+    operands, op() transposes the last two dimensions, as in `batched_gemm`.
 
     This is the workhorse for DF-MP2:
         (ia|P) = Σ_μν C_μi @ (μν|P) @ C_νa    → two GEMMs per aux index
         B_ia^P = (ia|Q) @ J^{-1/2}_{QP}        → one GEMM
         E_MP2 = Σ B_ia^P @ B_jb^P              → batched GEMM
 
-    On Trainium, dispatches to NKI GEMM with stationary tile reuse.
+    On the XLA path (Trn1) and under set_backend("nki"), dispatches to NKI
+    GEMM with stationary tile reuse. On the native path (Trn2/Trn3), `auto`
+    runs device-resident operands as aten on the device and host operands on
+    the host CPU or as upload + aten, by measured time.
     """
     from .nki.dispatch import _neuron_mm_lhs, _use_nki, nki_gemm
 
     transA, transB = trans_flag(transA, "transA"), trans_flag(transB, "transB")
-    a = A.T if transA else A
-    b = B.T if transB else B
+    # `.mT`, not `.T`: on a batched operand `.T` reverses every dimension
+    # (#72). 1-D operands are left as they are (`.T` was a no-op there).
+    a = A.mT if transA and A.dim() >= 2 else A
+    b = B.mT if transB and B.dim() >= 2 else B
     a = _neuron_mm_lhs(a, b)
 
     if _use_nki() and a.dim() == 2 and b.dim() == 2:
@@ -179,9 +188,10 @@ def syrk(
     Used in metric contraction for density fitting:
     J_{PQ} = Σ_μν (P|μν)(μν|Q) which is A^T @ A form.
 
-    On Trainium, dispatches to NKI SYRK — a single-operand matmul kernel
-    that avoids the materialised `A.T.contiguous()` copy of the naive
-    `gemm(A, A.T)` call pattern.
+    On the XLA path (Trn1) and under set_backend("nki"), dispatches to NKI
+    SYRK — a single-operand matmul kernel that avoids the materialised
+    `A.T.contiguous()` copy of the naive `gemm(A, A.T)` call pattern. On
+    the native path, `auto` routes it like `gemm`.
     """
     from .nki import nki_syrk
     from .nki.dispatch import _symmetrize
@@ -216,10 +226,12 @@ def trsm(
     Given J = L @ L^T, solve L @ X = (μν|P) for X,
     then B_ia^P = C^T @ X gives the DF coefficients.
 
-    On Trainium + side='left', dispatches to a blocked NKI path: tiny
-    diagonal panels solve on torch.linalg.solve_triangular; the trailing
-    off-diagonal updates run through nki_gemm. side='right' and the
-    non-NKI path both use torch.linalg.solve_triangular directly.
+    On Trainium + side='left', dispatches to a blocked path: tiny diagonal
+    panels solve on torch.linalg.solve_triangular; the trailing off-diagonal
+    updates run through nki_gemm (XLA path, set_backend("nki")) or aten on
+    the device (native `auto`). On the native path, host operands solve with
+    LAPACK on the host. side='right' and the non-NKI path both use
+    torch.linalg.solve_triangular directly.
     """
     from .nki import nki_trsm
 
