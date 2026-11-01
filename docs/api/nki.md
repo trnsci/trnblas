@@ -8,10 +8,30 @@ Trainium Tensor Engine or fall back to PyTorch.
 ```python
 import trnblas
 
-trnblas.set_backend("auto")  # NKI on Trainium, PyTorch elsewhere (default)
+trnblas.set_backend("auto")  # measured routing on Trainium, PyTorch elsewhere (default)
 trnblas.set_backend("pytorch")  # force PyTorch fallback
 trnblas.set_backend("nki")  # force NKI (requires nki>=0.3.0)
 ```
+
+What `auto` does depends on the dispatch path (v0.9.0, #62, #63):
+
+- **Native (TorchNeuron, Trn2/Trn3)**: `gemm`, `batched_gemm`, `syrk`,
+  `symm` and left `trsm` are routed by measured time. Device-resident
+  operands run as aten on the `neuron` device; aten beat the NKI GEMM at
+  every measured shape (2.4–3.2× for plain GEMM). Host operands run on the
+  host CPU below a per-op size threshold and as one upload + aten + one
+  download above it; host `trsm` solves with LAPACK on the host. For
+  device-resident inputs, the DF-MP2 pair energy
+  (`nki_batched_pair_energy`) runs the fused `pair_energy_sym` NKI kernel
+  above 3 GFLOP per row launch (1.8× faster than aten on the energy step at
+  96/672/2304) and aten below it. `TRNBLAS_NATIVE_GEMM` overrides the
+  GEMM route.
+- **XLA (Trn1)**: the NKI kernels, as before.
+- **No device**: PyTorch.
+
+`set_backend("nki")` always runs the NKI kernels, for device-resident operands
+too. Dtypes the kernels do not compute (float64, for example) run in torch,
+or raise `NotImplementedError` under `TRNBLAS_REQUIRE_NKI=1` (v0.9.1, #68).
 
 `trnblas.HAS_NKI` is `True` when the `nki` package (NKI 0.3.0+, Neuron
 SDK 2.29+) is importable. trnblas uses the canonical `nki.*`
@@ -31,8 +51,8 @@ detected on the first kernel launch:
   registered only once this path is selected.
 - **XLA (Trn1)**: kernels run on the `torch_xla` device, as before.
 
-`set_backend` is unaffected: it still chooses NKI vs PyTorch. On the native
-path `nki_batched_pair_energy` takes the single full-batch kernel
+On the native path, for host-resident inputs or with
+`TRNBLAS_PAIR_ENERGY=legacy`, `nki_batched_pair_energy` takes the single full-batch kernel
 (`batched_pair`) up to est_iters = nocc² × N_A² × N_K = 3072 and the chunked
 per-i kernel (`j_batched`) above it (XLA: 4096). On trn2 the full-batch kernel
 is 2–11× faster warm, but above 3072 its first-call compile reached 43–178 s,
@@ -47,6 +67,7 @@ See [Installation](../installation.md#two-neuron-pytorch-lineages).
 | `TRNBLAS_USE_SIMULATOR=1` | Route kernel dispatch through `nki.simulate(kernel)(numpy_args)` on CPU. Bypasses `torch_xla` + NEFF compile; used for fast correctness iteration. See [docs/developing_kernels.md](../developing_kernels.md). |
 | `TRNSCI_NKI_DISPATCH=auto\|native\|xla` | Suite-wide. Forces the native or XLA dispatch path. |
 | `TRNBLAS_BATCHED_PAIR_CHUNK_THRESHOLD=<n>` | Overrides batched-pair routing (default 4096 on XLA, 3072 on native). |
+| `TRNBLAS_NATIVE_GEMM=auto\|nki\|aten\|host` | Native path. Overrides the measured GEMM-family route; see [Installation](../installation.md#runtime-environment-variables). |
 
 ## GEMM kernel
 

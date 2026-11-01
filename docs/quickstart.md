@@ -40,10 +40,15 @@ n = trnblas.nrm2(u)
 ```python
 import trnblas
 
-trnblas.set_backend("auto")  # NKI on Trainium, PyTorch elsewhere (default)
+trnblas.set_backend("auto")  # measured routing on Trainium, PyTorch elsewhere (default)
 trnblas.set_backend("pytorch")  # force PyTorch
 trnblas.set_backend("nki")  # force NKI (requires Neuron hardware)
 ```
+
+On Trn2/Trn3 (native TorchNeuron), `auto` sends GEMMs on device-resident
+operands to aten, which is faster than the NKI GEMM there, and picks the host
+CPU or upload + aten for host operands. See
+[NKI Backend](api/nki.md#backend-selection).
 
 ## DF-MP2 example
 
