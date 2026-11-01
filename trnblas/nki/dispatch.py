@@ -869,6 +869,12 @@ def nki_metric_inv_half(J: torch.Tensor) -> torch.Tensor:
     one upload of X); otherwise `torch.linalg.cholesky` + `nki_trsm`.
     The result has J's dtype and device.
     """
+    if not (J.is_floating_point() or J.is_complex()):
+        # The host route would compute in float64 and truncate the factor back
+        # to an integer dtype (#86); the torch route raises. Raise on every route.
+        raise NotImplementedError(
+            f"metric_inv_half: expected a floating point or complex tensor; got {J.dtype}"
+        )
     if _metric_solve_route(J) == "host":
         X = _host_inv_chol_factor(J)
         return X.to(dtype=J.dtype).to(J.device)
