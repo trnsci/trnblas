@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`gemm(..., transA=True)` / `transB=True` on batched (>= 3-D) operands
+  reversed every dimension** (silent). `op(X)` was built with `X.T`, which on a
+  non-2-D tensor turns `(b, m, k)` into `(k, m, b)`; `torch.matmul` then
+  multiplied the reversed tensor whenever the shapes broadcast (square
+  batches), and raised otherwise. `op()` now transposes the last two
+  dimensions, as `batched_gemm` does. Affects every release, 0.2.0–0.9.1, on
+  every backend; 2-D calls are unchanged (#72).
+
 ## [0.9.1] — 2026-11-01
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
