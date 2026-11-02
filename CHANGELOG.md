@@ -7,6 +7,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **float64 policy (suite-wide, #89; behaviour change).** float64 under
+  `auto` now computes in torch at float64 accuracy (previously cast to fp32
+  on the NKI path). Trainium computes float64 at fp32 precision, so no NKI
+  kernel gives float64 accuracy; the four rules, the same in every trnsci
+  library, are:
+  - `set_backend("auto")`: float64 operands (amplitudes, `B`, or orbital
+    energies) run in torch, on the host or as aten on the device, whichever
+    the op already uses for its non-kernel route. For the DF-MP2 energy
+    APIs this replaces the fp32 rounding of float64 orbital energies on the
+    `pair_energy_sym` and multi-core routes (through 0.10.0); pass float32
+    `eps` to keep those calls on the kernel.
+  - explicit `set_backend("nki")`: float64 operands are cast to float32 for
+    the kernel, and a `UserWarning` ("precision is reduced to float32") is
+    emitted once per op. **This changes GEMM-family behaviour**: from 0.9.1
+    (#68/#69) through 0.10.0, float64 `gemm`, `batched_gemm`, `syrk`, left
+    `trsm` and the device route of `metric_inv_half` ran in torch at float64
+    accuracy under `nki`; they now run the FP32 kernels and return float64
+    values at float32 accuracy. Use `auto` for float64 accuracy. `symm` has
+    no kernel and still runs in torch. A float64 operand mixed with another
+    dtype is not cast (torch semantics, as before; #90 is separate).
+  - `TRNBLAS_REQUIRE_NKI=1`: float64 raises `NotImplementedError` (the
+    #68 `_no_kernel_for_dtype` convention) before any cast; it takes
+    precedence over the `nki` cast.
+  - Result dtype: every route returns what the pytorch backend returns for
+    the same inputs. The GEMM family already did; the energy kernels
+    (`nki_mp2_energy`, `nki_fused_gemm_energy`, `nki_batched_pair_energy`
+    including the `pair_energy_sym`, chunked and multi-core routes) returned
+    float32 (multi-core: `B.dtype`) through 0.10.0 and now return the
+    promoted dtype: float64 for float64 inputs, bfloat16/float16 for
+    half-precision amplitudes and orbital energies (the kernel still
+    accumulates in FP32; only the returned scalar is cast), float64 for
+    float32 amplitudes with float64 `eps_vir`. For `nki_batched_pair_energy`
+    and `nki_fused_gemm_energy` the occupied energies enter the pytorch
+    reference as Python floats, so the dtype is
+    `torch.promote_types(B.dtype, eps_vir.dtype)`. The multi-core aten route
+    (`TRNBLAS_CORES`) now keeps the caller's `eps` dtype instead of rounding
+    it to `B.dtype`, as the single-core aten route already did.
+  - `trnblas.parallel.pair_energy` returns a Python float from an fp32
+    all-reduce and still rounds `eps` to `B`'s dtype; only float64 `B`
+    under explicit `nki` changes (cast to float32 for the sym kernel, with
+    the warning).
+
+  Lands in the release after 0.10.0. `tests/test_conformance.py` keeps the
+  fp64 tolerance under `--backend auto` and relaxes it (and skips the fp64
+  gradchecks) only under `--backend nki`. Needs device validation.
+
+### Fixed
+
+- **Float64, integer, bool and complex tensors reached the FP32 DF-MP2 energy
+  kernels** (silent). `nki_mp2_energy`, `nki_fused_gemm_energy` and
+  `nki_batched_pair_energy` had no dtype check, so under `set_backend("nki")`
+  or `auto` a float64 (or integer/complex) amplitude tensor, or float64
+  orbital energies, went into the FP32 kernels and came back as garbage, or
+  failed and fell back to torch with a warning. Now integer / bool / complex
+  amplitudes run the torch reference (the pytorch backend's result;
+  device-resident `B` on the sym route runs as aten), bfloat16/float16
+  operands are upcast exactly to float32 for the kernel, and float64
+  follows the policy above. Under `TRNBLAS_REQUIRE_NKI=1` each of these
+  raises `NotImplementedError` instead. Affects every release with these
+  kernels, through 0.10.0. Found by the suite-wide audit (trnsci/trnsci#35).
+- **One dtype check at the NKI kernel boundary.** Every launch (`_launch`,
+  `_call_kernel` on the native and XLA paths, the simulator via the new
+  `_simulate`, and every `_native.OPS` entry, including the direct
+  `pair_energy_sym` calls in `multicore` / `parallel`) checks its operands
+  against a per-kernel table `_KERNEL_DTYPES` and raises `TypeError` naming
+  the op and dtypes for anything else, or for a kernel without an entry.
+  `tests/test_kernel_dtype_guard.py` registers every op through a stub
+  `nki_op` that refuses unsupported dtypes and drives every public API with
+  float32/float64/bfloat16/float16/int32/int64/bool/complex inputs on the
+  native, XLA and simulator paths, under `auto` and `nki`, plus the float64
+  policy (no kernel under `auto`; float32 kernel operands and exactly one
+  warning per op under `nki`; `NotImplementedError` under
+  `TRNBLAS_REQUIRE_NKI=1`) and the result-dtype rule. Open question: #90
+  (mixed-dtype GEMM operands).
+
 ## [0.10.0] — 2026-11-02
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
@@ -38,31 +115,6 @@ Headline: **correctness fixes — upgrade recommended.** In 0.2.0–0.9.1, `gemm
   Affects 0.3.0 through 0.9.1. The loop now runs over the broadcast batch
   index on expanded views, with no copies. Found by the conformance suite on
   Trn2 (trnsci/trnsci#35).
-- **Float64, integer, bool and complex tensors reached the FP32 DF-MP2 energy
-  kernels** (silent). `nki_mp2_energy`, `nki_fused_gemm_energy` and
-  `nki_batched_pair_energy` had no dtype check, so under `set_backend("nki")`
-  or `auto` a float64 (or integer/complex) amplitude tensor, or float64
-  orbital energies, went into the FP32 kernels and came back as garbage, or
-  failed and fell back to torch with a warning. Now float64 / integer / bool /
-  complex amplitudes run the torch reference (the pytorch backend's result;
-  device-resident `B` on the sym route runs as aten), bfloat16/float16
-  operands are upcast exactly to float32, and float64 orbital energies are
-  rounded to float32 (as the sym and multi-core paths already did). Under
-  `TRNBLAS_REQUIRE_NKI=1` each of these raises `NotImplementedError`
-  instead. The GEMM-family routes are unchanged (float64 already ran in
-  torch, #68). Affects every release with these kernels, through 0.9.1. Found by the suite-wide audit
-  (trnsci/trnsci#35).
-- **One dtype check at the NKI kernel boundary.** Every launch (`_launch`,
-  `_call_kernel` on the native and XLA paths, the simulator via the new
-  `_simulate`, and every `_native.OPS` entry, including the direct
-  `pair_energy_sym` calls in `multicore` / `parallel`) checks its operands
-  against a per-kernel table `_KERNEL_DTYPES` and raises `TypeError` naming
-  the op and dtypes for anything else, or for a kernel without an entry.
-  `tests/test_kernel_dtype_guard.py` registers every op through a stub
-  `nki_op` that refuses unsupported dtypes and drives every public API with
-  float32/float64/bfloat16/float16/int32/int64/bool/complex inputs on the
-  native, XLA and simulator paths. Open questions: #89 (energy result dtype),
-  #90 (mixed-dtype GEMM operands).
 - **`metric_inv_half` with an integer `J` on the `neuron` device returned a
   truncated integer factor** (silent, #86). The native host route computes
   L^-T in float64 and cast it back to `J.dtype`, which turned most entries

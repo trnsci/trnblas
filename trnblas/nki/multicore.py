@@ -192,8 +192,11 @@ def pair_energy_multicore(
     devices = devices[: len(chunks)]
     home = B.device
     B_h = _stage_to_host(B.detach()) if any(d != home for d in devices) else None
-    eo_h = eps_occ.detach().cpu().to(B.dtype)
-    ev_h = eps_vir.detach().cpu().to(B.dtype)
+    # The sym kernel takes eps in B's (FP32) dtype; the aten route keeps the
+    # caller's eps dtype, as the single-core `_torch_chunked_pair_energy` does.
+    edt = B.dtype if route == "sym" else None
+    eo_h = eps_occ.detach().cpu().to(edt or eps_occ.dtype)
+    ev_h = eps_vir.detach().cpu().to(edt or eps_vir.dtype)
 
     parts = []
     for rows, dev in zip(chunks, devices, strict=True):
@@ -203,7 +206,7 @@ def pair_energy_multicore(
         else:
             parts.append(aten_rows(src, eo_h, ev_h, rows, dev))
     total = sum(float(p) for p in parts)
-    return torch.tensor(total, dtype=B.dtype).to(home)
+    return torch.tensor(total, dtype=torch.promote_types(B.dtype, ev_h.dtype)).to(home)
 
 
 def sym_rows(

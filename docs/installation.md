@@ -130,7 +130,7 @@ pytest tests/ -v
 
 | Variable | Effect |
 |----------|--------|
-| `TRNBLAS_REQUIRE_NKI=1` | Re-raise on NKI kernel errors instead of silently falling back to `torch.matmul`. Useful in the validation suite to surface kernel breakage. Under `set_backend("nki")`, dtypes the kernels do not compute (float64, for example) raise `NotImplementedError` instead of running in torch (v0.9.1). Unset (default): kernel exceptions fall back to PyTorch. |
+| `TRNBLAS_REQUIRE_NKI=1` | Re-raise on NKI kernel errors instead of silently falling back to `torch.matmul`. Useful in the validation suite to surface kernel breakage. Dtypes the kernels do not compute (float64, for example) raise `NotImplementedError` instead of running in torch or, for float64 under `set_backend("nki")`, being cast to float32 (v0.9.1; see [Precision and dtypes](api/nki.md#precision-and-dtypes)). Unset (default): kernel exceptions fall back to PyTorch. |
 | `TRNBLAS_USE_SIMULATOR=1` | Route kernel dispatch through `nki.simulate(kernel)(numpy_args)` on CPU. Bypasses `torch_xla` + NEFF compile; used for fast correctness iteration. Requires `nki>=0.3.0`. |
 | `TRNSCI_NKI_DISPATCH=auto\|native\|xla` | Suite-wide. Forces the native or XLA dispatch path; `auto` (default) detects. Forcing an unavailable path raises. |
 | `TRNSCI_XLA_DEPRECATION=1` | Suite-wide, off by default. The XLA path emits one `DeprecationWarning`. |

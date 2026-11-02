@@ -14,6 +14,12 @@ stubs for the XLA and simulator paths. Every public API that can reach a
 kernel is then driven with float32, float64, bfloat16, float16, int32, int64,
 bool, complex64 and complex128 inputs under `nki` and `auto`, and the result
 dtype is compared with the pytorch backend's.
+
+Float64 policy (suite-wide, trnblas#89): under `auto` float64 runs in torch at
+float64 accuracy (no kernel call); under explicit `nki` float64 operands are
+cast to float32 for the kernel with one UserWarning per op; under
+TRNBLAS_REQUIRE_NKI=1 float64 raises NotImplementedError. Every route returns
+the pytorch backend's result dtype (bf16/fp16 and mixed promotion included).
 """
 
 import sys
@@ -318,13 +324,8 @@ def _pytorch(fn, args):
         return None, exc
 
 
-def _expected_dtype(name, ref, s: Stubs, is_energy):
-    # The energy kernels return float32 (unchanged by this guard). Where the
-    # pytorch backend returns another dtype (float64 eps, half-precision eps
-    # and amplitudes) that is a needs-decision question, not changed here.
-    if is_energy and s.calls:
-        return F32
-    return ref.dtype
+def _has_f64(name, d, e):
+    return d == F64 or (APIS[name][2] and e == F64)
 
 
 def _drive(s: Stubs, name, d, e, backend):
@@ -342,8 +343,11 @@ def _drive(s: Stubs, name, d, e, backend):
     assert not s.violations, s.violations
     if ref is None:
         return  # pytorch refuses it; the nki route may compute in torch
+    if backend == "auto" and _has_f64(name, d, e):
+        assert not s.calls, f"{name} {d}/{e}: float64 under auto reached {s.calls}"
     if isinstance(ref, torch.Tensor):
-        assert got.dtype == _expected_dtype(name, ref, s, is_energy), (name, got.dtype, ref.dtype)
+        # Every route returns the pytorch backend's dtype (trnblas#89).
+        assert got.dtype == ref.dtype, (name, got.dtype, ref.dtype)
         assert got.shape == ref.shape
         if not s.calls:  # torch route: the pytorch backend's answer
             torch.testing.assert_close(got, ref, equal_nan=True)
@@ -406,13 +410,15 @@ def test_multicore_sym_rows(stubs, d):
 
 
 @pytest.mark.parametrize("name,d,e", CASES, ids=[_id(c) for c in CASES])
-def test_xla_path(xla_stubs, name, d, e):
-    _drive(xla_stubs, name, d, e, "auto")
+@pytest.mark.parametrize("backend", ["nki", "auto"])
+def test_xla_path(xla_stubs, name, d, e, backend):
+    _drive(xla_stubs, name, d, e, backend)
 
 
 @pytest.mark.parametrize("name,d,e", CASES, ids=[_id(c) for c in CASES])
-def test_simulator_path(sim_stubs, name, d, e):
-    _drive(sim_stubs, name, d, e, "auto")
+@pytest.mark.parametrize("backend", ["nki", "auto"])
+def test_simulator_path(sim_stubs, name, d, e, backend):
+    _drive(sim_stubs, name, d, e, backend)
 
 
 # ── TRNBLAS_REQUIRE_NKI=1: refuse instead of computing in torch or casting ────
@@ -529,3 +535,222 @@ def test_supported_dtypes_reach_every_kernel(stubs, monkeypatch):
     _drive(stubs, "nki_batched_pair_energy", F32, F32, "nki")
     seen |= set(stubs.calls)
     assert seen >= KERNEL_FAMILIES, KERNEL_FAMILIES - seen
+
+
+# ── float64 policy (trnblas#89): auto -> torch, nki -> fp32 cast + one warning ─
+
+# APIs whose float64 call reaches a kernel under explicit `nki`, and the op
+# name the warning carries. `symm` has no kernel: torch, no warning.
+F64_KERNEL_APIS = {
+    "gemm": "gemm",
+    "gemm_transA": "gemm",
+    "batched_gemm": "batched_gemm",
+    "syrk": "syrk",
+    "syrk_trans": "syrk",
+    "trsm": "trsm",
+    "metric_inv_half": "trsm",
+    "nki_gemm": "gemm",
+    "nki_batched_gemm": "batched_gemm",
+    "nki_syrk": "syrk",
+    "nki_trsm": "trsm",
+    "nki_metric_inv_half": "trsm",
+    "nki_mp2_energy": "mp2_energy",
+    "nki_fused_gemm_energy": "fused_gemm_energy",
+    "nki_batched_pair_energy": "batched_pair_energy",
+}
+ENERGY_APIS = ["nki_mp2_energy", "nki_fused_gemm_energy", "nki_batched_pair_energy"]
+# (api, data dtype, eps dtype) with a float64 operand.
+F64_CASES = [(n, F64, F32) for n in F64_KERNEL_APIS] + [(n, F64, F64) for n in ENERGY_APIS]
+F64_CASES += [(n, F32, F64) for n in ENERGY_APIS]
+AUTO_F64_CASES = F64_CASES + [("symm", F64, F32)]
+PAIR_F64_CASES = [c for c in F64_CASES if c[0] == "nki_batched_pair_energy"]
+
+
+def _cast_warnings(record):
+    return [w for w in record if "precision is reduced to float32" in str(w.message)]
+
+
+@pytest.fixture
+def fresh_warned(monkeypatch):
+    monkeypatch.setattr(dispatch, "_fp32_cast_warned", set())
+
+
+def _path_fixture(request, path):
+    return request.getfixturevalue(
+        {"native": "stubs", "xla": "xla_stubs", "sim": "sim_stubs"}[path]
+    )
+
+
+@pytest.mark.parametrize("path", ["native", "xla", "sim"])
+@pytest.mark.parametrize("name,d,e", AUTO_F64_CASES, ids=[_id(c) for c in AUTO_F64_CASES])
+def test_auto_float64_runs_torch_at_fp64(request, fresh_warned, path, name, d, e):
+    s = _path_fixture(request, path)
+    fn, build, _ = APIS[name]
+    args = build(d, e)
+    ref = _run(fn, args, "pytorch")
+    s.calls.clear()
+    dispatch.set_backend("auto")
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        got = fn(*args)
+    assert not s.calls, f"float64 under auto reached kernels {s.calls}"
+    assert not _cast_warnings(rec)
+    assert got.dtype == ref.dtype
+    # float64 accuracy: torch.testing's float64 tolerances (rtol 1e-7, atol 1e-7).
+    torch.testing.assert_close(got, ref, rtol=1e-12, atol=1e-12)
+
+
+@pytest.mark.parametrize("path", ["native", "xla", "sim"])
+@pytest.mark.parametrize("name,d,e", F64_CASES, ids=[_id(c) for c in F64_CASES])
+def test_nki_float64_casts_to_fp32_and_warns_once(request, fresh_warned, path, name, d, e):
+    s = _path_fixture(request, path)
+    fn, build, _ = APIS[name]
+    args = build(d, e)
+    ref = _run(fn, args, "pytorch")
+    s.calls.clear()
+    dispatch.set_backend("nki")
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        outs = [fn(*args) for _ in range(3)]
+    assert s.calls, f"{name}: float64 under nki did not reach a kernel"
+    assert not s.violations, s.violations  # every kernel operand was float32
+    msgs = _cast_warnings(rec)
+    assert len(msgs) == 1, [str(w.message) for w in msgs]
+    assert msgs[0].category is UserWarning
+    assert F64_KERNEL_APIS[name] in str(msgs[0].message)
+    for got in outs:
+        assert got.dtype == ref.dtype, (got.dtype, ref.dtype)
+        assert got.shape == ref.shape
+
+
+@pytest.mark.parametrize("_n,d,e", PAIR_F64_CASES, ids=[_id(c) for c in PAIR_F64_CASES])
+def test_nki_float64_sym_route_casts(stubs, fresh_warned, monkeypatch, _n, d, e):
+    monkeypatch.setenv("TRNBLAS_PAIR_ENERGY", "sym")
+    monkeypatch.setattr(dispatch, "_on_neuron_device", lambda *t: True)
+    fn, build, _ = APIS["nki_batched_pair_energy"]
+    args = build(d, e)
+    ref = _run(fn, args, "pytorch")
+    stubs.calls.clear()
+    dispatch.set_backend("nki")
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        got = [fn(*args) for _ in range(2)]
+    assert "pair_energy_sym" in stubs.calls
+    assert not stubs.violations
+    assert len(_cast_warnings(rec)) == 1
+    assert all(g.dtype == ref.dtype for g in got)
+
+
+def test_nki_symm_float64_runs_torch_without_warning(stubs, fresh_warned):
+    fn, build, _ = APIS["symm"]
+    args = build(F64, F32)
+    ref = _run(fn, args, "pytorch")
+    dispatch.set_backend("nki")
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        got = fn(*args)
+    assert not stubs.calls and not _cast_warnings(rec)
+    torch.testing.assert_close(got, ref, rtol=1e-12, atol=1e-12)
+
+
+def test_nki_mixed_float64_gemm_keeps_torch_semantics(stubs, fresh_warned):
+    """float64 @ float32 is not cast: it runs (and raises) as the pytorch backend does."""
+    A, B = _rand((9, 7), F64), _rand((7, 5), F32, 1)
+    with pytest.raises(RuntimeError):
+        _run(trnblas.nki.nki_gemm, (A, B), "pytorch")
+    with pytest.raises(RuntimeError):
+        _run(trnblas.nki.nki_gemm, (A, B), "nki")
+    assert not stubs.calls
+
+
+@pytest.mark.parametrize("backend", ["nki", "auto"])
+@pytest.mark.parametrize("name,d,e", F64_CASES, ids=[_id(c) for c in F64_CASES])
+def test_require_nki_float64_raises_before_cast(
+    stubs, fresh_warned, monkeypatch, backend, name, d, e
+):
+    """TRNBLAS_REQUIRE_NKI=1 takes precedence over the explicit-nki cast."""
+    monkeypatch.setattr(dispatch, "_REQUIRE_NKI", True)
+    fn, build, _ = APIS[name]
+    args = build(d, e)
+    dispatch.set_backend(backend)
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        if backend == "nki" or APIS[name][2]:
+            with pytest.raises(NotImplementedError):
+                fn(*args)
+        else:
+            # Native `auto` GEMM family never picks a kernel for host operands
+            # (aten / host CPU, fp32 included), so there is nothing to refuse:
+            # float64 computes in torch.
+            fn(*args)
+    assert not stubs.calls
+    assert not _cast_warnings(rec)
+
+
+@pytest.mark.parametrize("name,d,e", F64_CASES, ids=[_id(c) for c in F64_CASES])
+def test_require_nki_float64_raises_on_xla_auto(xla_stubs, monkeypatch, name, d, e):
+    monkeypatch.setattr(dispatch, "_REQUIRE_NKI", True)
+    fn, build, _ = APIS[name]
+    with pytest.raises(NotImplementedError):
+        _run(fn, build(d, e), "auto")
+    assert not xla_stubs.calls
+
+
+# ── result dtype == pytorch backend dtype (trnblas#89) ────────────────────────
+
+RESULT_DTYPE_PAIRS = [
+    (F32, F32),
+    (F64, F64),
+    (F32, F64),
+    (F64, F32),
+    (BF16, BF16),
+    (F16, F16),
+    (BF16, F32),
+    (F16, F32),
+    (F32, BF16),
+    (F32, F16),
+    (BF16, F64),
+]
+PAIR_ROUTES = ["default", "chunked", "sym", "multicore_sym", "multicore_aten"]
+RESULT_CASES = [(n, "default", d, e) for n in ENERGY_APIS[:2] for d, e in RESULT_DTYPE_PAIRS]
+RESULT_CASES += [
+    ("nki_batched_pair_energy", r, d, e) for r in PAIR_ROUTES for d, e in RESULT_DTYPE_PAIRS
+]
+
+
+@pytest.mark.parametrize("backend", ["nki", "auto"])
+@pytest.mark.parametrize(
+    "name,route,d,e",
+    RESULT_CASES,
+    ids=[f"{c[1]}-{_id((c[0], c[2], c[3]))}" for c in RESULT_CASES],
+)
+def test_energy_result_dtype_matches_pytorch(stubs, monkeypatch, backend, name, route, d, e):
+    if route == "chunked":
+        monkeypatch.setenv("TRNBLAS_BATCHED_PAIR_CHUNK_THRESHOLD", "0")
+    if route in ("sym", "multicore_sym", "multicore_aten"):
+        monkeypatch.setenv("TRNBLAS_PAIR_ENERGY", "aten" if route == "multicore_aten" else "sym")
+        monkeypatch.setattr(dispatch, "_on_neuron_device", lambda *t: True)
+    if route.startswith("multicore"):
+        cpu = torch.device("cpu")
+        monkeypatch.setattr(multicore, "pair_energy_devices", lambda B: [cpu, cpu])
+    fn, build, _ = APIS[name]
+    args = build(d, e)
+    ref = _run(fn, args, "pytorch")
+    got = _run(fn, args, backend)
+    assert not stubs.violations, stubs.violations
+    assert got.dtype == ref.dtype, (got.dtype, ref.dtype)
+    assert got.shape == ref.shape
+
+
+@pytest.mark.parametrize("d", [F32, F64, BF16, F16], ids=str)
+@pytest.mark.parametrize("name", ["gemm", "batched_gemm", "syrk", "trsm", "nki_gemm"])
+@pytest.mark.parametrize("backend", ["nki", "auto"])
+def test_gemm_result_dtype_matches_pytorch(stubs, name, d, backend):
+    fn, build, _ = APIS[name]
+    args = build(d, F32)
+    ref, ref_exc = _pytorch(fn, args)
+    if ref_exc is not None:  # torch has no half-precision CPU triangular solve
+        assert name == "trsm" and d in (BF16, F16)
+        return
+    got = _run(fn, args, backend)
+    assert got.dtype == ref.dtype == d

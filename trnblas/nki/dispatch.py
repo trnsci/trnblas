@@ -301,16 +301,65 @@ def _no_kernel_for_dtype(
         dts = sorted({str(t.dtype) for t in tensors})
         raise NotImplementedError(
             f"trnblas {what}: the NKI kernels take {takes}, got {dts}. "
-            "Unset TRNBLAS_REQUIRE_NKI to compute in torch."
+            "Unset TRNBLAS_REQUIRE_NKI to compute in torch (or, for float64 under "
+            "set_backend('nki'), on the kernel at float32 precision)."
         )
+
+
+# ── float64 policy (suite-wide, trnblas#89) ──────────────────────────────────
+#
+# Trainium computes float64 at fp32 precision, so no NKI kernel gives float64
+# accuracy. `auto` runs float64 in torch (host or device aten) at float64
+# accuracy. An explicit `set_backend("nki")` asks for the kernel: float64
+# operands are cast to float32, the kernel runs, the result is cast back to
+# the pytorch backend's dtype, and a UserWarning is emitted once per op.
+# TRNBLAS_REQUIRE_NKI=1 refuses float64 with NotImplementedError instead
+# (`_no_kernel_for_dtype`), and takes precedence over the cast.
+_fp32_cast_warned: set[str] = set()
+
+
+def _nki_casts_fp64(*tensors: torch.Tensor) -> bool:
+    """True when float64 `tensors` go to an FP32 kernel as float32: explicit
+    `set_backend("nki")` and every operand float64 (a mix of float64 with
+    other dtypes keeps its torch route, as the pytorch backend would)."""
+    return _backend == "nki" and all(t.dtype == torch.float64 for t in tensors)
+
+
+def _warn_fp32_cast(op: str) -> None:
+    """One UserWarning per op: float64 operands ran on an FP32 kernel."""
+    if op in _fp32_cast_warned:
+        return
+    _fp32_cast_warned.add(op)
+    warnings.warn(
+        f"trnblas {op}: set_backend('nki') runs float64 operands on the FP32 NKI "
+        "kernel; precision is reduced to float32 (the result keeps float64 dtype). "
+        "Use set_backend('auto') for float64 accuracy in torch, or set "
+        "TRNBLAS_REQUIRE_NKI=1 to raise instead.",
+        UserWarning,
+        stacklevel=3,
+    )
+
+
+def _as_result_dtype(out, dtype: torch.dtype):
+    """`out` cast to `dtype` (the pytorch backend's result dtype) when they differ."""
+    if (
+        isinstance(out, torch.Tensor)
+        and out.dtype != dtype
+        and (dtype.is_floating_point or dtype.is_complex)
+    ):
+        return out.to(dtype)
+    return out
 
 
 def _gemm_route(
     *tensors: torch.Tensor, op: str = "gemm", macs: float | None = None, nbytes: int | None = None
 ) -> str:
-    """'torch', 'nki', 'aten' or 'host' for a plain GEMM-family call.
+    """'torch', 'nki', 'nki_fp32', 'lnc', 'aten' or 'host' for a plain GEMM-family call.
 
     'torch' is the pytorch backend (torch on whatever device the data is on).
+    'nki_fp32' (float64 under explicit `set_backend("nki")`) is the NKI kernel
+    on float32 copies; the caller warns once and casts the result back.
+    Callers without a kernel (`symm`) treat it as 'torch'.
     `macs` / `nbytes` (multiply-adds and host-link bytes) are needed only for
     all-host operands under `auto`; they default to `tensors[0] @ tensors[1]`.
     """
@@ -319,7 +368,9 @@ def _gemm_route(
     if _backend == "nki" or _use_simulator() or _get_dispatch_path() != "native":
         if not _kernel_dtypes_ok(*tensors):
             _no_kernel_for_dtype(op, *tensors)
-            return "torch"
+            # Explicit `nki`: float64 runs the kernel in float32 (the caller
+            # casts and warns). `auto`: torch at float64 accuracy.
+            return "nki_fp32" if _nki_casts_fp64(*tensors) else "torch"
         return "nki"
     policy = _native_gemm_policy()
     if policy == "nki" and not _kernel_dtypes_ok(*tensors):
@@ -509,39 +560,50 @@ def _check_kernel_operands(op_name: str, *tensors) -> None:
 
 
 # The energy kernels compute in FP32. bfloat16/float16 operands are upcast
-# exactly; float64 orbital energies (small vectors, often straight from
-# NumPy) are rounded to float32, as `_pair_sym_feeds` and the multi-core path
-# already did, since the amplitudes are FP32. Float64 / integer / bool /
-# complex amplitudes run the torch reference (the pytorch backend), because
-# an FP32 kernel would throw away the precision the caller asked for.
+# exactly. Float64 operands (amplitudes or orbital energies) follow the
+# float64 policy above: torch under `auto`, a float32 cast plus a one-time
+# warning under explicit `nki`, NotImplementedError under TRNBLAS_REQUIRE_NKI.
+# Integer / bool / complex operands run the torch reference (the pytorch
+# backend). Every route returns the pytorch backend's result dtype
+# (trnblas#89; `_mp2_result_dtype` and friends).
 _ENERGY_DATA_DTYPES = _GEMM_KERNEL_DTYPES
-_ENERGY_EPS_DTYPES = _GEMM_KERNEL_DTYPES | {torch.float64}
 
 
 def _energy_operands(what: str, data: tuple, eps: tuple):
     """FP32 operands for a DF-MP2 energy kernel, or None to run torch.
 
     `data` are the amplitude / B tensors, `eps` the orbital energies. Under
-    TRNBLAS_REQUIRE_NKI an unsupported dtype, or a float64 eps that would be
-    rounded, raises NotImplementedError instead.
+    TRNBLAS_REQUIRE_NKI an operand the kernel does not take (float64
+    included) raises NotImplementedError instead.
     """
-    if any(t.dtype not in _ENERGY_DATA_DTYPES for t in data) or any(
-        t.dtype not in _ENERGY_EPS_DTYPES for t in eps
-    ):
+    ts = (*data, *eps)
+    if any(t.dtype not in _ENERGY_DATA_DTYPES for t in ts):
         _no_kernel_for_dtype(
             what,
-            *data,
-            *eps,
-            takes="float32 amplitudes (bfloat16/float16 upcast) and float32 orbital energies",
+            *ts,
+            takes="float32 amplitudes and orbital energies (bfloat16/float16 upcast)",
         )
-        return None
-    if _REQUIRE_NKI and any(t.dtype == torch.float64 for t in eps):
-        raise NotImplementedError(
-            f"trnblas {what}: the NKI energy kernels are FP32; float64 orbital energies "
-            "would be rounded to float32. Pass float32 eps, or unset TRNBLAS_REQUIRE_NKI."
-        )
+        bad = [t for t in ts if t.dtype not in _ENERGY_DATA_DTYPES]
+        if not _nki_casts_fp64(*bad):
+            return None  # `auto`, or integer / bool / complex: torch
+        _warn_fp32_cast(what)
     f32 = torch.float32
     return tuple(t.to(f32) for t in data), tuple(t.to(f32) for t in eps)
+
+
+def _mp2_result_dtype(T_flat, eps_occ_chunk, eps_occ_full, eps_vir) -> torch.dtype:
+    """dtype `_torch_mp2_energy` (the pytorch backend) returns."""
+    dt = torch.promote_types(T_flat.dtype, eps_occ_chunk.dtype)
+    return torch.promote_types(dt, torch.promote_types(eps_occ_full.dtype, eps_vir.dtype))
+
+
+def _pair_result_dtype(B, eps_vir) -> torch.dtype:
+    """dtype `_torch_batched_pair_energy` / `_torch_fused_pair_energy` return.
+
+    The occupied energies enter those references as Python floats, so only
+    the amplitudes and `eps_vir` set the dtype.
+    """
+    return torch.promote_types(B.dtype, eps_vir.dtype)
 
 
 def _simulate(kernel, op_name: str, *tensors: torch.Tensor, device=None) -> torch.Tensor:
@@ -611,6 +673,11 @@ def nki_batched_gemm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
         return torch.matmul(A, B)
     if route == "aten":
         return _aten_on_device(torch.matmul, A, B)
+    out_dtype = None
+    if route == "nki_fp32":
+        _warn_fp32_cast("batched_gemm")
+        out_dtype = A.dtype
+        A, B = A.to(torch.float32), B.to(torch.float32)
     # Loop over the broadcast batch index on expanded views (no copies). Each
     # slice is copied into one preallocated result as it arrives (a
     # `torch.stack` would be one more pass into fresh host memory, #61).
@@ -620,7 +687,7 @@ def nki_batched_gemm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     for idx in np.ndindex(*batch):
         c = _nki_gemm_impl(a[idx], b[idx])
         if out is None:
-            out = _host_empty((*batch, *c.shape), c.dtype, c.device)
+            out = _host_empty((*batch, *c.shape), out_dtype or c.dtype, c.device)
         out[idx].copy_(c)
     return out
 
@@ -672,8 +739,9 @@ def nki_mp2_energy(
     if feeds is None:  # no FP32 kernel for these dtypes: the pytorch backend
         return _torch_mp2_energy(T_flat, eps_occ_chunk, eps_occ_full, eps_vir)
     (t_k,), (eo_c_k, eo_f_k, ev_k) = feeds
+    dt = _mp2_result_dtype(T_flat, eps_occ_chunk, eps_occ_full, eps_vir)
     try:
-        return _nki_mp2_energy_impl(t_k, eo_c_k, eo_f_k, ev_k)
+        return _as_result_dtype(_nki_mp2_energy_impl(t_k, eo_c_k, eo_f_k, ev_k), dt)
     except Exception as exc:
         if _REQUIRE_NKI:
             raise
@@ -736,6 +804,9 @@ def nki_gemm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     route = _gemm_route(A, B)
     if route == "nki":
         return _nki_gemm_impl(A, B)
+    if route == "nki_fp32":
+        _warn_fp32_cast("gemm")
+        return _nki_gemm_impl(A.to(torch.float32), B.to(torch.float32)).to(A.dtype)
     if route == "lnc":
         return _nki_gemm_lnc(A, B)
     if route == "aten":
@@ -760,6 +831,9 @@ def nki_syrk(A: torch.Tensor, symmetrize: bool = False) -> torch.Tensor:
     route = _gemm_route(A, op="syrk", macs=M * M * K, nbytes=(M * K + M * M) * A.element_size())
     if route == "nki":
         return _nki_syrk_impl(A, symmetrize=symmetrize)
+    if route == "nki_fp32":
+        _warn_fp32_cast("syrk")
+        return _nki_syrk_impl(A.to(torch.float32), symmetrize=symmetrize).to(A.dtype)
     if route == "aten" and A.device.type != "neuron":
         a = _upload(A)
         r = torch.matmul(a, a.T)
@@ -812,6 +886,11 @@ def nki_trsm(
                 return _nki_trsm_left(A, B, uplo, trans, diag, alpha, mm=torch.matmul)
             X = _nki_trsm_left(_upload(A), _upload(B), uplo, trans, diag, alpha, mm=torch.matmul)
             return _to_host(X, B.device)
+        if route == "nki_fp32":
+            _warn_fp32_cast("trsm")
+            f32 = torch.float32
+            X = _nki_trsm_left(A.to(f32), B.to(f32), uplo, trans, diag, alpha, mm=_nki_gemm_impl)
+            return X.to(B.dtype)
         return _nki_trsm_left(A, B, uplo, trans, diag, alpha, mm=_nki_gemm_impl)
     except Exception as exc:
         if _REQUIRE_NKI:
@@ -837,7 +916,7 @@ def nki_trsm(
 
 
 def _trsm_route(A: torch.Tensor, B: torch.Tensor) -> str:
-    """'nki', 'aten' or 'host' for a left TRSM (with `_use_nki()`)."""
+    """'nki', 'nki_fp32', 'aten' or 'host' for a left TRSM (with `_use_nki()`)."""
     if _backend == "nki" or _use_simulator() or _get_dispatch_path() != "native":
         route = "nki"
     else:
@@ -845,9 +924,10 @@ def _trsm_route(A: torch.Tensor, B: torch.Tensor) -> str:
         if route not in ("nki", "aten"):
             return "host" if _on_host(A, B) else "aten"
     if route == "nki" and not _kernel_dtypes_ok(A, B):
-        # The NKI GEMM updates are FP32-only (#68): solve with torch instead.
+        # The NKI GEMM updates are FP32-only (#68): solve with torch instead,
+        # except float64 under explicit `nki` (kernel in float32, warned once).
         _no_kernel_for_dtype("trsm", A, B)
-        return "host"
+        return "nki_fp32" if _nki_casts_fp64(A, B) else "host"
     return route
 
 
@@ -1706,6 +1786,16 @@ def nki_batched_pair_energy(
     """
     if not _use_nki():
         return _torch_batched_pair_energy(B, eps_occ, eps_vir)
+    # Every route returns the pytorch backend's dtype (trnblas#89).
+    return _as_result_dtype(
+        _batched_pair_energy_routed(B, eps_occ, eps_vir), _pair_result_dtype(B, eps_vir)
+    )
+
+
+def _batched_pair_energy_routed(
+    B: torch.Tensor, eps_occ: torch.Tensor, eps_vir: torch.Tensor
+) -> torch.Tensor:
+    """`nki_batched_pair_energy` under `_use_nki()`, before the result-dtype cast."""
     route = _pair_energy_route(B)  # 'aten' for amplitudes the kernels do not take
     feeds = None
     if route != "aten":
@@ -1719,7 +1809,9 @@ def nki_batched_pair_energy(
 
         devices = pair_energy_devices(B)
         if devices is not None:
-            # `sym_rows` builds FP32 kernel operands itself.
+            if route == "sym":  # FP32 kernel operands (float64 cast under explicit nki)
+                (B_k,), (eo_k, ev_k) = feeds
+                return pair_energy_multicore(B_k, eo_k, ev_k, route, devices)
             return pair_energy_multicore(B, eps_occ, eps_vir, route, devices)
     if route == "aten":
         return _torch_chunked_pair_energy(B, eps_occ, eps_vir)
@@ -1818,11 +1910,13 @@ def _pair_energy_route(B: torch.Tensor) -> str:
         return "legacy"
     if choice in ("sym", "auto") and B.dtype not in _ENERGY_DATA_DTYPES:
         # The sym kernel is FP32: float64 / integer / complex B runs as aten
-        # (torch on the device), at full precision.
+        # (torch on the device), at full precision. Float64 under explicit
+        # `nki` takes the usual choice; the sym kernel then gets float32.
         _no_kernel_for_dtype(
             "batched_pair_energy", B, takes="float32 amplitudes (bfloat16/float16 upcast)"
         )
-        return "aten"
+        if not _nki_casts_fp64(B):
+            return "aten"
     if choice != "auto":
         return choice
     dims = _pair_sym_dims(*B.shape)
@@ -2204,8 +2298,10 @@ def nki_fused_gemm_energy(
     if feeds is None:  # no FP32 kernel for these dtypes: the pytorch backend
         return _torch_fused_pair_energy(b_i, b_j, eps_occ_i, eps_occ_j, eps_vir)
     (bi_k, bj_k), (ev_k,) = feeds
+    dt = torch.promote_types(_pair_result_dtype(b_i, eps_vir), b_j.dtype)
     try:
-        return _nki_fused_gemm_energy_impl(bi_k, bj_k, eps_occ_i, eps_occ_j, ev_k)
+        out = _nki_fused_gemm_energy_impl(bi_k, bj_k, eps_occ_i, eps_occ_j, ev_k)
+        return _as_result_dtype(out, dt)
     except Exception as exc:
         if _REQUIRE_NKI:
             raise
