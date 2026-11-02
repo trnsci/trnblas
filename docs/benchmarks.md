@@ -547,6 +547,22 @@ The rule (`_lnc_gemm_wins`): fp32, A a transposed view, 16 ≤ M ≤ 64,
 transposed view is 1.1–2.6x faster at every bf16 small-M shape measured but
 `xxl` (2.07 vs 2.02 ms, where aten on contiguous A takes 1.66).
 
+Umbrella DF-MP2 profile (`examples/quantum_chemistry/df_mp2_profile.py`,
+trnsci/trnsci main, `--modes neuron --pipelines example`), warm ms, same
+session; "before" is `TRNBLAS_NATIVE_GEMM=aten` (the previous `auto` for
+device-resident operands):
+
+| size (ao/aux/occ) | half-transform before → after | total before → after | half `gemm` route after |
+|---|---|---|---|
+| m (128/384/16) | 0.7 → 0.7 | 18.0 → 14.8 | aten |
+| l (256/768/32) | 1.5 → 1.4 | 52.4 → 52.7 | kernel |
+| xl (384/1152/48) | 3.6 → 2.6 | 152.4 → 148.5 | kernel |
+
+The half-transform is a small part of the pipeline (the metric and energy
+steps dominate), so the end-to-end change is within run-to-run noise: `m`
+takes the same routes in both runs and still moved 18.0 → 14.8 ms.
+B and the energy match to the same relative error (1.9–2.0e-7, ≤ 6.9e-8).
+
 **LNC=1** (`NEURON_LOGICAL_NC_CONFIG=1`, one physical core): the same
 picture at about twice the time. 4096³ fp32: aten 7.28, kernel 7.45 (LNC=2:
 3.72 / 3.88, so the kernel scales 1.92x from one to two physical cores);
