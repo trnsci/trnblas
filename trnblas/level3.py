@@ -94,12 +94,13 @@ def gemm(
     # (#72). 1-D operands are left as they are (`.T` was a no-op there).
     a = A.mT if transA and A.dim() >= 2 else A
     b = B.mT if transB and B.dim() >= 2 else B
-    a = _neuron_mm_lhs(a, b)
 
     if _use_nki() and a.dim() == 2 and b.dim() == 2:
+        # nki_gemm applies `_neuron_mm_lhs` on its aten route; the LNC kernel
+        # takes a transposed `a` as is (#79).
         result = nki_gemm(a, b)
     else:
-        result = torch.matmul(a, b)
+        result = torch.matmul(_neuron_mm_lhs(a, b), b)
 
     return _scale_add(result, alpha, beta, C)
 

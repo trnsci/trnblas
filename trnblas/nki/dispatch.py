@@ -175,11 +175,13 @@ _RAGGED_ENABLED: bool = os.environ.get("TRNBLAS_GEMM_RAGGED", "1").lower() not i
 #
 # bf16 moves the host/device crossover up 2-30x: the host's bf16 matmul
 # (AMX) ran 4096^3 in 115 ms and 32x256x196608 in 4.0 ms (device 10.2 ms).
-# Device-resident operands: aten beat the NKI kernel at every GEMM, batched
-# and SYRK shape and dtype measured, by 1.1x (32x256x196608, syrk 1024x256)
-# to 6x (8192^3 bf16: 7.7 vs 47 ms; fp32 29.4 vs 116 ms), and by 20-310x for
-# batched_gemm (one kernel launch per slice); there is no crossover. The NKI
-# GEMM stays reachable through `set_backend("nki")` / TRNBLAS_NATIVE_GEMM=nki.
+# Device-resident operands: aten beat the single-program NKI kernel at every
+# GEMM, batched and SYRK shape and dtype measured, by 1.1x (32x256x196608,
+# syrk 1024x256) to 6x (8192^3 bf16: 7.7 vs 47 ms; fp32 29.4 vs 116 ms), and
+# by 20-310x for batched_gemm (one kernel launch per slice). It stays
+# reachable through `set_backend("nki")` / TRNBLAS_NATIVE_GEMM=nki. The
+# LNC-split GEMM (#79) wins one device-resident region, which `auto` routes to
+# it (`_lnc_gemm_wins`); TRNBLAS_NATIVE_GEMM=lnc forces it.
 # TRSM: see `_trsm_route`.
 #
 # The host CPUs on the measurement box share physical cores with other jobs,
@@ -187,12 +189,13 @@ _RAGGED_ENABLED: bool = os.environ.get("TRNBLAS_GEMM_RAGGED", "1").lower() not i
 # fitted to the quieter run; on a contended host the device route is better
 # than they predict near the crossover.
 #
-# TRNBLAS_NATIVE_GEMM=auto|nki|aten|host overrides `auto` (for validation and
-# re-benchmarking; `host` applies to all-host inputs only). An explicit
+# TRNBLAS_NATIVE_GEMM=auto|nki|aten|host|lnc overrides `auto` (for validation
+# and re-benchmarking; `host` applies to all-host inputs only, `lnc` to
+# device-resident 2-D `gemm` only). An explicit
 # `set_backend("nki")` always runs the NKI kernels. The XLA path, the simulator
 # and the "cpu" dispatch path keep the kernel route, as before. The fused
 # kernels (MP2 energy, batched pair, pair_energy_sym) are not affected.
-_NATIVE_GEMM_CHOICES = ("auto", "nki", "aten", "host")
+_NATIVE_GEMM_CHOICES = ("auto", "nki", "aten", "host", "lnc")
 
 # Host-vs-device model: for all-host operands, the host CPU wins when
 #   macs < scale * (fixed + per_byte * link_bytes)
@@ -320,10 +323,19 @@ def _gemm_route(
     if policy == "nki" and not _kernel_dtypes_ok(*tensors):
         _no_kernel_for_dtype(op, *tensors)
         return "torch"
+    if policy == "lnc":
+        # Forces the LNC-split GEMM (#79) for plain 2-D device-resident GEMMs;
+        # everything else takes aten, as under `aten`.
+        lnc_ok = op == "gemm" and _on_neuron_device(*tensors) and _kernel_dtypes_ok(*tensors)
+        return "lnc" if lnc_ok and tensors[0].dim() == 2 else "aten"
     if policy in ("nki", "aten"):
         return policy
     if not _on_host(*tensors):
-        return "aten"  # device-resident (or mixed): aten at every measured shape
+        # Device-resident (or mixed): aten, except the shapes where the
+        # LNC-split kernel measured faster (#79, `_lnc_gemm_wins`).
+        if op == "gemm" and _on_neuron_device(*tensors) and _lnc_gemm_wins(*tensors[:2]):
+            return "lnc"
+        return "aten"
     if policy == "host":
         return "host"
     if macs is None:
@@ -341,6 +353,62 @@ def _gemm_via_aten(*tensors: torch.Tensor) -> bool:
     (aten on the device, or torch on the host). Kept for callers that only
     distinguish kernel from not-kernel (e.g. the umbrella DF-MP2 profile)."""
     return _gemm_route(*tensors) in ("aten", "host")
+
+
+# ── LNC-split GEMM (#79) under `auto` ────────────────────────────────────────
+#
+# `_gemm_lnc_tn_kernel` / `_gemm_lnc_kernel` split C over both physical cores of
+# the logical core and keep a <= 512-row A^T block stationary in SBUF over all
+# of K. On the device their Tensor Engine time matches aten's from ~4096^3 up
+# (neuron-explorer profiles on #79), but each custom-op launch costs ~0.1 ms of
+# host time against ~0.016 ms for an aten matmul, so a synchronous call wins
+# only where the kernel saves more than that. `auto` takes it in the measured
+# win region (trn2.3xlarge, SDK 2.33, LNC=2, device-resident, warm medians;
+# tables on #79): fp32 with A a transposed view, 16 <= M <= 64,
+# 128 <= K <= 512, N >= 256 K and K * N >= 2^24 (B at least 64 MiB). That is
+# the DF-MP2 half-transform `C_occ.T @ eri.reshape(nao, nao * naux)` from the
+# umbrella profile's `l` size up: 1.5x at `l` and 1.7x at `xl`, and at `xxl`
+# 4.0 ms against 6.3 ms for aten on the transposed view. Everywhere else
+# measured, aten is as fast or faster.
+_LNC_GEMM_M = (16, 64)
+_LNC_GEMM_K = (128, 512)
+_LNC_GEMM_N_PER_K = 256
+_LNC_GEMM_MIN_KN = 1 << 24
+
+
+def _lnc_gemm_wins(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """True when device-resident `a @ b` is in the measured win region of the
+    LNC-split GEMM kernel (see the table above)."""
+    if a.dim() != 2 or b.dim() != 2 or a.dtype != torch.float32 or b.dtype != torch.float32:
+        return False
+    M, K = a.shape
+    N = b.shape[1]
+    if not (a.mT.is_contiguous() and not a.is_contiguous()):
+        return False
+    return (
+        _LNC_GEMM_M[0] <= M <= _LNC_GEMM_M[1]
+        and _LNC_GEMM_K[0] <= K <= _LNC_GEMM_K[1]
+        and N >= _LNC_GEMM_N_PER_K * K
+        and K * N >= _LNC_GEMM_MIN_KN
+    )
+
+
+def _nki_gemm_lnc(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    """`A @ B` on the LNC-split kernels (#79), operands already on the device.
+
+    A transposed view goes to `_gemm_lnc_tn_kernel` as its dense base (no
+    copy, no transposes); anything else to `_gemm_lnc_kernel`. Falls back to
+    aten if the kernel fails (re-raises under TRNBLAS_REQUIRE_NKI=1)."""
+    b = B.contiguous()
+    try:
+        if A.mT.is_contiguous():
+            return _call_kernel(_gemm_lnc_tn_kernel, "gemm_lnc_tn", A.mT, b)
+        return _call_kernel(_gemm_lnc_kernel, "gemm_lnc", A.contiguous(), b)
+    except Exception as exc:
+        if _REQUIRE_NKI:
+            raise
+        _warn_fallback(exc, "LNC GEMM kernel failed — falling back to aten")
+        return torch.matmul(_neuron_mm_lhs(A, B), B)
 
 
 def _aten_on_device(fn, *tensors: torch.Tensor) -> torch.Tensor:
@@ -568,6 +636,8 @@ def nki_gemm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     route = _gemm_route(A, B)
     if route == "nki":
         return _nki_gemm_impl(A, B)
+    if route == "lnc":
+        return _nki_gemm_lnc(A, B)
     if route == "aten":
         return _aten_on_device(lambda a, b: torch.matmul(_neuron_mm_lhs(a, b), b), A, B)
     return torch.matmul(A, B)
@@ -2107,6 +2177,64 @@ def _nki_syrk_impl(A: torch.Tensor, symmetrize: bool = False) -> torch.Tensor:
         return _symmetrize(r) if symmetrize else r
 
 
+# ── LNC-split GEMM (#79): static tiling helpers ──────────────────────────────
+# Plain Python on static sizes, called while the kernels trace; defined outside
+# the `HAS_NKI` block so CPU tests can check the tiling covers C exactly.
+
+
+def _lnc_sizes(D, T):
+    """Static tile sizes covering D: full T tiles, then the remainder."""
+    out = [T] * (D // T)
+    if D % T:
+        out.append(D % T)
+    return out
+
+
+def _lnc_tm(K, itemsize):
+    """128-row M tiles per block: up to 4, with the block's A^T at most
+    64 KiB per partition (a staged block and the next one's rows can be
+    live at once). B is re-read once per block, so a bigger block saves
+    HBM traffic; 4 tiles x one 2 KiB PSUM bank leaves half of PSUM free
+    for the next N tile."""
+    tm = 4
+    while tm > 1 and K * tm * itemsize > 64 * 1024:
+        tm -= 1
+    return tm
+
+
+def _lnc_nplan(NP, TM):
+    """N tiling of an NP-column range for an M block of TM tiles:
+    (W, NF, full, tail). NF super-tiles of W columns start at multiples of W,
+    each split into the 512-wide (or narrower, when NP < 512) PSUM sub-tiles
+    `full`; the remaining NP - NF * W columns are the sub-tiles `tail`. A
+    super-tile has 4 // TM sub-tiles, so a block holds at most 4 PSUM banks
+    and the next one can start while it drains, and every B load is
+    4 // TM sub-tiles wide."""
+    tns = 512 if NP > 512 else NP
+    nsub = max(1, 4 // TM)
+    W = tns * nsub if tns * nsub <= NP else tns
+    NF = NP // W
+    return W, NF, [tns] * (W // tns), _lnc_sizes(NP - NF * W, tns)
+
+
+def _lnc_blocks_of(MP, TM):
+    """Static (row offset, M tile sizes) of the M blocks of an MP-row range."""
+    sizes = _lnc_sizes(MP, 128)
+    return [(i * 128, sizes[i : i + TM]) for i in range(0, len(sizes), TM)]
+
+
+def _lnc_split(M, N, n_prog):
+    """(split, rows per program, cols per program): split 'm' (rows), 'n'
+    (columns) or '' (one program does everything). For an odd split the
+    two programs' ranges overlap by one row/column, which both compute and
+    store with identical values."""
+    if n_prog > 1 and M >= 256:
+        return "m", (M + n_prog - 1) // n_prog, N
+    if n_prog > 1 and N >= 2:
+        return "n", M, (N + n_prog - 1) // n_prog
+    return "", M, N
+
+
 if HAS_NKI:
     # ---------------------------------------------------------------------------
     # GEMM tile-config kernels — one @nki.jit per candidate in _TILE_CANDIDATES.
@@ -2371,6 +2499,191 @@ if HAS_NKI:
         }
     )
     _gemm_kernel = _gemm_kernel_registry[(_TILE_M, _TILE_K, _TILE_N)]
+
+    # ---------------------------------------------------------------------------
+    # LNC=2 GEMM (#79): `_gemm_lnc_kernel` (A row-major) and `_gemm_lnc_tn_kernel`
+    # (A given as A^T). Helpers take only static Python sizes plus symbolic
+    # offsets, and read no module or closure state (aws-neuron-sdk#1454).
+    # ---------------------------------------------------------------------------
+
+    def _lnc_ntile(aT, aTr, b, c, m0, msizes, n0, nsizes):
+        """One M block x one N super-tile (sub-tiles `nsizes`, each <= 512)
+        of C, accumulated over K in PSUM. Each B load covers the whole
+        super-tile (wide DMAs), and each B sub-tile is used by every M tile's
+        stationary A^T."""
+        K = b.shape[0]
+        NKF = K // 128
+        KR = K - NKF * 128
+        TM = len(msizes)
+        W = sum(nsizes)
+        noff = [sum(nsizes[:j]) for j in range(len(nsizes))]
+        ps = [
+            [nl.zeros((ms, ns), dtype=nl.float32, buffer=nl.psum) for ns in nsizes] for ms in msizes
+        ]
+        for kt in nl.affine_range(NKF):
+            b_t = nl.load(b[kt * 128 : (kt + 1) * 128, n0 : n0 + W])
+            for mt in range(TM):
+                col = (kt * TM + mt) * 128
+                for j in range(len(nsizes)):
+                    nisa.nc_matmul(
+                        dst=ps[mt][j],
+                        stationary=aT[0:128, col : col + msizes[mt]],
+                        moving=b_t[0:128, noff[j] : noff[j] + nsizes[j]],
+                        accumulate=True,
+                    )
+        if KR > 0:
+            b_r = nl.load(b[K - KR : K, n0 : n0 + W])
+            for mt in range(TM):
+                for j in range(len(nsizes)):
+                    nisa.nc_matmul(
+                        dst=ps[mt][j],
+                        stationary=aTr[0:KR, mt * 128 : mt * 128 + msizes[mt]],
+                        moving=b_r[0:KR, noff[j] : noff[j] + nsizes[j]],
+                        accumulate=True,
+                    )
+        for mt in range(TM):
+            c_sb = nl.ndarray((msizes[mt], W), dtype=c.dtype, buffer=nl.sbuf)
+            for j in range(len(nsizes)):
+                nisa.tensor_copy(
+                    src=ps[mt][j], dst=c_sb[0 : msizes[mt], noff[j] : noff[j] + nsizes[j]]
+                )
+            r = m0 + mt * 128
+            nl.store(c[r : r + msizes[mt], n0 : n0 + W], value=c_sb)
+
+    def _lnc_load_at(at, m0, msizes):
+        """SBUF A^T block for rows [m0, m0 + sum(msizes)) from `at` (K, M):
+        plain DMAs with K on the partition axis. Column (kt * TM + mt) * 128
+        holds M tile mt of K tile kt."""
+        K = at.shape[0]
+        TM = len(msizes)
+        MS = sum(msizes)
+        NKF = K // 128
+        KR = K - NKF * 128
+        aT = nl.ndarray((128, max(NKF, 1) * TM * 128), dtype=at.dtype, buffer=nl.sbuf)
+        aTr = nl.ndarray((max(KR, 1), TM * 128), dtype=at.dtype, buffer=nl.sbuf)
+        for kt in nl.affine_range(NKF):
+            aT[0:128, kt * TM * 128 : kt * TM * 128 + MS] = nl.load(
+                at[kt * 128 : (kt + 1) * 128, m0 : m0 + MS]
+            )
+        if KR > 0:
+            aTr[0:KR, 0:MS] = nl.load(at[K - KR : K, m0 : m0 + MS])
+        return aT, aTr
+
+    def _lnc_block_n(aT, aTr, b, c, m0, msizes, n0, NP):
+        """Every N super-tile of one M block (`_lnc_nplan`)."""
+        W, NF, full, tail = _lnc_nplan(NP, len(msizes))
+        for nt in nl.affine_range(NF):
+            _lnc_ntile(aT, aTr, b, c, m0, msizes, n0 + nt * W, full)
+        if tail:
+            _lnc_ntile(aT, aTr, b, c, m0, msizes, n0 + NF * W, tail)
+
+    def _lnc_region_t(at, b, c, r0, MP, c0, NP):
+        """Rows [r0, r0 + MP) x columns [c0, c0 + NP) of C from A^T in HBM,
+        one M block at a time. Each block's A^T gets its own SBUF buffer, so
+        the next block's load overlaps this block's matmuls. (Issuing it
+        explicitly before them measured 1-3% slower: it queues ahead of the
+        current block's B tiles.)"""
+        K = at.shape[0]
+        TM = _lnc_tm(K, 4 if at.dtype == nl.float32 else 2)
+        for m_off, msizes in _lnc_blocks_of(MP, TM):
+            aT, aTr = _lnc_load_at(at, r0 + m_off, msizes)
+            _lnc_block_n(aT, aTr, b, c, r0 + m_off, msizes, c0, NP)
+
+    def _lnc_load_rows(a, m0, msizes):
+        """Plain DMAs of A's rows for one M block: per M tile, [ms, <= KC]
+        chunks along K with KC = 16 KiB per partition (a single 32 KiB row
+        tile, K = 8192 fp32, ran the kernel 2.3x slower)."""
+        K = a.shape[1]
+        KC = 4096 if a.dtype == nl.float32 else 8192
+        return [
+            [
+                nl.load(a[m0 + mt * 128 : m0 + mt * 128 + msizes[mt], k0 : k0 + kw])
+                for k0, kw in zip(range(0, K, KC), _lnc_sizes(K, KC), strict=True)
+            ]
+            for mt in range(len(msizes))
+        ]
+
+    def _lnc_rows_to_at(a, rows, msizes):
+        """SBUF A^T block (layout of `_lnc_load_at`) from staged rows, by
+        Tensor Engine transposes, K-tile-major within each K chunk."""
+        K = a.shape[1]
+        KC = 4096 if a.dtype == nl.float32 else 8192
+        TM = len(msizes)
+        NKF = K // 128
+        KR = K - NKF * 128
+        aT = nl.ndarray((128, max(NKF, 1) * TM * 128), dtype=a.dtype, buffer=nl.sbuf)
+        aTr = nl.ndarray((max(KR, 1), TM * 128), dtype=a.dtype, buffer=nl.sbuf)
+        for ci, kw in enumerate(_lnc_sizes(K, KC)):
+            kt0 = ci * (KC // 128)
+            for j in nl.affine_range(kw // 128):
+                for mt in range(TM):
+                    ms = msizes[mt]
+                    pt = nl.ndarray((128, ms), dtype=a.dtype, buffer=nl.psum)
+                    nisa.nc_transpose(dst=pt, data=rows[mt][ci][0:ms, j * 128 : (j + 1) * 128])
+                    col = ((kt0 + j) * TM + mt) * 128
+                    nisa.tensor_copy(src=pt, dst=aT[0:128, col : col + ms])
+        if KR > 0:
+            last = len(rows[0]) - 1
+            kw = K - last * KC
+            for mt in range(TM):
+                ms = msizes[mt]
+                pr = nl.ndarray((KR, ms), dtype=a.dtype, buffer=nl.psum)
+                nisa.nc_transpose(dst=pr, data=rows[mt][last][0:ms, kw - KR : kw])
+                nisa.tensor_copy(src=pr, dst=aTr[0:KR, mt * 128 : mt * 128 + ms])
+        return aT, aTr
+
+    def _lnc_region_f(a, b, c, r0, MP, c0, NP):
+        """As `_lnc_region_t` from row-major A, with no HBM scratch: block
+        i+1's rows are staged by DMA while block i computes, then transposed
+        on the Tensor Engine into the block's SBUF A^T."""
+        K = a.shape[1]
+        TM = _lnc_tm(K, 4 if a.dtype == nl.float32 else 2)
+        blocks = _lnc_blocks_of(MP, TM)
+        rows = _lnc_load_rows(a, r0 + blocks[0][0], blocks[0][1])
+        for i in range(len(blocks)):
+            aT, aTr = _lnc_rows_to_at(a, rows, blocks[i][1])
+            if i + 1 < len(blocks):
+                rows = _lnc_load_rows(a, r0 + blocks[i + 1][0], blocks[i + 1][1])
+            _lnc_block_n(aT, aTr, b, c, r0 + blocks[i][0], blocks[i][1], c0, NP)
+
+    @nki.jit
+    def _gemm_lnc_kernel(a, b):
+        """C = A @ B on the native path (Trn2), split over the logical core (#79).
+
+        Launched gridless: at LNC=2 NKI traces it once per physical core
+        (`num_programs() == 2`), at LNC=1 once. Each program takes a
+        contiguous half of the rows of C (of the columns when M < 256).
+        A's rows are loaded with plain `nl.load` (no DMA transposes,
+        aws-neuron-sdk#1452) and transposed on the Tensor Engine into an
+        SBUF-resident A^T block per M block; then the tiling is that of
+        `_gemm_lnc_tn_kernel`.
+        Any M, K, N >= 1; fp32/bf16/fp16 in, same dtype out, FP32 PSUM.
+        """
+        M, K = a.shape
+        _, N = b.shape
+        c = nl.ndarray((M, N), dtype=a.dtype, buffer=nl.shared_hbm)
+        n_prog = nl.num_programs() if nl.program_ndim() > 0 else 1
+        split, MP, NPP = _lnc_split(M, N, n_prog)
+        r0 = nl.program_id(0) * (M - MP) if split == "m" else 0
+        c0 = nl.program_id(0) * (N - NPP) if split == "n" else 0
+        _lnc_region_f(a, b, c, r0, MP, c0, NPP)
+        return c
+
+    @nki.jit
+    def _gemm_lnc_tn_kernel(at, b):
+        """C = A @ B from A^T: `at` is (K, M) row-major (A is a transposed
+        view). Same split and tiling as `_gemm_lnc_kernel`, with no
+        transposes: each program's A^T blocks are plain DMAs with K on the
+        partition axis, held in SBUF while every N tile of B streams past."""
+        K, M = at.shape
+        _, N = b.shape
+        c = nl.ndarray((M, N), dtype=at.dtype, buffer=nl.shared_hbm)
+        n_prog = nl.num_programs() if nl.program_ndim() > 0 else 1
+        split, MP, NPP = _lnc_split(M, N, n_prog)
+        r0 = nl.program_id(0) * (M - MP) if split == "m" else 0
+        c0 = nl.program_id(0) * (N - NPP) if split == "n" else 0
+        _lnc_region_t(at, b, c, r0, MP, c0, NPP)
+        return c
 
     @nki.jit
     def _mp2_energy_kernel(T_flat, eps_occ_chunk, eps_occ_full, eps_vir_col, eps_vir_row):
