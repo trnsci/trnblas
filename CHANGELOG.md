@@ -17,6 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Affects 0.3.0 through 0.9.1. The loop now runs over the broadcast batch
   index on expanded views, with no copies. Found by the conformance suite on
   Trn2 (trnsci/trnsci#35).
+- **`metric_inv_half` with an integer `J` on the `neuron` device returned a
+  truncated integer factor** (silent, #86). The native host route computes
+  L^-T in float64 and cast it back to `J.dtype`, which turned most entries
+  into 0. The torch route raises for integer input. Every route now raises
+  `NotImplementedError`. Affects 0.8.0 through 0.9.1. Found by the round-3
+  device harness on Trn2 (trnsci/trnsci#35).
 
 ### Added
 
