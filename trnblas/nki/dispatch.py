@@ -8,10 +8,12 @@ tile reuse on the Tensor Engine for 2x fewer SBUF loads vs naive.
 
 from __future__ import annotations
 
+import functools
 import importlib.util
 import json
 import math
 import os
+import threading
 import warnings
 from pathlib import Path
 from typing import Any
@@ -351,6 +353,144 @@ def _as_result_dtype(out, dtype: torch.dtype):
     return out
 
 
+# ── float64 on the neuron device (trnblas#89 amendment) ─────────────────────
+#
+# On Trainium, device aten computes float64 at fp32 precision (measured on
+# Trn2), so "torch at float64 accuracy" under `auto` cannot mean device aten
+# for float64 data already on the `neuron` device. `_fp64_host_guard` wraps
+# every public op: under `auto`, a float64 / complex128 operand on the neuron
+# device sends the call to the host (operands copied down, host torch at
+# float64) and the result comes back to the original device in float64, with
+# one UserWarning per op. TRNBLAS_FP64_ON_DEVICE=1 keeps device aten (fp32
+# precision) for callers who prefer speed. Host-resident float64 is unchanged
+# (host torch). TRNBLAS_REQUIRE_NKI=1 still raises for float64 (no host copy).
+_FP64_ON_DEVICE = os.environ.get("TRNBLAS_FP64_ON_DEVICE", "").lower() in ("1", "true", "yes")
+_FP64_DTYPES = frozenset({torch.float64, torch.complex128})
+_fp64_host_warned: set[str] = set()
+_fp64_host_state = threading.local()
+
+
+def _is_neuron(t: torch.Tensor) -> bool:
+    """True for a tensor on the `neuron` device."""
+    return t.device.type == "neuron"
+
+
+def _fp64_device_resident(t) -> bool:
+    """True for a float64 / complex128 tensor on the `neuron` device."""
+    return isinstance(t, torch.Tensor) and t.dtype in _FP64_DTYPES and _is_neuron(t)
+
+
+def _fp64_to_host(t: torch.Tensor) -> torch.Tensor:
+    """Host copy of a device-resident operand (keeps dtype and autograd)."""
+    return t.to("cpu")
+
+
+def _fp64_from_host(t: torch.Tensor, device) -> torch.Tensor:
+    """Host result back on the operands' device (keeps dtype and autograd)."""
+    return t.to(device)
+
+
+def _map_tensors(obj, fn):
+    """`obj` with `fn` applied to every tensor inside tuples / lists / dicts."""
+    if isinstance(obj, torch.Tensor):
+        return fn(obj)
+    if isinstance(obj, tuple) and hasattr(obj, "_fields"):  # namedtuple
+        return type(obj)(*(_map_tensors(o, fn) for o in obj))
+    if isinstance(obj, (tuple, list)):
+        return type(obj)(_map_tensors(o, fn) for o in obj)
+    if isinstance(obj, dict):
+        return {k: _map_tensors(v, fn) for k, v in obj.items()}
+    return obj
+
+
+def _any_tensor(obj, pred) -> bool:
+    if isinstance(obj, torch.Tensor):
+        return pred(obj)
+    if isinstance(obj, (tuple, list)):
+        return any(_any_tensor(o, pred) for o in obj)
+    if isinstance(obj, dict):
+        return any(_any_tensor(v, pred) for v in obj.values())
+    return False
+
+
+def _first_tensor(obj, pred):
+    if isinstance(obj, torch.Tensor):
+        return obj if pred(obj) else None
+    items = obj.values() if isinstance(obj, dict) else obj if isinstance(obj, (tuple, list)) else ()
+    for o in items:
+        t = _first_tensor(o, pred)
+        if t is not None:
+            return t
+    return None
+
+
+def _warn_fp64_host(op: str) -> None:
+    """One UserWarning per op: device-resident float64 computed on the host."""
+    if op in _fp64_host_warned:
+        return
+    _fp64_host_warned.add(op)
+    warnings.warn(
+        f"trnblas {op}: float64 on the neuron device is computed on the host for "
+        "float64 accuracy (device arithmetic is fp32); pass float32 to stay on "
+        "device, or set TRNBLAS_FP64_ON_DEVICE=1 to keep device aten at fp32 precision.",
+        UserWarning,
+        stacklevel=3,
+    )
+
+
+def _fp64_host_guard(op: str):
+    """Decorator for a public op: device-resident float64 runs on the host.
+
+    Applies under `set_backend("auto")` when some tensor argument is float64
+    or complex128 on the `neuron` device, unless TRNBLAS_FP64_ON_DEVICE=1 or
+    TRNBLAS_REQUIRE_NKI=1. Neuron-resident operands are copied to the host,
+    the op runs there (host float64 takes host torch), and tensor results
+    are moved back to the device of the first such operand, in their dtype.
+    Nested guarded calls inside the host call do nothing.
+    """
+
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            if (
+                _backend != "auto"
+                or _FP64_ON_DEVICE
+                or _REQUIRE_NKI
+                or getattr(_fp64_host_state, "active", False)
+                or not _any_tensor((args, kwargs), _fp64_device_resident)
+            ):
+                return fn(*args, **kwargs)
+            _warn_fp64_host(op)
+            device = _first_tensor((args, kwargs), _fp64_device_resident).device
+
+            def down(t):
+                return _fp64_to_host(t) if _is_neuron(t) else t
+
+            h_args, h_kwargs = _map_tensors((args, kwargs), down)
+            _fp64_host_state.active = True
+            try:
+                out = fn(*h_args, **h_kwargs)
+            finally:
+                _fp64_host_state.active = False
+            return _map_tensors(out, lambda t: _fp64_from_host(t, device))
+
+        return wrapper
+
+    return deco
+
+
+def _fp64_stays_on_host(*tensors: torch.Tensor) -> bool:
+    """True when host-resident float64 / complex128 must not be uploaded to
+    device aten (which computes it at fp32 precision): `auto`, all operands
+    on the host, one of them float64 / complex128, no TRNBLAS_FP64_ON_DEVICE."""
+    return (
+        _backend == "auto"
+        and not _FP64_ON_DEVICE
+        and _on_host(*tensors)
+        and any(t.dtype in _FP64_DTYPES for t in tensors)
+    )
+
+
 def _gemm_route(
     *tensors: torch.Tensor, op: str = "gemm", macs: float | None = None, nbytes: int | None = None
 ) -> str:
@@ -376,6 +516,8 @@ def _gemm_route(
     if policy == "nki" and not _kernel_dtypes_ok(*tensors):
         _no_kernel_for_dtype(op, *tensors)
         return "torch"
+    if policy in ("lnc", "aten") and _fp64_stays_on_host(*tensors):
+        return "host"  # device aten computes float64 at fp32 precision
     if policy == "lnc":
         # Forces the LNC-split GEMM (#79) for plain 2-D device-resident GEMMs;
         # everything else takes aten, as under `aten`.
@@ -647,6 +789,7 @@ def _use_nki() -> bool:
     return HAS_NKI
 
 
+@_fp64_host_guard("nki_batched_gemm")
 def nki_batched_gemm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     """Batched GEMM with torch.matmul batch semantics: A (..., M, K) and
     B (..., K, N) broadcast their batch dims → C (*batch, M, N).
@@ -718,6 +861,7 @@ def _torch_mp2_energy(
     return (T * (2.0 * T - T.transpose(-2, -1)) / denom).sum()
 
 
+@_fp64_host_guard("nki_mp2_energy")
 def nki_mp2_energy(
     T_flat: torch.Tensor,
     eps_occ_chunk: torch.Tensor,
@@ -787,6 +931,7 @@ def _nki_mp2_energy_impl(
     return partial.sum()
 
 
+@_fp64_host_guard("nki_gemm")
 def nki_gemm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     """GEMM with NKI dispatch.
 
@@ -814,6 +959,7 @@ def nki_gemm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     return torch.matmul(A, B)
 
 
+@_fp64_host_guard("nki_syrk")
 def nki_syrk(A: torch.Tensor, symmetrize: bool = False) -> torch.Tensor:
     """SYRK via single-operand NKI matmul. Returns A @ A.T.
 
@@ -847,6 +993,7 @@ def nki_syrk(A: torch.Tensor, symmetrize: bool = False) -> torch.Tensor:
     return _symmetrize(r) if symmetrize else r
 
 
+@_fp64_host_guard("nki_trsm")
 def nki_trsm(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -921,7 +1068,7 @@ def _trsm_route(A: torch.Tensor, B: torch.Tensor) -> str:
         route = "nki"
     else:
         route = _native_gemm_policy()
-        if route not in ("nki", "aten"):
+        if route not in ("nki", "aten") or (route == "aten" and _fp64_stays_on_host(A, B)):
             return "host" if _on_host(A, B) else "aten"
     if route == "nki" and not _kernel_dtypes_ok(A, B):
         # The NKI GEMM updates are FP32-only (#68): solve with torch instead,
@@ -1118,6 +1265,7 @@ def _device_inv_chol_factor(J: torch.Tensor) -> torch.Tensor:
     return nki_trsm(L, eye, uplo="lower", trans=True)
 
 
+@_fp64_host_guard("nki_metric_inv_half")
 def nki_metric_inv_half(J: torch.Tensor) -> torch.Tensor:
     """Cholesky inverse factor X = L^-T of an SPD metric J = L L^T.
 
@@ -1757,6 +1905,7 @@ def _torch_batched_pair_energy(
     return e
 
 
+@_fp64_host_guard("nki_batched_pair_energy")
 def nki_batched_pair_energy(
     B: torch.Tensor,
     eps_occ: torch.Tensor,
@@ -2268,6 +2417,7 @@ def _torch_fused_pair_energy(
     return (T * (2.0 * T - T.T) / denom).sum()
 
 
+@_fp64_host_guard("nki_fused_gemm_energy")
 def nki_fused_gemm_energy(
     b_i: torch.Tensor,
     b_j: torch.Tensor,

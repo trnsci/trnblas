@@ -754,3 +754,227 @@ def test_gemm_result_dtype_matches_pytorch(stubs, name, d, backend):
         return
     got = _run(fn, args, backend)
     assert got.dtype == ref.dtype == d
+
+
+# ── float64 on the neuron device (trnblas#89 amendment) ──────────────────────
+#
+# Device aten computes float64 at fp32 precision on Trainium, so under `auto`
+# a float64 / complex128 operand on the neuron device is copied to the host,
+# computed there in host torch at float64, and returned on its device in
+# float64, with one UserWarning per op. TRNBLAS_FP64_ON_DEVICE=1 keeps device
+# aten. The neuron device is faked on CPU: `dispatch._is_neuron` reports the
+# tensors the test marks, and the host / return transfers are spies.
+
+HOST_MSG = "float64 on the neuron device is computed on the host for float64 accuracy"
+
+# Every public op (trnblas.* and trnblas.nki.*): name -> (callable, builder).
+DEV_APIS = {n: (fn, build) for n, (fn, build, _) in APIS.items()}
+DEV_APIS.update(
+    {
+        "axpy": (
+            lambda x, y: trnblas.axpy(-1.5, x, y),
+            lambda d, e: (_rand((9,), d), _rand((9,), d, 1)),
+        ),
+        "dot": (trnblas.dot, lambda d, e: (_rand((9,), d), _rand((9,), d, 1))),
+        "nrm2": (trnblas.nrm2, lambda d, e: (_rand((9,), d),)),
+        "scal": (lambda x: trnblas.scal(0.25, x), lambda d, e: (_rand((9,), d),)),
+        "asum": (trnblas.asum, lambda d, e: (_rand((9,), d),)),
+        "iamax": (trnblas.iamax, lambda d, e: (_rand((9,), d),)),
+        "gemv": (
+            lambda A, x, y: trnblas.gemv(1.5, A, x, beta=0.5, y=y),
+            lambda d, e: (_rand((6, 4), d), _rand((4,), d, 1), _rand((6,), d, 2)),
+        ),
+        "symv": (
+            lambda A, x: trnblas.symv(1.5, A, x),
+            lambda d, e: (_rand((5, 5), d), _rand((5,), d, 1)),
+        ),
+        "trmv": (trnblas.trmv, lambda d, e: (_tri(5, d), _rand((5,), d, 1))),
+        "ger": (
+            lambda x, y, A: trnblas.ger(2.0, x, y, A),
+            lambda d, e: (_rand((6,), d), _rand((4,), d, 1), _rand((6, 4), d, 2)),
+        ),
+        "trmm": (
+            lambda A, B: trnblas.trmm(1.5, A, B),
+            lambda d, e: (_tri(6, d), _rand((6, 4), d, 1)),
+        ),
+        "syrk_C": (
+            lambda A, C: trnblas.syrk(1.5, A, beta=0.5, C=C),
+            lambda d, e: (_rand((6, 4), d), _spd(6, d)),
+        ),
+    }
+)
+# The trnblas.* entry point whose warning each case carries.
+DEV_OP = {n: n.removesuffix("_transA").removesuffix("_trans").removesuffix("_C") for n in DEV_APIS}
+_NO_C128 = set(ENERGY_APIS) | {"metric_inv_half", "nki_metric_inv_half", "iamax"}
+DEV_CASES = [(n, F64, F32) for n in DEV_APIS]
+DEV_CASES += [(n, F32, F64) for n in ENERGY_APIS]
+DEV_CASES += [(n, torch.complex128, F32) for n in DEV_APIS if n not in _NO_C128]
+
+
+class FakeNeuron:
+    """Marks CPU tensors as neuron-resident and records the host transfers."""
+
+    def __init__(self):
+        self.keep: list[torch.Tensor] = []  # keeps ids unique while marked
+        self.ids: set[int] = set()
+        self.down: list[torch.Tensor] = []
+        self.up: list[torch.device] = []
+
+    def mark(self, t):
+        if isinstance(t, torch.Tensor):
+            self.keep.append(t)
+            self.ids.add(id(t))
+        return t
+
+    def is_neuron(self, t):
+        return id(t) in self.ids
+
+    def to_host(self, t):
+        self.down.append(t)
+        return t.clone()  # a distinct, unmarked (host) tensor
+
+    def from_host(self, t, device):
+        self.up.append(torch.device(device))
+        return self.mark(t.clone())
+
+
+@pytest.fixture
+def fake_neuron(stubs, monkeypatch):
+    f = FakeNeuron()
+    monkeypatch.setattr(dispatch, "_is_neuron", f.is_neuron)
+    monkeypatch.setattr(dispatch, "_fp64_to_host", f.to_host)
+    monkeypatch.setattr(dispatch, "_fp64_from_host", f.from_host)
+    monkeypatch.setattr(dispatch, "_fp64_host_warned", set())
+    monkeypatch.setattr(dispatch, "_fp32_cast_warned", set())
+    monkeypatch.setattr(dispatch, "_FP64_ON_DEVICE", False)
+
+    def no_upload(*a, **k):
+        raise AssertionError("float64 under auto must not be uploaded to device aten")
+
+    monkeypatch.setattr(dispatch, "_upload", no_upload)
+    f.stubs = stubs
+    return f
+
+
+def _host_warnings(record):
+    return [w for w in record if HOST_MSG in str(w.message)]
+
+
+def _dev_case(name, d, e):
+    fn, build = DEV_APIS[name]
+    args = build(d, e)
+    ref, exc = _pytorch(fn, args)
+    if exc is not None:
+        pytest.skip(f"the pytorch backend refuses {name} {d}: {exc}")
+    return fn, args, ref
+
+
+@pytest.mark.parametrize("name,d,e", DEV_CASES, ids=[_id(c) for c in DEV_CASES])
+def test_auto_device_float64_computes_on_host(fake_neuron, name, d, e):
+    fn, args, ref = _dev_case(name, d, e)
+    dev_args = [fake_neuron.mark(a) for a in args]
+    dispatch.set_backend("auto")
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        outs = [fn(*dev_args) for _ in range(3)]
+    assert not fake_neuron.stubs.calls, fake_neuron.stubs.calls  # no kernel
+    # Host path: every neuron-resident operand came down on every call.
+    assert len(fake_neuron.down) == 3 * len(dev_args)
+    msgs = _host_warnings(rec)
+    assert len(msgs) == 1, [str(w.message) for w in msgs]  # once per op
+    assert msgs[0].category is UserWarning
+    assert f"trnblas {DEV_OP[name]}:" in str(msgs[0].message)
+    for got in outs:
+        if not isinstance(ref, torch.Tensor):  # iamax: a Python int
+            assert got == ref
+            continue
+        assert fake_neuron.is_neuron(got)  # back on the device ...
+        assert fake_neuron.up[-1] == args[0].device  # ... the operands came from
+        assert got.dtype == ref.dtype and got.dtype in (F64, torch.complex128)
+        # float64 accuracy against the float64 CPU reference.
+        torch.testing.assert_close(got, ref, rtol=1e-12, atol=1e-12)
+
+
+@pytest.mark.parametrize("name", ["gemm", "nki_batched_pair_energy", "trsm", "dot"])
+def test_fp64_on_device_override_keeps_device_path(fake_neuron, monkeypatch, name):
+    monkeypatch.setattr(dispatch, "_FP64_ON_DEVICE", True)
+    monkeypatch.setattr(dispatch, "_on_neuron_device", lambda *t: True)  # device routes
+    fn, args, ref = _dev_case(name, F64, F32)
+    dev_args = [fake_neuron.mark(a) for a in args]
+    dispatch.set_backend("auto")
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        got = fn(*dev_args)
+    assert not fake_neuron.down and not fake_neuron.up  # no host copy
+    assert not _host_warnings(rec)
+    assert not fake_neuron.stubs.calls  # device aten, not a kernel
+    assert got.dtype == ref.dtype == F64
+
+
+@pytest.mark.parametrize("backend", ["nki", "pytorch"])
+@pytest.mark.parametrize("name", ["gemm", "symm", "nki_mp2_energy", "axpy"])
+def test_device_float64_host_path_is_auto_only(fake_neuron, backend, name):
+    fn, args, ref = _dev_case(name, F64, F32)
+    dev_args = [fake_neuron.mark(a) for a in args]
+    dispatch.set_backend(backend)
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        got = fn(*dev_args)
+    assert not fake_neuron.down and not fake_neuron.up
+    assert not _host_warnings(rec)
+    assert got.dtype == ref.dtype
+
+
+@pytest.mark.parametrize("name", ["gemm", "trsm", "nki_mp2_energy", "nki_batched_pair_energy"])
+def test_require_nki_device_float64_skips_host_path(fake_neuron, monkeypatch, name):
+    """TRNBLAS_REQUIRE_NKI=1 keeps refusing float64: no host copy, no warning."""
+    monkeypatch.setattr(dispatch, "_REQUIRE_NKI", True)
+    fn, args, _ = _dev_case(name, F64, F32)
+    dev_args = [fake_neuron.mark(a) for a in args]
+    dispatch.set_backend("auto")
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        if name in ENERGY_APIS:
+            with pytest.raises(NotImplementedError):
+                fn(*dev_args)
+        else:
+            fn(*dev_args)  # native `auto` GEMM family: torch, nothing to refuse
+    assert not fake_neuron.down and not _host_warnings(rec)
+
+
+@pytest.mark.parametrize("name", ["gemm", "symm", "nki_mp2_energy", "metric_inv_half"])
+def test_host_float64_unchanged(fake_neuron, name):
+    fn, args, ref = _dev_case(name, F64, F32)  # host-resident: not marked
+    dispatch.set_backend("auto")
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        got = fn(*args)
+    assert not fake_neuron.down and not fake_neuron.up and not _host_warnings(rec)
+    torch.testing.assert_close(got, ref, rtol=1e-12, atol=1e-12)
+
+
+def test_device_float32_stays_on_device(fake_neuron):
+    fn, args, _ = _dev_case("gemm", F32, F32)
+    dispatch.set_backend("auto")
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        fn(*[fake_neuron.mark(a) for a in args])
+    assert not fake_neuron.down and not _host_warnings(rec)
+
+
+@pytest.mark.parametrize("policy", ["aten", "lnc"])
+@pytest.mark.parametrize("name", ["gemm", "batched_gemm", "syrk", "symm", "trsm", "nki_gemm"])
+def test_forced_aten_policy_keeps_host_float64_on_host(fake_neuron, monkeypatch, policy, name):
+    """TRNBLAS_NATIVE_GEMM=aten|lnc no longer uploads host float64 to device
+    aten (fp32 precision); TRNBLAS_FP64_ON_DEVICE=1 restores the upload."""
+    monkeypatch.setenv("TRNBLAS_NATIVE_GEMM", policy)
+    fn, args, ref = _dev_case(name, F64, F32)
+    dispatch.set_backend("auto")
+    got = _run(fn, args, "auto")  # `_upload` raises if reached
+    torch.testing.assert_close(got, ref, rtol=1e-12, atol=1e-12)
+    uploads = []
+    monkeypatch.setattr(dispatch, "_upload", lambda t: uploads.append(t) or t)
+    monkeypatch.setattr(dispatch, "_FP64_ON_DEVICE", True)
+    _run(fn, args, "auto")
+    # trsm takes no `lnc` policy: host operands solve on the host either way.
+    assert uploads or (name, policy) == ("trsm", "lnc")

@@ -15,8 +15,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   kernel gives float64 accuracy; the four rules, the same in every trnsci
   library, are:
   - `set_backend("auto")`: float64 operands (amplitudes, `B`, or orbital
-    energies) run in torch, on the host or as aten on the device, whichever
-    the op already uses for its non-kernel route. For the DF-MP2 energy
+    energies) run in host torch at float64 accuracy. Device aten computes
+    float64 at fp32 precision on Trainium (measured on Trn2), so float64 or
+    complex128 operands already on the `neuron` device are copied to the
+    host, computed there, and returned on the device in float64, with one
+    `UserWarning` per op ("float64 on the neuron device is computed on the
+    host for float64 accuracy (device arithmetic is fp32); pass float32 to
+    stay on device"). This covers every public op, Level 1-3 and
+    `trnblas.nki.*`, through one guard (`_fp64_host_guard`).
+    `TRNBLAS_FP64_ON_DEVICE=1` keeps device aten (fp32 precision) for callers
+    who prefer speed. Host-resident float64 stays in host torch, and a forced
+    `TRNBLAS_NATIVE_GEMM=aten|lnc` no longer uploads it to device aten
+    unless `TRNBLAS_FP64_ON_DEVICE=1`. For the DF-MP2 energy
     APIs this replaces the fp32 rounding of float64 orbital energies on the
     `pair_energy_sym` and multi-core routes (through 0.10.0); pass float32
     `eps` to keep those calls on the kernel.
