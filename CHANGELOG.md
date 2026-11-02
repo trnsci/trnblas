@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- **Eager NKI kernel calls skip the per-call handle rebuild and the custom-op
+  layer (trnblas#88).** On the native path, a `trnblas::` custom-op call cost
+  about 0.11 ms of host time before the kernel was queued, against 0.016 ms
+  for aten. Most of that went to nki's `Kernel.__call__`, which rebuilds the
+  torch handle on every call, plus the `torch.library` layer. `_call_kernel`
+  now calls a `torch_neuronx.wrap_nki` handle built once per kernel. On trn2
+  that is 0.027 ms per GEMM call. A 128x128x512 kernel GEMM plus synchronize
+  drops from 0.188 to 0.118 ms, `trnblas.gemm` from 0.221 to 0.136 ms, and
+  `syrk` 256x128 from 0.187 to 0.114 ms. `torch.compile`, requires-grad,
+  int64 and tensor-subclass inputs keep the custom op.
+  `TRNBLAS_NKI_EAGER_HANDLE=0` turns this off. `scripts/bench_native_dispatch.py
+  call` measures it.
+
 ### Fixed
 
 - **`batched_gemm` on the NKI route follows torch.matmul batch broadcasting (#84).**
