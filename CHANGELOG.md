@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-11-02
+
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
+
+Headline: **correctness fixes — upgrade recommended.** In 0.2.0–0.9.1, `gemm` with transA/transB on batched operands reversed every dimension (#72) and BLAS letter flags (`uplo="U"`, `diag="U"`, `trans="N"`) ran the opposite branch (#73); on the NKI route `batched_gemm` ignored batch broadcasting and integer `metric_inv_half` returned zeros (#84, #86). New: LNC=2 GEMM kernels that beat aten on the DF-MP2 half-transform (#88), and cached `wrap_nki` handles that cut eager NKI dispatch from ~0.11 to ~0.03 ms (#92, aws-neuron-sdk#1456).
+
 ### Performance
 
 - **Eager NKI kernel calls skip the per-call handle rebuild and the custom-op
@@ -38,6 +44,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   into 0. The torch route raises for integer input. Every route now raises
   `NotImplementedError`. Affects 0.8.0 through 0.9.1. Found by the round-3
   device harness on Trn2 (trnsci/trnsci#35).
+
+
+- **BLAS flag spellings silently ran the opposite operation** (silent). Each
+  wrapper compared `uplo` / `side` / `diag` against one word and took the other
+  branch for anything else, and `trans*` used truthiness: `uplo="U"` ran the
+  lower triangle, `diag="U"` a non-unit diagonal, `trans="N"` the transpose
+  (rel. err 0.04–2.4 in `symv`, `symm`, `trmv`, `trmm`, `trsm`, `syrk`, `gemv`,
+  `gemm`, `batched_gemm`). The documented words and the BLAS letters are now
+  accepted case-insensitively and anything else raises `ValueError`. Every
+  spelling that was correct before gives the same result. Affects every
+  release, 0.2.0–0.9.1, on every backend (#73). The API docs listed a
+  non-existent `unit=` keyword for `trmv` / `trmm`; it is `diag=`.
+- **`gemm(..., transA=True)` / `transB=True` on batched (>= 3-D) operands
+  reversed every dimension** (silent). `op(X)` was built with `X.T`, which on a
+  non-2-D tensor turns `(b, m, k)` into `(k, m, b)`; `torch.matmul` then
+  multiplied the reversed tensor whenever the shapes broadcast (square
+  batches), and raised otherwise. `op()` now transposes the last two
+  dimensions, as `batched_gemm` does. Affects every release, 0.2.0–0.9.1, on
+  every backend; 2-D calls are unchanged (#72).
 
 ### Added
 
@@ -79,25 +104,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `NKI_TRACE_CACHE_URL` directory per session (no stale editable-install
   traces). `NKI_ENABLE_TRACE_CACHE=0` still turns it off.
 - README: known platform issue note for #1454.
-### Fixed
-
-- **BLAS flag spellings silently ran the opposite operation** (silent). Each
-  wrapper compared `uplo` / `side` / `diag` against one word and took the other
-  branch for anything else, and `trans*` used truthiness: `uplo="U"` ran the
-  lower triangle, `diag="U"` a non-unit diagonal, `trans="N"` the transpose
-  (rel. err 0.04–2.4 in `symv`, `symm`, `trmv`, `trmm`, `trsm`, `syrk`, `gemv`,
-  `gemm`, `batched_gemm`). The documented words and the BLAS letters are now
-  accepted case-insensitively and anything else raises `ValueError`. Every
-  spelling that was correct before gives the same result. Affects every
-  release, 0.2.0–0.9.1, on every backend (#73). The API docs listed a
-  non-existent `unit=` keyword for `trmv` / `trmm`; it is `diag=`.
-- **`gemm(..., transA=True)` / `transB=True` on batched (>= 3-D) operands
-  reversed every dimension** (silent). `op(X)` was built with `X.T`, which on a
-  non-2-D tensor turns `(b, m, k)` into `(k, m, b)`; `torch.matmul` then
-  multiplied the reversed tensor whenever the shapes broadcast (square
-  batches), and raised otherwise. `op()` now transposes the last two
-  dimensions, as `batched_gemm` does. Affects every release, 0.2.0–0.9.1, on
-  every backend; 2-D calls are unchanged (#72).
 
 ## [0.9.1] — 2026-11-01
 
