@@ -56,8 +56,20 @@ class TestAsum:
         x = torch.tensor([-1.0, 2.0, -3.0])
         assert trnblas.asum(x).item() == pytest.approx(6.0)
 
+    def test_complex_is_blas_scasum(self):
+        # |Re| + |Im|, not the modulus (#75): 7 + 3 + 1 = 11, modulus sum ~8.0
+        x = torch.tensor([3 + 4j, -1 + 2j, 0.5 - 0.5j], dtype=torch.complex64)
+        out = trnblas.asum(x)
+        assert out.dtype == torch.float32
+        assert out.item() == pytest.approx(11.0)
+
 
 class TestIamax:
     def test_basic(self):
         x = torch.tensor([1.0, -5.0, 3.0, -2.0])
+        assert trnblas.iamax(x) == 1
+
+    def test_complex_is_blas_icamax(self):
+        # modulus would pick 0 (3 > 2.83); |Re| + |Im| picks 1 (4 > 3) (#75)
+        x = torch.tensor([3 + 0j, 2 + 2j], dtype=torch.complex128)
         assert trnblas.iamax(x) == 1
