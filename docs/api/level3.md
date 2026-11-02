@@ -36,6 +36,13 @@ a small post-kernel `0.5·(C + Cᵀ)` symmetrisation protects against fp32
 reduction-order asymmetry. On the native path, `auto` routes it like
 `gemm` (aten on the device, or host CPU for small host calls).
 
+As in BLAS (`dsyrk`, `cublasSsyrk`), only the `uplo` triangle of an `n×n`
+`C` is referenced; the other triangle is ignored (since 0.11.0, #74). A `C`
+whose off-diagonal entries all lie in the opposite triangle still uses that
+triangle and emits a `DeprecationWarning`: pass the matching `uplo`. A `C`
+that broadcasts against the result (scalar, row, column) is added and the
+sum symmetrised.
+
 ## `trsm(alpha, A, B, side="left", uplo="upper", trans=False, diag="nonunit")`
 
 Triangular solve: solves `op(A)·X = α·B` (or `X·op(A) = α·B` when `side="right"`).

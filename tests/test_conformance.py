@@ -16,8 +16,10 @@ and fp64 ``gradcheck``/``gradgradcheck``.
 
 Known needs-decision behaviour is ``xfail(strict=True)`` with the issue
 number, so the case flips to XPASS (a failure) once it is decided:
-trnblas#74 (``syrk`` ignores ``uplo``). trnblas#75 is decided: complex
-``asum`` / ``iamax`` use BLAS |Re|+|Im| (``scasum`` / ``icamax``).
+none at present. trnblas#74 (``syrk`` ignored ``uplo``) and trnblas#75
+(complex ``asum`` / ``iamax`` used the modulus) are decided: only the
+``uplo`` triangle of C is referenced, and ``asum`` / ``iamax`` use BLAS
+|Re|+|Im| (``scasum`` / ``icamax``).
 
 CPU CI runs it with the defaults (``pytest -m "not neuron"``). On a Trainium
 box the same cases run through the NKI/auto paths with device inputs::
@@ -170,7 +172,7 @@ def R_symm(alpha, A, B, beta=0.0, C=None, side="left", uplo="upper"):
 
 def R_syrk(alpha, A, beta=0.0, C=None, trans=False, uplo="upper"):
     """BLAS semantics: only the `uplo` triangle of C is referenced; trnblas
-    returns the full symmetric matrix."""
+    returns the full symmetric matrix (#74)."""
     P = A.mT @ A if trans else A @ A.mT
     return _addC(alpha * P, beta, None if C is None else _sym(C, uplo))
 
@@ -708,11 +710,6 @@ def test_syrk(nk, trans, uplo, Ckind, dtype):
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="trnsci/trnblas#74 needs decision: syrk ignores uplo; BLAS reads only "
-    "the uplo triangle of C",
-)
 @P("Ckind", ["one_triangle", "nonsymmetric"])
 @P("uplo", ["upper", "lower"])
 @P("trans", [False, True])
@@ -726,6 +723,38 @@ def test_syrk_uplo_blas(trans, uplo, Ckind):
     else:
         C = rnd(g, n, n)
     check("syrk", [1.5, A, 0.5, C], dict(trans=trans, uplo=uplo), dtype=F64)
+
+
+@P("uplo", ["upper", "lower"])
+def test_syrk_opposite_triangle_deprecated(uplo):
+    """C stored only in the triangle opposite `uplo`: that triangle is used,
+    with a DeprecationWarning (the trnsparse#52 rule)."""
+    g = _gen(43)
+    n = 9
+    A, S = rnd(g, n, 3), spd(g, n)
+    C = torch.tril(S) if uplo == "upper" else torch.triu(S)
+    other = "lower" if uplo == "upper" else "upper"
+    with pytest.warns(DeprecationWarning, match=f"uplo={other!r}"):
+        out = tb.syrk(1.5, to_dev(A), 0.5, to_dev(C), uplo=uplo)
+    want = R_syrk(1.5, A, 0.5, C, uplo=other)
+    torch.testing.assert_close(hi(out), want, rtol=1e-10, atol=1e-10)
+
+
+@P("Ckind", ["diagonal", "symmetric", "uplo_triangle"])
+@P("uplo", ["upper", "lower"])
+def test_syrk_no_warning(uplo, Ckind):
+    g = _gen(44)
+    n = 9
+    A, S = rnd(g, n, 3), spd(g, n)
+    C = {
+        "diagonal": torch.diag(torch.diag(S)),
+        "symmetric": S,
+        "uplo_triangle": torch.triu(S) if uplo == "upper" else torch.tril(S),
+    }[Ckind]
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", DeprecationWarning)
+        out = tb.syrk(1.5, to_dev(A), 0.5, to_dev(C), uplo=uplo)
+    torch.testing.assert_close(hi(out), R_syrk(1.5, A, 0.5, C, uplo=uplo))
 
 
 def test_syrk_layouts_and_broadcast():

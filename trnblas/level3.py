@@ -17,6 +17,8 @@ host CPU or upload + aten for host operands.
 
 from __future__ import annotations
 
+import warnings
+
 import torch
 
 from ._flags import diag_flag, side_flag, trans_flag, uplo_flag
@@ -193,20 +195,70 @@ def syrk(
     SYRK — a single-operand matmul kernel that avoids the materialised
     `A.T.contiguous()` copy of the naive `gemm(A, A.T)` call pattern. On
     the native path, `auto` routes it like `gemm`.
+
+    Returns the full symmetric matrix. As in BLAS (``dsyrk``,
+    ``cublasSsyrk``), only the `uplo` triangle of an ``n x n`` C is
+    referenced; the other triangle is ignored. (Through 0.10.0 `uplo` was
+    ignored and the sum was symmetrised, #74.) A C whose off-diagonal entries
+    are all in the opposite triangle still uses that triangle, with a
+    ``DeprecationWarning``; pass the matching `uplo`. A C that broadcasts
+    against the result (scalar, row, column) is added and the sum
+    symmetrised.
     """
     from .nki import nki_syrk
     from .nki.dispatch import _symmetrize
 
     trans = trans_flag(trans)
-    uplo_flag(uplo)  # validated; the result is the full symmetric matrix (#74)
+    uplo = uplo_flag(uplo)
     A_eff = A.T.contiguous() if trans else A
+    add = C is not None and beta != 0.0
+    n = A_eff.shape[0]
+    if add and C.dim() == 2 and tuple(C.shape) == (n, n):
+        # BLAS: only the `uplo` triangle of C is referenced (#74). alpha * S
+        # + beta * sym(C) is exactly symmetric when both terms are.
+        Cs = _sym_from_triangle(C, _resolve_syrk_uplo(C, uplo))
+        return _scale_add(nki_syrk(A_eff, symmetrize=True), alpha, beta, Cs)
     # Symmetrize (fp32 reduction-order rounding can leave tiny asymmetry).
     # Without C, symmetrize A A^T before scaling: alpha * sym(S) is exactly
     # symmetric, and a large host-input result is symmetrised on the device
-    # (#61). With C, symmetrize the sum, as before.
-    add = C is not None and beta != 0.0
+    # (#61). A broadcast C (scalar, row, column) has no triangle: symmetrise
+    # the sum, as before.
     result = _scale_add(nki_syrk(A_eff, symmetrize=not add), alpha, beta, C)
     return _symmetrize(result) if add else result
+
+
+def _sym_from_triangle(C: torch.Tensor, uplo: str) -> torch.Tensor:
+    """The symmetric (not Hermitian) matrix stored in the `uplo` triangle of C."""
+    if uplo == "upper":
+        return torch.triu(C) + torch.triu(C, diagonal=1).mT
+    return torch.tril(C) + torch.tril(C, diagonal=-1).mT
+
+
+def _resolve_syrk_uplo(C: torch.Tensor, uplo: str) -> str:
+    """`uplo`, or the opposite triangle when only that one holds entries.
+
+    Through 0.10.0 `syrk` ignored `uplo` and symmetrised the sum, so a C
+    stored in the lower triangle with the default ``uplo="upper"`` gave a
+    result built from that triangle. Strict BLAS would reference only the
+    diagonal of such a C. Keep using the stored triangle, with a warning; a C
+    with entries in both triangles references only `uplo` (same rule as
+    trnsparse#52/#53).
+    """
+    has_upper = bool(torch.triu(C, diagonal=1).ne(0).any())
+    has_lower = bool(torch.tril(C, diagonal=-1).ne(0).any())
+    other = "lower" if uplo == "upper" else "upper"
+    in_uplo, in_other = (has_upper, has_lower) if uplo == "upper" else (has_lower, has_upper)
+    if in_other and not in_uplo:
+        warnings.warn(
+            f"syrk: C stores its off-diagonal entries only in the {other} triangle "
+            f"but uplo={uplo!r}; using the {other} triangle. Pass uplo={other!r}. "
+            "Since 0.11.0 only the uplo triangle of C is referenced when both "
+            "are stored, and this fallback will be removed (#74).",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        return other
+    return uplo
 
 
 def trsm(

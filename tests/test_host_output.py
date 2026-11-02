@@ -204,12 +204,15 @@ class TestWrappersThroughCache:
         assert torch.equal(out, out.T)
         assert (1024, 1024) in fake_kernels
 
-    def test_syrk_with_c_symmetrises_the_sum(self, fake_kernels):
+    @pytest.mark.parametrize("uplo", ["upper", "lower"])
+    def test_syrk_with_c_references_the_uplo_triangle(self, fake_kernels, uplo):
+        # BLAS: only the `uplo` triangle of C is read (#74).
         g = torch.Generator().manual_seed(4)
         A, C = torch.randn(600, 64, generator=g), torch.randn(600, 600, generator=g)
-        out = trnblas.syrk(1.0, A, beta=1.0, C=C)
-        ref = A @ A.T + C
-        torch.testing.assert_close(out, 0.5 * (ref + ref.T), rtol=1e-5, atol=1e-4)
+        out = trnblas.syrk(1.0, A, beta=1.0, C=C, uplo=uplo)
+        T = torch.triu(C) if uplo == "upper" else torch.tril(C)
+        Cs = T + T.T - torch.diag(torch.diag(C))
+        torch.testing.assert_close(out, A @ A.T + Cs, rtol=1e-5, atol=1e-4)
         assert torch.equal(out, out.T)
 
     @pytest.mark.parametrize("uplo", ["lower", "upper"])
