@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Mixed-dtype GEMM operands raise the same error as `torch.matmul` on every
+  backend (#90).** The NKI dtype check looked at each operand on its own, so
+  `gemm(1.0, A_fp32, B_bf16)` (and `batched_gemm`, `symm`) took the NKI kernel
+  route under `set_backend("nki")`, the XLA path or `TRNBLAS_NATIVE_GEMM=nki`/`lnc`,
+  and returned a result in the left operand's dtype, where the pytorch backend
+  raises `RuntimeError`. Affects 0.2.0 through 0.10.0. Mixed operands now go to
+  torch before any kernel route and raise torch's error (also under
+  `TRNBLAS_REQUIRE_NKI=1`). A mixed `trsm` computes in torch, as on the pytorch
+  backend.
+
 ## [0.10.0] — 2026-11-02
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
