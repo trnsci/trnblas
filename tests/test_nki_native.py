@@ -100,6 +100,42 @@ class TestNativeOpsEager:
         assert _rel(C.cpu(), A.double() @ B.double()) < 1e-5
 
 
+class TestEagerHandle:
+    """Eager calls take the cached handle; results match the custom op."""
+
+    def test_handle_matches_op_and_is_cached(self, monkeypatch):
+        monkeypatch.setattr(D, "_eager_handles", {})
+        A, B = _host(127, 129), _host(129, 513, seed=1)
+        a, b = A.to(DEV), B.to(DEV)
+        op = D._get_native_ops()["gemm_ragged"](a, b).cpu()
+        for _ in range(3):
+            out = D._call_kernel(D._gemm_kernel_ragged, "gemm_ragged", a, b)
+            assert out.device.type == "neuron"
+            assert torch.equal(out.cpu(), op)
+        assert list(D._eager_handles) == [id(D._gemm_kernel_ragged)]
+        assert _rel(op, A.double() @ B.double()) < 1e-5
+
+    def test_flag_off_uses_op(self, monkeypatch):
+        monkeypatch.setattr(D, "_eager_handles", {})
+        monkeypatch.setattr(D, "_EAGER_HANDLE_ENABLED", False)
+        A = _host(256, 128)
+        out = D._call_kernel(D._syrk_kernel, "syrk", A.to(DEV)).cpu()
+        assert D._eager_handles == {}
+        assert _rel(out, A.double() @ A.double().T) < 1e-5
+
+    def test_call_kernel_inside_compile_uses_op(self, monkeypatch):
+        monkeypatch.setattr(D, "_eager_handles", {})
+
+        @torch.compile(backend="neuron", fullgraph=True)
+        def f(a, b):
+            return D._call_kernel(D._gemm_kernel_ragged, "gemm_ragged", a, b) * 2.0
+
+        A, B = _host(127, 129), _host(129, 513, seed=1)
+        out = f(A.to(DEV), B.to(DEV)).cpu()
+        assert D._eager_handles == {}
+        assert _rel(out, 2.0 * (A.double() @ B.double())) < 1e-5
+
+
 class TestNativeTorchCompile:
     def test_gemm_ragged_inside_compile(self):
         gemm_ragged = D._get_native_ops()["gemm_ragged"]

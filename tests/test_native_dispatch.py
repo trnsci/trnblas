@@ -319,7 +319,7 @@ class TestEagerHandle:
             built.append(kernel)
             return lambda *t: ("handle", t)
 
-        monkeypatch.setattr(dispatch, "_wrap_nki_to_torch_hop", wrap)
+        monkeypatch.setattr(dispatch, "_wrap_nki", wrap)
 
         def op(*t):
             return ("op", t)
@@ -346,15 +346,22 @@ class TestEagerHandle:
         assert eager == []
 
     def test_no_handle_api_uses_op(self, eager, monkeypatch):
-        monkeypatch.setattr(dispatch, "_wrap_nki_to_torch_hop", False)
+        monkeypatch.setattr(dispatch, "_wrap_nki", False)
         assert dispatch._call_kernel(_FakeKernel(), "k", torch.ones(1))[0] == "op"
 
     def test_missing_nki_api_resolves_to_unavailable(self, monkeypatch):
         monkeypatch.setattr(dispatch, "_eager_handles", {})
-        monkeypatch.setattr(dispatch, "_wrap_nki_to_torch_hop", None)
-        monkeypatch.setitem(sys.modules, "nki.framework.kernel", None)
+        monkeypatch.setattr(dispatch, "_wrap_nki", None)
+        monkeypatch.setitem(sys.modules, "torch_neuronx", types.ModuleType("torch_neuronx"))
         assert dispatch._eager_handle(_FakeKernel()) is None
-        assert dispatch._wrap_nki_to_torch_hop is False
+        assert dispatch._wrap_nki is False
+
+    def test_torch_neuronx_missing_resolves_to_unavailable(self, monkeypatch):
+        monkeypatch.setattr(dispatch, "_eager_handles", {})
+        monkeypatch.setattr(dispatch, "_wrap_nki", None)
+        monkeypatch.setitem(sys.modules, "torch_neuronx", None)
+        assert dispatch._eager_handle(_FakeKernel()) is None
+        assert dispatch._wrap_nki is False
 
 
 class TestEagerCallOk:
