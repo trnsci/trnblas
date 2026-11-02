@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`syrk` honours `uplo`: only the `uplo` triangle of C is referenced, as in
+  BLAS `dsyrk`/`cublasSsyrk` (#74).** Through 0.10.0 `uplo` was validated but
+  ignored, and with `beta != 0` the result was `sym(alpha·A·Aᵀ + beta·C)`,
+  `sym(X) = (X + Xᵀ)/2`. A C stored in one triangle (the BLAS convention, the
+  other triangle zero) got half its off-diagonal entries (rel. err 0.04–0.19
+  in the audit), and the other triangle of a non-symmetric C leaked into the
+  result. Now an `n×n` C is read as the symmetric matrix stored in its `uplo`
+  triangle. **Results change** for callers passing a full non-symmetric C:
+  only its `uplo` triangle is used. A symmetric C gives the same result as
+  before. A C that broadcasts (scalar, row, column) is unchanged.
+
+### Deprecated
+
+- **`syrk` with C stored only in the triangle opposite `uplo` (#74).** When
+  every off-diagonal entry of C is in the other triangle (for example a
+  lower-stored C with the default `uplo="upper"`), `syrk` uses that triangle
+  and emits a `DeprecationWarning` asking for the matching `uplo`. Strict
+  BLAS would read only the diagonal of such a C; the fallback will be removed
+  in a later minor release. Same rule as trnsparse `spmv_symmetric`
+  (trnsci/trnsparse#52). A diagonal-only C gives no warning.
+
 ## [0.10.0] — 2026-11-02
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
