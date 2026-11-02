@@ -17,6 +17,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Affects 0.3.0 through 0.9.1. The loop now runs over the broadcast batch
   index on expanded views, with no copies. Found by the conformance suite on
   Trn2 (trnsci/trnsci#35).
+- **Float64, integer, bool and complex tensors reached the FP32 DF-MP2 energy
+  kernels** (silent). `nki_mp2_energy`, `nki_fused_gemm_energy` and
+  `nki_batched_pair_energy` had no dtype check, so under `set_backend("nki")`
+  or `auto` a float64 (or integer/complex) amplitude tensor, or float64
+  orbital energies, went into the FP32 kernels and came back as garbage, or
+  failed and fell back to torch with a warning. Now float64 / integer / bool /
+  complex amplitudes run the torch reference (the pytorch backend's result;
+  device-resident `B` on the sym route runs as aten), bfloat16/float16
+  operands are upcast exactly to float32, and float64 orbital energies are
+  rounded to float32 (as the sym and multi-core paths already did). Under
+  `TRNBLAS_REQUIRE_NKI=1` each of these raises `NotImplementedError`
+  instead. The GEMM-family routes are unchanged (float64 already ran in
+  torch, #68). Affects every release with these kernels, through 0.9.1. Found by the suite-wide audit
+  (trnsci/trnsci#35).
+- **One dtype check at the NKI kernel boundary.** Every launch (`_launch`,
+  `_call_kernel` on the native and XLA paths, the simulator via the new
+  `_simulate`, and every `_native.OPS` entry, including the direct
+  `pair_energy_sym` calls in `multicore` / `parallel`) checks its operands
+  against a per-kernel table `_KERNEL_DTYPES` and raises `TypeError` naming
+  the op and dtypes for anything else, or for a kernel without an entry.
+  `tests/test_kernel_dtype_guard.py` registers every op through a stub
+  `nki_op` that refuses unsupported dtypes and drives every public API with
+  float32/float64/bfloat16/float16/int32/int64/bool/complex inputs on the
+  native, XLA and simulator paths. Open questions: #89 (energy result dtype),
+  #90 (mixed-dtype GEMM operands).
 
 ### Added
 

@@ -224,27 +224,32 @@ def sym_rows(
 
     nocc, nvir, naux = src.shape
     i0, i1 = rows
+    if src.dtype not in D._ENERGY_DATA_DTYPES:
+        raise TypeError(f"sym_rows: the pair_energy_sym kernel is FP32; got B of dtype {src.dtype}")
+    # The kernel takes FP32 operands; bfloat16/float16 B is upcast exactly.
+    kdt = torch.float32
     dims = D._pair_sym_dims(nocc, nvir, naux)
     nv, na, nd = dims["nvir_pad"], dims["naux_pad"], dims["nd_pad"]
     op = D._get_native_ops()["pair_energy_sym"]
     span = i1 - i0 + nd - 1
     idx = [(i0 + r) % nocc for r in range(span)]
-    win = _gather_rows(src, idx, dev)
+    win = _gather_rows(src, idx, dev).to(kdt)
     if (nv, na) != (nvir, naux):
-        Bp = torch.zeros(span, nv, na, dtype=src.dtype, device=dev)
+        Bp = torch.zeros(span, nv, na, dtype=kdt, device=dev)
         Bp[:, :nvir, :naux] = win
     else:
         Bp = win
     Bw = Bp.permute(0, 2, 1).contiguous()  # (span, naux_pad, nvir_pad): B[j].T
     del Bp, win
+    eo_h, ev_h = eo_h.to(kdt), ev_h.to(kdt)
     eps_w = torch.cat([eo_h, eo_h])[idx]
     ex = torch.stack([eps_w[r : r + nd] for r in range(i1 - i0)]).to(dev)  # (rows, nd)
     eo = eo_h[i0:i1].reshape(1, -1).to(dev)
-    evp = torch.zeros(nv, dtype=src.dtype)
+    evp = torch.zeros(nv, dtype=kdt)
     evp[:nvir] = ev_h
     evc = evp.reshape(nv, 1).to(dev)
     evr = evp.reshape(1, nv).to(dev)
-    w = torch.tensor(dims["weights"], dtype=src.dtype).to(dev)
+    w = torch.tensor(dims["weights"], dtype=kdt).to(dev)
     acc = None
     for r in range(i1 - i0):
         p = op(Bw[r], Bw[r : r + nd], eo[:, r : r + 1], ex[r : r + 1], evc, evr)

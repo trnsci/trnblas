@@ -285,7 +285,9 @@ def _kernel_dtypes_ok(*tensors: torch.Tensor) -> bool:
     return all(t.dtype in _DEVICE_GEMM_DTYPES for t in tensors)
 
 
-def _no_kernel_for_dtype(what: str, *tensors: torch.Tensor) -> None:
+def _no_kernel_for_dtype(
+    what: str, *tensors: torch.Tensor, takes: str = "float32/bfloat16/float16"
+) -> None:
     """Under TRNBLAS_REQUIRE_NKI, refuse a dtype the kernels do not take.
 
     Without it the caller runs torch instead. Before 0.9.1 float64 operands
@@ -295,7 +297,7 @@ def _no_kernel_for_dtype(what: str, *tensors: torch.Tensor) -> None:
     if _REQUIRE_NKI:
         dts = sorted({str(t.dtype) for t in tensors})
         raise NotImplementedError(
-            f"trnblas {what}: the NKI kernels take float32/bfloat16/float16, got {dts}. "
+            f"trnblas {what}: the NKI kernels take {takes}, got {dts}. "
             "Unset TRNBLAS_REQUIRE_NKI to compute in torch."
         )
 
@@ -389,6 +391,98 @@ _gemm_kernel_registry: dict[tuple[int, int, int], Any] = {}
 # Persistent autotune results: shape bucket → winning tile config.
 _autotune_mem: dict[tuple[int, int, int], tuple[int, int, int]] = {}
 _autotune_loaded: bool = False
+
+
+# ── Operand dtypes at the NKI kernel boundary (trnsci/trnsci#35) ─────────────
+#
+# Every kernel launch goes through `_call_kernel` (native custom op or XLA),
+# `_simulate` (nki.simulate) or a `_native.OPS` entry, and each of them checks
+# its operands against `_KERNEL_DTYPES[op_name]` and raises TypeError for any
+# other dtype, or for an op with no entry. The wrappers decide what to do
+# with other dtypes before they get there (torch, an exact upcast, or
+# NotImplementedError under TRNBLAS_REQUIRE_NKI), so the check never fires
+# on a supported call; it is the backstop that keeps float64, integer, bool
+# and complex tensors out of the FP32 kernels if a wrapper forgets.
+#
+# GEMM / SYRK kernels: FP32 PSUM accumulation, output in the input dtype.
+# DF-MP2 energy kernels: FP32 SBUF tiles and an FP32 result, FP32 operands.
+_GEMM_KERNEL_DTYPES = frozenset(_DEVICE_GEMM_DTYPES)
+_FP32_KERNEL_DTYPES = frozenset({torch.float32})
+_KERNEL_DTYPES: dict[str, frozenset] = {
+    **{f"gemm_{tm}_{tk}_{tn}": _GEMM_KERNEL_DTYPES for tm, tk, tn in _TILE_CANDIDATES},
+    "gemm_ragged": _GEMM_KERNEL_DTYPES,
+    "gemm_lnc": _GEMM_KERNEL_DTYPES,  # LNC-split GEMM, #79
+    "gemm_lnc_tn": _GEMM_KERNEL_DTYPES,  # LNC-split GEMM, #79
+    "syrk": _GEMM_KERNEL_DTYPES,
+    "mp2_energy": _FP32_KERNEL_DTYPES,
+    "fused_gemm_energy": _FP32_KERNEL_DTYPES,
+    "batched_pair": _FP32_KERNEL_DTYPES,
+    "j_batched": _FP32_KERNEL_DTYPES,
+    "pair_energy_sym": _FP32_KERNEL_DTYPES,
+}
+
+
+def _check_kernel_operands(op_name: str, *tensors) -> None:
+    """Raise TypeError unless every tensor operand of kernel `op_name` has a
+    dtype in `_KERNEL_DTYPES[op_name]` (and the op has an entry)."""
+    allowed = _KERNEL_DTYPES.get(op_name)
+    if allowed is None:
+        raise TypeError(
+            f"trnblas: NKI kernel {op_name!r} has no entry in _KERNEL_DTYPES; "
+            "add its operand dtypes before launching it"
+        )
+    dts = [t.dtype for t in tensors if isinstance(t, torch.Tensor)]
+    bad = sorted({str(d) for d in dts if d not in allowed})
+    if bad:
+        raise TypeError(
+            f"trnblas: NKI kernel {op_name!r} takes {sorted(str(d) for d in allowed)}; "
+            f"got operand dtypes {[str(d) for d in dts]} (unsupported: {bad})"
+        )
+
+
+# The energy kernels compute in FP32. bfloat16/float16 operands are upcast
+# exactly; float64 orbital energies (small vectors, often straight from
+# NumPy) are rounded to float32, as `_pair_sym_feeds` and the multi-core path
+# already did, since the amplitudes are FP32. Float64 / integer / bool /
+# complex amplitudes run the torch reference (the pytorch backend), because
+# an FP32 kernel would throw away the precision the caller asked for.
+_ENERGY_DATA_DTYPES = _GEMM_KERNEL_DTYPES
+_ENERGY_EPS_DTYPES = _GEMM_KERNEL_DTYPES | {torch.float64}
+
+
+def _energy_operands(what: str, data: tuple, eps: tuple):
+    """FP32 operands for a DF-MP2 energy kernel, or None to run torch.
+
+    `data` are the amplitude / B tensors, `eps` the orbital energies. Under
+    TRNBLAS_REQUIRE_NKI an unsupported dtype, or a float64 eps that would be
+    rounded, raises NotImplementedError instead.
+    """
+    if any(t.dtype not in _ENERGY_DATA_DTYPES for t in data) or any(
+        t.dtype not in _ENERGY_EPS_DTYPES for t in eps
+    ):
+        _no_kernel_for_dtype(
+            what,
+            *data,
+            *eps,
+            takes="float32 amplitudes (bfloat16/float16 upcast) and float32 orbital energies",
+        )
+        return None
+    if _REQUIRE_NKI and any(t.dtype == torch.float64 for t in eps):
+        raise NotImplementedError(
+            f"trnblas {what}: the NKI energy kernels are FP32; float64 orbital energies "
+            "would be rounded to float32. Pass float32 eps, or unset TRNBLAS_REQUIRE_NKI."
+        )
+    f32 = torch.float32
+    return tuple(t.to(f32) for t in data), tuple(t.to(f32) for t in eps)
+
+
+def _simulate(kernel, op_name: str, *tensors: torch.Tensor, device=None) -> torch.Tensor:
+    """`nki.simulate(kernel)` on `tensors` (TRNBLAS_USE_SIMULATOR), result on `device`."""
+    _check_kernel_operands(op_name, *tensors)
+    out = nki.simulate(kernel)(*[t.detach().cpu().numpy() for t in tensors])
+    out = torch.from_numpy(np.asarray(out))
+    return out if device is None else out.to(device)
+
 
 _backend = "auto"
 
@@ -506,8 +600,12 @@ def nki_mp2_energy(
     """
     if not _use_nki():
         return _torch_mp2_energy(T_flat, eps_occ_chunk, eps_occ_full, eps_vir)
+    feeds = _energy_operands("mp2_energy", (T_flat,), (eps_occ_chunk, eps_occ_full, eps_vir))
+    if feeds is None:  # no FP32 kernel for these dtypes: the pytorch backend
+        return _torch_mp2_energy(T_flat, eps_occ_chunk, eps_occ_full, eps_vir)
+    (t_k,), (eo_c_k, eo_f_k, ev_k) = feeds
     try:
-        return _nki_mp2_energy_impl(T_flat, eps_occ_chunk, eps_occ_full, eps_vir)
+        return _nki_mp2_energy_impl(t_k, eo_c_k, eo_f_k, ev_k)
     except Exception as exc:
         if _REQUIRE_NKI:
             raise
@@ -536,14 +634,16 @@ def _nki_mp2_energy_impl(
     ev_row_in = eps_vir.reshape(1, -1).contiguous()
 
     if _use_simulator():
-        partial_np = nki.simulate(_mp2_energy_kernel)(
-            t_in.cpu().numpy(),
-            eo_c_in.cpu().numpy(),
-            eo_f_in.cpu().numpy(),
-            ev_col_in.cpu().numpy(),
-            ev_row_in.cpu().numpy(),
+        partial = _simulate(
+            _mp2_energy_kernel,
+            "mp2_energy",
+            t_in,
+            eo_c_in,
+            eo_f_in,
+            ev_col_in,
+            ev_row_in,
+            device=T_flat.device,
         )
-        partial = torch.from_numpy(np.asarray(partial_np)).to(T_flat.device)
     else:
         partial = _launch(
             _mp2_energy_kernel, "mp2_energy", t_in, eo_c_in, eo_f_in, ev_col_in, ev_row_in
@@ -1078,8 +1178,10 @@ def _call_kernel(kernel, op_name: str, *device_tensors: torch.Tensor) -> torch.T
     """Run one kernel on tensors already on the kernel device (see `_to_device`).
 
     `op_name` is the `trnblas::<op_name>` custom op used on the native path;
-    the XLA path calls `kernel` directly on torch_xla tensors.
+    the XLA path calls `kernel` directly on torch_xla tensors. Operand dtypes
+    are checked against `_KERNEL_DTYPES[op_name]` first (TypeError).
     """
+    _check_kernel_operands(op_name, *device_tensors)
     if _get_dispatch_path() == "native":
         return _get_native_ops()[op_name](*device_tensors)
     return kernel(*device_tensors)
@@ -1090,6 +1192,7 @@ def _launch(kernel, op_name: str, *tensors: torch.Tensor) -> torch.Tensor:
     the device of the first input. Every host wrapper goes through here (or
     through `_to_device` + `_call_kernel` when operands stay resident across
     several launches)."""
+    _check_kernel_operands(op_name, *tensors)
     xs, orig = _to_device(*tensors)
     return _to_host(_call_kernel(kernel, op_name, *xs), orig)
 
@@ -1374,8 +1477,7 @@ def _nki_gemm_impl(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
 
     def _run(kernel, op_name: str, A_feed: torch.Tensor, B_feed: torch.Tensor) -> torch.Tensor:
         if _use_simulator():
-            out_np = nki.simulate(kernel)(A_feed.cpu().numpy(), B_feed.cpu().numpy())
-            return torch.from_numpy(np.asarray(out_np)).to(A.device)
+            return _simulate(kernel, op_name, A_feed, B_feed, device=A.device)
         return _launch(kernel, op_name, A_feed, B_feed)
 
     def _launch_tiled(A_feed: torch.Tensor, B_feed: torch.Tensor) -> torch.Tensor:
@@ -1458,25 +1560,34 @@ def nki_batched_pair_energy(
     """
     if not _use_nki():
         return _torch_batched_pair_energy(B, eps_occ, eps_vir)
-    route = _pair_energy_route(B)
+    route = _pair_energy_route(B)  # 'aten' for amplitudes the kernels do not take
+    feeds = None
+    if route != "aten":
+        feeds = _energy_operands("batched_pair_energy", (B,), (eps_occ, eps_vir))
+        if feeds is None:  # no FP32 kernel for these dtypes: torch, as the pytorch backend
+            if route == "sym":  # device-resident: the aten route
+                return _torch_chunked_pair_energy(B, eps_occ, eps_vir)
+            return _torch_batched_pair_energy(B, eps_occ, eps_vir)
     if route in ("sym", "aten"):
         from .multicore import pair_energy_devices, pair_energy_multicore
 
         devices = pair_energy_devices(B)
         if devices is not None:
+            # `sym_rows` builds FP32 kernel operands itself.
             return pair_energy_multicore(B, eps_occ, eps_vir, route, devices)
     if route == "aten":
         return _torch_chunked_pair_energy(B, eps_occ, eps_vir)
+    (B_k,), (eo_k, ev_k) = feeds
     if route == "sym":
         try:
-            return _nki_pair_energy_sym_impl(B, eps_occ, eps_vir)
+            return _nki_pair_energy_sym_impl(B_k, eo_k, ev_k)
         except Exception as exc:
             if _REQUIRE_NKI:
                 raise
             _warn_fallback(exc, "pair_energy_sym kernel failed — falling back to aten")
             return _torch_chunked_pair_energy(B, eps_occ, eps_vir)
     try:
-        return _nki_batched_pair_energy_impl(B, eps_occ, eps_vir)
+        return _nki_batched_pair_energy_impl(B_k, eo_k, ev_k)
     except Exception as exc:
         if _REQUIRE_NKI:
             raise
@@ -1559,6 +1670,13 @@ def _pair_energy_route(B: torch.Tensor) -> str:
         )
     if _use_simulator() or not _on_neuron_device(B) or _get_dispatch_path() != "native":
         return "legacy"
+    if choice in ("sym", "auto") and B.dtype not in _ENERGY_DATA_DTYPES:
+        # The sym kernel is FP32: float64 / integer / complex B runs as aten
+        # (torch on the device), at full precision.
+        _no_kernel_for_dtype(
+            "batched_pair_energy", B, takes="float32 amplitudes (bfloat16/float16 upcast)"
+        )
+        return "aten"
     if choice != "auto":
         return choice
     dims = _pair_sym_dims(*B.shape)
@@ -1703,13 +1821,15 @@ def _nki_batched_pair_energy_impl(
         ev_col_feed, ev_row_feed = ev_col, ev_row
 
     if _use_simulator():
-        partial_np = nki.simulate(_batched_pair_kernel)(
-            B_feed.cpu().numpy(),
-            eps_occ_row.cpu().numpy(),
-            ev_col_feed.cpu().numpy(),
-            ev_row_feed.cpu().numpy(),
+        partial = _simulate(
+            _batched_pair_kernel,
+            "batched_pair",
+            B_feed,
+            eps_occ_row,
+            ev_col_feed,
+            ev_row_feed,
+            device=B.device,
         )
-        partial = torch.from_numpy(np.asarray(partial_np)).to(B.device)
     else:
         partial = _launch(
             _batched_pair_kernel,
@@ -1819,28 +1939,32 @@ def _nki_batched_pair_energy_chunked_impl(
             b_i_feed = B_feed[i].contiguous()
             eo_i = eps_occ[i : i + 1].reshape(1, 1).contiguous()
             if j_chunk_size == nocc:
-                partial_np = nki.simulate(_j_batched_kernel)(
-                    b_i_feed.cpu().numpy(),
-                    B_feed.cpu().numpy(),
-                    eo_i.cpu().numpy(),
-                    eps_occ_row.cpu().numpy(),
-                    ev_col_feed.cpu().numpy(),
-                    ev_row_feed.cpu().numpy(),
+                partial = _simulate(
+                    _j_batched_kernel,
+                    "j_batched",
+                    b_i_feed,
+                    B_feed,
+                    eo_i,
+                    eps_occ_row,
+                    ev_col_feed,
+                    ev_row_feed,
                 )
-                e_total = e_total + float(torch.from_numpy(np.asarray(partial_np)).sum())
+                e_total = e_total + float(partial.sum())
             else:
                 for j_start in range(0, nocc_padded, j_chunk_size):
                     B_j = B_feed[j_start : j_start + j_chunk_size].contiguous()
                     eo_j = eps_occ_row[0:1, j_start : j_start + j_chunk_size]
-                    partial_np = nki.simulate(_j_batched_kernel)(
-                        b_i_feed.cpu().numpy(),
-                        B_j.cpu().numpy(),
-                        eo_i.cpu().numpy(),
-                        eo_j.cpu().numpy(),
-                        ev_col_feed.cpu().numpy(),
-                        ev_row_feed.cpu().numpy(),
+                    partial = _simulate(
+                        _j_batched_kernel,
+                        "j_batched",
+                        b_i_feed,
+                        B_j,
+                        eo_i,
+                        eo_j,
+                        ev_col_feed,
+                        ev_row_feed,
                     )
-                    e_total = e_total + float(torch.from_numpy(np.asarray(partial_np)).sum())
+                    e_total = e_total + float(partial.sum())
         return e_total
 
     # Hardware: move fixed tensors to the device once; slice b_i, eo_i, and
@@ -1930,8 +2054,12 @@ def nki_fused_gemm_energy(
     """
     if not _use_nki():
         return _torch_fused_pair_energy(b_i, b_j, eps_occ_i, eps_occ_j, eps_vir)
+    feeds = _energy_operands("fused_gemm_energy", (b_i, b_j), (eps_vir,))
+    if feeds is None:  # no FP32 kernel for these dtypes: the pytorch backend
+        return _torch_fused_pair_energy(b_i, b_j, eps_occ_i, eps_occ_j, eps_vir)
+    (bi_k, bj_k), (ev_k,) = feeds
     try:
-        return _nki_fused_gemm_energy_impl(b_i, b_j, eps_occ_i, eps_occ_j, eps_vir)
+        return _nki_fused_gemm_energy_impl(bi_k, bj_k, eps_occ_i, eps_occ_j, ev_k)
     except Exception as exc:
         if _REQUIRE_NKI:
             raise
@@ -1987,14 +2115,16 @@ def _nki_fused_gemm_energy_impl(
         ev_row_feed = ev_row
 
     if _use_simulator():
-        partial_np = nki.simulate(_fused_gemm_energy_kernel)(
-            bi_feed.cpu().numpy(),
-            bj_feed.cpu().numpy(),
-            eo_sum.cpu().numpy(),
-            ev_col_feed.cpu().numpy(),
-            ev_row_feed.cpu().numpy(),
+        partial = _simulate(
+            _fused_gemm_energy_kernel,
+            "fused_gemm_energy",
+            bi_feed,
+            bj_feed,
+            eo_sum,
+            ev_col_feed,
+            ev_row_feed,
+            device=b_i.device,
         )
-        partial = torch.from_numpy(np.asarray(partial_np)).to(b_i.device)
     else:
         partial = _launch(
             _fused_gemm_energy_kernel,
@@ -2076,8 +2206,7 @@ def _nki_syrk_impl(A: torch.Tensor, symmetrize: bool = False) -> torch.Tensor:
             A_feed = A.contiguous()
 
         if _use_simulator():
-            out_np = nki.simulate(_syrk_kernel)(A_feed.cpu().numpy())
-            result = torch.from_numpy(np.asarray(out_np)).to(A.device)
+            result = _simulate(_syrk_kernel, "syrk", A_feed, device=A.device)
         else:
             (a,), orig = _to_device(A_feed)
             result = _call_kernel(_syrk_kernel, "syrk", a)

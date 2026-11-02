@@ -180,3 +180,24 @@ OPS = {
     "j_batched": j_batched,
     "pair_energy_sym": pair_energy_sym,
 }
+
+
+def _dtype_checked(name: str, op):
+    """`op` behind the operand-dtype check of `dispatch._KERNEL_DTYPES[name]`.
+
+    Every caller of a `trnblas::` op (`_call_kernel`, and the direct callers
+    in `_nki_pair_energy_sym_impl` / `multicore.sym_rows`) gets this wrapper,
+    so a float64, integer, bool or complex tensor never reaches a kernel
+    (TypeError naming the op and dtypes; trnsci/trnsci#35).
+    """
+
+    def checked(*args):
+        _d._check_kernel_operands(name, *args)
+        return op(*args)
+
+    checked.__name__ = name
+    checked.op = op
+    return checked
+
+
+OPS = {name: _dtype_checked(name, op) for name, op in OPS.items()}
