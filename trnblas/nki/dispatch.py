@@ -288,6 +288,16 @@ def _kernel_dtypes_ok(*tensors: torch.Tensor) -> bool:
     return all(t.dtype in _DEVICE_GEMM_DTYPES for t in tensors)
 
 
+def _mixed_dtypes(*tensors: torch.Tensor) -> bool:
+    """True when the operands do not share one dtype.
+
+    torch.matmul raises on mixed operands (e.g. fp32 @ bf16), so these go to
+    torch and raise the same error there (#90). Before 0.10.1 each operand
+    was checked on its own, and a mixed call took the NKI kernel route.
+    """
+    return len({t.dtype for t in tensors}) > 1
+
+
 def _no_kernel_for_dtype(what: str, *tensors: torch.Tensor) -> None:
     """Under TRNBLAS_REQUIRE_NKI, refuse a dtype the kernels do not take.
 
@@ -312,7 +322,7 @@ def _gemm_route(
     `macs` / `nbytes` (multiply-adds and host-link bytes) are needed only for
     all-host operands under `auto`; they default to `tensors[0] @ tensors[1]`.
     """
-    if not _use_nki():
+    if not _use_nki() or _mixed_dtypes(*tensors):
         return "torch"
     if _backend == "nki" or _use_simulator() or _get_dispatch_path() != "native":
         if not _kernel_dtypes_ok(*tensors):
@@ -704,6 +714,8 @@ def nki_trsm(
     if side != "left" or not _use_nki() or B.dim() != 2:
         return _trsm_torch(alpha, A, B, side, uplo, trans, diag)
     route = _trsm_route(A, B)
+    if route == "torch":
+        return _trsm_torch(alpha, A, B, side, uplo, trans, diag)
     if route == "host":
         return _trsm_on_host(alpha, A, B, uplo, trans, diag)
     try:
@@ -737,7 +749,10 @@ def nki_trsm(
 
 
 def _trsm_route(A: torch.Tensor, B: torch.Tensor) -> str:
-    """'nki', 'aten' or 'host' for a left TRSM (with `_use_nki()`)."""
+    """'torch', 'nki', 'aten' or 'host' for a left TRSM (with `_use_nki()`)."""
+    if _mixed_dtypes(A, B):
+        # Same result as the pytorch backend, never a mixed kernel GEMM (#90).
+        return "torch"
     if _backend == "nki" or _use_simulator() or _get_dispatch_path() != "native":
         route = "nki"
     else:
