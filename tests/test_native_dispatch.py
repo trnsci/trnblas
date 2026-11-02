@@ -833,6 +833,14 @@ class TestMetricInvHalf:
         assert dispatch._metric_solve_route(torch.empty(n, n)) == "host"
         assert dispatch._metric_solve_route(torch.empty(n + 1, n + 1)) == "device"
 
+    @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+    def test_integer_metric_raises_on_the_host_route(self, native_nki, dtype):
+        """The host route used to truncate the float64 factor to J's int dtype (#86)."""
+        J = (torch.eye(4) * 10 + 1).to(dtype)
+        assert dispatch._metric_solve_route(J) == "host"
+        with pytest.raises(NotImplementedError, match="floating point"):
+            trnblas.metric_inv_half(J)
+
     def test_route_env_override(self, native_nki, monkeypatch):
         monkeypatch.setenv("TRNBLAS_METRIC_SOLVE", "device")
         assert dispatch._metric_solve_route(torch.empty(8, 8)) == "device"
