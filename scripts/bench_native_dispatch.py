@@ -13,6 +13,11 @@ Run on a TorchNeuron (Trn2/Trn3) host:
           sweep on trn2 (#52).
 ``gemm``  ``trnblas.gemm`` (NKI) vs ``A @ B`` (aten) on device-resident inputs,
           aligned and ragged shapes.
+``call``  Host cost of one kernel call on device-resident inputs: the
+          ``trnblas::`` custom op against the cached eager handle
+          (``TRNBLAS_NKI_EAGER_HANDLE``), with aten for scale. ``issue`` is the
+          host time per call of ``n`` back-to-back calls, ``e2e`` the median of
+          one call plus a synchronize; ms.
 
 Each line: ``RESULT <mode> <case> first=<s> warm_median=<ms> [extra]``.
 Inputs are created on the host and copied to the device before timing:
@@ -96,15 +101,77 @@ def bench_gemm(sizes):
         )
 
 
+def _issue_e2e(fn, n=200):
+    for _ in range(10):
+        fn()
+    _sync()
+    issue = []
+    for _ in range(5):
+        t0 = time.perf_counter()
+        rs = [fn() for _ in range(n)]
+        issue.append((time.perf_counter() - t0) / n * 1e3)
+        _sync()
+        del rs
+    e2e = []
+    for _ in range(100):
+        t0 = time.perf_counter()
+        fn()
+        _sync()
+        e2e.append((time.perf_counter() - t0) * 1e3)
+    return statistics.median(issue), statistics.median(e2e)
+
+
+def bench_call():
+    trnblas.set_backend("nki")
+    D._REQUIRE_NKI = True
+    g = torch.Generator().manual_seed(0)
+    cases = []
+    for m, k, n in ((128, 128, 512), (1024, 1024, 1024)):
+        A, B = torch.randn(m, k, generator=g), torch.randn(k, n, generator=g)
+        a, b = A.to("neuron"), B.to("neuron")
+        tile = D._gemm_kernel_registry[(D._TILE_M, D._TILE_K, D._TILE_N)]
+        op = D._gemm_op_name(D._TILE_M, D._TILE_K, D._TILE_N)
+        ref = A.double() @ B.double()
+        cases += [
+            (f"aten a@b {m}x{k}x{n}", lambda a=a, b=b: a @ b, None),
+            (
+                f"kernel {op} {m}x{k}x{n}",
+                lambda a=a, b=b, t=tile, o=op: D._call_kernel(t, o, a, b),
+                ref,
+            ),
+            (f"trnblas.gemm {m}x{k}x{n}", lambda a=a, b=b: trnblas.gemm(1.0, a, b), ref),
+        ]
+    S = torch.randn(256, 128, generator=g)
+    s_dev = S.to("neuron")
+    cases.append(
+        ("kernel syrk 256x128", lambda: D._call_kernel(D._syrk_kernel, "syrk", s_dev), None)
+    )
+    print(f"{'case':36s} {'path':7s} {'issue':>8s} {'e2e':>8s}  rel_err", flush=True)
+    for name, fn, ref in cases:
+        paths = ("aten",) if ref is None and name.startswith("aten") else ("op", "handle")
+        for path in paths:
+            D._EAGER_HANDLE_ENABLED = path != "op"
+            out = fn()
+            err = ""
+            if ref is not None:
+                err = f"{((out.double().cpu() - ref).norm() / ref.norm()).item():.1e}"
+            del out
+            issue, e2e = _issue_e2e(fn)
+            print(f"{name:36s} {path:7s} {issue:8.4f} {e2e:8.4f}  {err}", flush=True)
+    D._EAGER_HANDLE_ENABLED = True
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["pair", "gemm"])
+    ap.add_argument("mode", choices=["pair", "gemm", "call"])
     args = ap.parse_args()
     path = D._get_dispatch_path()
     print(f"INFO dispatch_path={path}", flush=True)
     if path != "native":
         raise SystemExit("needs the native TorchNeuron path")
-    if args.mode == "pair":
+    if args.mode == "call":
+        bench_call()
+    elif args.mode == "pair":
         # All at or under the XLA threshold (est_iters <= 4096), so the full-batch
         # kernel stays within the trace size known to compile.
         bench_pair([(4, 128, 128), (16, 128, 384), (32, 128, 384), (64, 128, 128), (16, 256, 512)])

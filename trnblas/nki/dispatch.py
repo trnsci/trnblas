@@ -1250,15 +1250,85 @@ def _to_host(t: torch.Tensor, device) -> torch.Tensor:
     return _host_empty(t.shape, t.dtype, device).copy_(t)
 
 
+# ── Eager call handles (native path) ─────────────────────────────────────────
+#
+# A `trnblas::` custom-op call costs ~0.10 ms of host time before the kernel
+# is queued; an aten op costs ~0.02 ms (trn2, SDK 2.33, trivial copy kernel).
+# Most of the gap is per-call work that never changes for a given kernel:
+#   - nki's `Kernel.__call__` rebuilds the torch handle on every call
+#     (`nki.framework.kernel.wrap_nki_to_torch_hop`: `inspect.signature`, a
+#     fresh `TorchNativeKernel` hashed into the registry, LNC resolution):
+#     ~0.06 ms;
+#   - the `torch.library` custom-op layer (autograd and dispatcher hops, the
+#     int64-policy wrapper): ~0.01-0.02 ms.
+# So eager calls on plain neuron tensors build a handle once per kernel with
+# the public `torch_neuronx.wrap_nki` and call it directly (~0.02 ms). It is
+# the same kind of `NKIHOPCaller` that `Kernel.__call__` builds, for the same
+# registered kernel, but gridless, so NKI resolves the LNC grid itself
+# (checked on trn2: 2 programs per launch at LNC=2, 1 at LNC=1).
+# Under torch.compile, for tensor subclasses (fake / functional), tensors that
+# require grad, and int64 inputs (the custom op applies the TorchNeuron int64
+# policy), the custom op is used as before.
+# `TRNBLAS_NKI_EAGER_HANDLE=0` turns the fast path off.
+
+_EAGER_HANDLE_ENABLED: bool = os.environ.get(
+    "TRNBLAS_NKI_EAGER_HANDLE", "1"
+).strip().lower() not in ("0", "false", "no", "off")
+# id(kernel) -> (kernel, handle); holding the kernel keeps its id unique.
+_eager_handles: dict[int, tuple[Any, Any]] = {}
+_wrap_nki: Any = None  # torch_neuronx.wrap_nki, resolved on first use; False if absent
+
+
+def _eager_handle(kernel):
+    """Torch call handle for `kernel`, built once; None if unavailable."""
+    entry = _eager_handles.get(id(kernel))
+    if entry is not None:
+        return entry[1]
+    global _wrap_nki
+    if _wrap_nki is None:
+        try:
+            import torch_neuronx
+
+            _wrap_nki = getattr(torch_neuronx, "wrap_nki", False)
+        except ImportError:
+            _wrap_nki = False
+    if _wrap_nki is False or not hasattr(kernel, "func"):
+        return None  # no torch_neuronx.wrap_nki, or not an @nki.jit kernel
+    handle = _wrap_nki(kernel)
+    _eager_handles[id(kernel)] = (kernel, handle)
+    return handle
+
+
+def _eager_call_ok(tensors) -> bool:
+    """True when calling the cached handle is equivalent to the custom op."""
+    if not _EAGER_HANDLE_ENABLED or torch.compiler.is_compiling():
+        return False
+    for t in tensors:
+        if (
+            type(t) is not torch.Tensor
+            or t.device.type != _NEURON_DEVICE
+            or t.requires_grad
+            or t.dtype == torch.int64
+        ):
+            return False
+    return True
+
+
 def _call_kernel(kernel, op_name: str, *device_tensors: torch.Tensor) -> torch.Tensor:
     """Run one kernel on tensors already on the kernel device (see `_to_device`).
 
     `op_name` is the `trnblas::<op_name>` custom op used on the native path;
     the XLA path calls `kernel` directly on torch_xla tensors. Operand dtypes
-    are checked against `_KERNEL_DTYPES[op_name]` first (TypeError).
+    are checked against `_KERNEL_DTYPES[op_name]` first (TypeError). Eager
+    native calls on plain neuron tensors skip the custom-op layer through a
+    cached handle (see above).
     """
     _check_kernel_operands(op_name, *device_tensors)
     if _get_dispatch_path() == "native":
+        if _eager_call_ok(device_tensors):
+            handle = _eager_handle(kernel)
+            if handle is not None:
+                return handle(*device_tensors)
         return _get_native_ops()[op_name](*device_tensors)
     return kernel(*device_tensors)
 

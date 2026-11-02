@@ -9,6 +9,7 @@ CPU-only: `torch_neuronx` and `torch_xla` are replaced with stand-ins via
 """
 
 import importlib.util
+import os
 import subprocess
 import sys
 import types
@@ -298,6 +299,117 @@ class TestLaunchRouting:
         monkeypatch.setitem(sys.modules, "torch_xla", None)
         with pytest.raises(ImportError):
             dispatch._launch(lambda x: x, "syrk", torch.ones(1, 1))
+
+
+class _FakeKernel:
+    """Stands in for an `@nki.jit` kernel (has `.func`)."""
+
+    func = None
+
+
+class TestEagerHandle:
+    """Eager native calls go through a cached handle, not the custom op."""
+
+    @pytest.fixture
+    def eager(self, monkeypatch):
+        monkeypatch.setattr(dispatch, "_dispatch_path", "native")
+        monkeypatch.setattr(dispatch, "_eager_handles", {})
+        monkeypatch.setattr(dispatch, "_eager_call_ok", lambda tensors: True)
+        built = []
+
+        def wrap(kernel):
+            built.append(kernel)
+            return lambda *t: ("handle", t)
+
+        monkeypatch.setattr(dispatch, "_wrap_nki", wrap)
+
+        def op(*t):
+            return ("op", t)
+
+        monkeypatch.setattr(dispatch, "_native_ops", {"k": op})
+        return built
+
+    def test_handle_built_once_and_skips_op(self, eager):
+        k = _FakeKernel()
+        x = torch.ones(1)
+        for _ in range(3):
+            assert dispatch._call_kernel(k, "k", x)[0] == "handle"
+        assert eager == [k]
+
+    def test_one_handle_per_kernel(self, eager):
+        k1, k2 = _FakeKernel(), _FakeKernel()
+        dispatch._call_kernel(k1, "k", torch.ones(1))
+        dispatch._call_kernel(k2, "k", torch.ones(1))
+        dispatch._call_kernel(k1, "k", torch.ones(1))
+        assert eager == [k1, k2]
+
+    def test_non_jit_callable_uses_op(self, eager):
+        assert dispatch._call_kernel(lambda x: x, "k", torch.ones(1))[0] == "op"
+        assert eager == []
+
+    def test_no_handle_api_uses_op(self, eager, monkeypatch):
+        monkeypatch.setattr(dispatch, "_wrap_nki", False)
+        assert dispatch._call_kernel(_FakeKernel(), "k", torch.ones(1))[0] == "op"
+
+    def test_missing_nki_api_resolves_to_unavailable(self, monkeypatch):
+        monkeypatch.setattr(dispatch, "_eager_handles", {})
+        monkeypatch.setattr(dispatch, "_wrap_nki", None)
+        monkeypatch.setitem(sys.modules, "torch_neuronx", types.ModuleType("torch_neuronx"))
+        assert dispatch._eager_handle(_FakeKernel()) is None
+        assert dispatch._wrap_nki is False
+
+    def test_torch_neuronx_missing_resolves_to_unavailable(self, monkeypatch):
+        monkeypatch.setattr(dispatch, "_eager_handles", {})
+        monkeypatch.setattr(dispatch, "_wrap_nki", None)
+        monkeypatch.setitem(sys.modules, "torch_neuronx", None)
+        assert dispatch._eager_handle(_FakeKernel()) is None
+        assert dispatch._wrap_nki is False
+
+
+class TestEagerCallOk:
+    """Only plain, grad-free, non-int64 neuron tensors outside compile qualify."""
+
+    @pytest.fixture
+    def cpu_is_kernel_device(self, monkeypatch):
+        monkeypatch.setattr(dispatch, "_NEURON_DEVICE", "cpu")
+
+    def test_plain_tensors_accepted(self, cpu_is_kernel_device):
+        assert dispatch._eager_call_ok([torch.ones(2), torch.ones(3, dtype=torch.bfloat16)])
+
+    def test_requires_grad_rejected(self, cpu_is_kernel_device):
+        assert not dispatch._eager_call_ok([torch.ones(2), torch.ones(2, requires_grad=True)])
+
+    def test_int64_rejected(self, cpu_is_kernel_device):
+        assert not dispatch._eager_call_ok([torch.ones(2, dtype=torch.int64)])
+
+    def test_subclass_rejected(self, cpu_is_kernel_device):
+        assert not dispatch._eager_call_ok([torch.nn.Parameter(torch.ones(2), False)])
+
+    def test_cpu_tensors_rejected(self):
+        assert not dispatch._eager_call_ok([torch.ones(1)])
+
+    def test_flag_off(self, monkeypatch):
+        monkeypatch.setattr(dispatch, "_EAGER_HANDLE_ENABLED", False)
+        assert not dispatch._eager_call_ok([])
+
+    def test_compiling(self, monkeypatch):
+        monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+        assert not dispatch._eager_call_ok([])
+
+    def test_no_tensors_outside_compile(self):
+        assert dispatch._eager_call_ok([])
+
+    def test_flag_parsed_from_env(self):
+        code = "import trnblas.nki.dispatch as d; print(d._EAGER_HANDLE_ENABLED)"
+        for value, expect in (("0", "False"), ("off", "False"), ("1", "True"), ("", "True")):
+            out = subprocess.run(
+                [sys.executable, "-c", code],
+                env={**os.environ, "TRNBLAS_NKI_EAGER_HANDLE": value},
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+            assert out.splitlines()[-1] == expect, value
 
 
 @pytest.fixture
