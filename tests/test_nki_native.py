@@ -315,6 +315,64 @@ class TestNativeAutoRouting:
         assert _rel(C2, A.double() @ B.double()) < 1e-5
 
 
+class TestNativeLncGemm:
+    """The LNC-split GEMM kernels (#79) against a float64 product, at sizes
+    that hit every edge tile: M/N/K remainders, the odd row/column split of
+    an LNC=2 core (both programs store the shared row), the small-M column
+    split with 2048-wide B loads, and K chunk boundaries of the staged rows."""
+
+    SHAPES = [
+        (1, 1, 1),
+        (5, 7, 3),
+        (127, 129, 513),
+        (257, 640, 2049),
+        (1023, 1025, 1031),
+        (17, 130, 2051),
+        (64, 512, 4099),
+        (300, 4097, 200),
+        (129, 8193, 257),
+    ]
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize("M,K,N", SHAPES)
+    def test_kernels_match_fp64(self, M, K, N, dtype):
+        ops = D._get_native_ops()
+        A, B = _host(M, K).to(dtype), _host(K, N, seed=1).to(dtype)
+        ref = A.double() @ B.double()
+        a, b = A.to(DEV), B.to(DEV)
+        at = A.T.contiguous().to(DEV)
+        tol = 1e-5 if dtype == torch.float32 else 1e-2
+        for out in (ops["gemm_lnc"](a, b), ops["gemm_lnc_tn"](at, b)):
+            assert out.shape == (M, N) and out.dtype == dtype
+            assert _rel(out.cpu(), ref) < tol
+
+    def test_auto_routes_half_transform_to_kernel(self, monkeypatch):
+        """DF-MP2 half-transform (C_occ.T @ eri), fp32 device-resident: the
+        measured win region, so `auto` runs `_gemm_lnc_tn_kernel`."""
+        monkeypatch.delenv("TRNBLAS_NATIVE_GEMM", raising=False)
+        monkeypatch.setattr(D, "_backend", "auto")
+        monkeypatch.setattr(D, "_REQUIRE_NKI", True)
+        calls = []
+        real = D._nki_gemm_lnc
+        monkeypatch.setattr(D, "_nki_gemm_lnc", lambda *a: calls.append(1) or real(*a))
+        C_occ, eri = _host(256, 32), _host(256, 196608, seed=1)
+        out = trnblas.gemm(1.0, C_occ.to(DEV), eri.to(DEV), transA=True)
+        assert calls == [1]
+        assert _rel(out.cpu(), C_occ.double().T @ eri.double()) < 1e-5
+        # bf16 and row-major A stay on aten.
+        trnblas.gemm(1.0, C_occ.to(DEV).bfloat16(), eri.to(DEV).bfloat16(), transA=True)
+        trnblas.gemm(1.0, C_occ.T.contiguous().to(DEV), eri.to(DEV))
+        assert calls == [1]
+
+    def test_env_lnc_forces_row_major_kernel(self, monkeypatch):
+        monkeypatch.setenv("TRNBLAS_NATIVE_GEMM", "lnc")
+        monkeypatch.setattr(D, "_backend", "auto")
+        monkeypatch.setattr(D, "_REQUIRE_NKI", True)
+        A, B = _host(301, 200), _host(200, 613, seed=1)
+        out = trnblas.gemm(1.0, A.to(DEV), B.to(DEV))
+        assert _rel(out.cpu(), A.double() @ B.double()) < 1e-5
+
+
 class TestNativeMetricInvHalf:
     """`metric_inv_half` on a device-resident J: host LAPACK route vs device route."""
 

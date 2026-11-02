@@ -42,8 +42,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   float32/float64/bfloat16/float16/int32/int64/bool/complex inputs on the
   native, XLA and simulator paths. Open questions: #89 (energy result dtype),
   #90 (mixed-dtype GEMM operands).
+- **`metric_inv_half` with an integer `J` on the `neuron` device returned a
+  truncated integer factor** (silent, #86). The native host route computes
+  L^-T in float64 and cast it back to `J.dtype`, which turned most entries
+  into 0. The torch route raises for integer input. Every route now raises
+  `NotImplementedError`. Affects 0.8.0 through 0.9.1. Found by the round-3
+  device harness on Trn2 (trnsci/trnsci#35).
 
 ### Added
+
+- **LNC-split NKI GEMM for Trn2 (#79).** Two new kernels on the native path:
+  `_gemm_lnc_tn_kernel` (A given as A^T, e.g. a transposed view) and
+  `_gemm_lnc_kernel` (row-major A). Both are launched gridless and split C
+  over both physical cores of an LNC=2 logical core (`num_programs()` /
+  `program_id`; one program at LNC=1), keep a 512-row A^T block stationary in
+  SBUF over all of K with FP32 PSUM accumulation, load B in up to 2048-wide
+  tiles, and handle every M/K/N remainder in-kernel. No DMA transposes
+  (aws-neuron-sdk#1452): A^T comes from plain `nl.load`s, and row-major A is
+  transposed on the Tensor Engine. Results match aten's error against float64
+  at every awkward size tested. On the device the kernels run at aten's
+  Tensor Engine rate from ~4096³ up, but each custom-op launch costs ~0.1 ms
+  more host time than aten, so `auto` takes them only in the measured win
+  region: device-resident fp32 with A a transposed view, 16 ≤ M ≤ 64,
+  128 ≤ K ≤ 512, N ≥ 256·K and K·N ≥ 2^24. That is the DF-MP2 half-transform
+  `C_occ.T @ eri` from the umbrella profile's `l` size up (1.5-1.7x faster
+  than aten there). Everything else keeps aten. `TRNBLAS_NATIVE_GEMM=lnc`
+  forces the kernels for plain 2-D GEMMs. Tables: `docs/benchmarks.md` and
+  #79; harness: `scripts/bench_lnc_gemm.py`.
 
 - **Reference-conformance suite (trnsci/trnsci#105).** `tests/test_conformance.py`
   checks every public op against independent float64 torch formulas at sizes

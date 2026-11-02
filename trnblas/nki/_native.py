@@ -61,6 +61,21 @@ def gemm_ragged(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return _d._gemm_kernel_ragged(a, b)
 
 
+@nki_op("trnblas::gemm_lnc", mutates_args={}, fake_fn=_fake_gemm)
+def gemm_lnc(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    # Gridless LNC-split GEMM (#79): one program per physical core at LNC=2.
+    return _d._gemm_lnc_kernel(a, b)
+
+
+@nki_op(
+    "trnblas::gemm_lnc_tn",
+    mutates_args={},
+    fake_fn=lambda at, b: at.new_empty((at.shape[1], b.shape[1])),
+)
+def gemm_lnc_tn(at: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    return _d._gemm_lnc_tn_kernel(at, b)
+
+
 # ── SYRK ─────────────────────────────────────────────────────────────────────
 
 
@@ -173,6 +188,8 @@ def pair_energy_sym(
 OPS = {
     **{_d._gemm_op_name(*tile): _register_gemm(tile) for tile in _d._TILE_CANDIDATES},
     "gemm_ragged": gemm_ragged,
+    "gemm_lnc": gemm_lnc,
+    "gemm_lnc_tn": gemm_lnc_tn,
     "syrk": syrk,
     "mp2_energy": mp2_energy,
     "fused_gemm_energy": fused_gemm_energy,

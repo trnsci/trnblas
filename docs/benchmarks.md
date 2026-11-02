@@ -431,6 +431,151 @@ is v0.8 in the same session, run right after the "after" rows:
 - neuron mode (device-resident inputs) is unchanged within noise: v0.8 took
   21.0 / 17.1 ms (m) and 57.6 / 47.9 ms (l).
 
+## LNC-split GEMM on Trn2 (#79)
+
+`_gemm_lnc_tn_kernel` (A given as A^T) and `_gemm_lnc_kernel` (row-major A)
+replace the single-program kernel's design on the native path:
+
+- launched gridless, one program per physical core at LNC=2
+  (`num_programs()` / `program_id`): rows of C split in half, or columns when
+  M < 256; an odd split overlaps by one row/column, written identically by both;
+- a 512-row A^T block (at most 64 KiB per partition) stays stationary in SBUF
+  over all of K, and each B tile feeds every M tile; FP32 PSUM, at most 4
+  banks per block; B loads up to 2048 columns wide (small M);
+- no DMA transposes: A^T tiles are plain `nl.load`s; row-major A is staged
+  by DMA a block ahead and transposed on the Tensor Engine;
+- every M/K/N remainder in-kernel; no closure or global state in the kernels.
+
+trn2.3xlarge, SDK 2.33, one LNC=2 logical core (`NEURON_RT_VISIBLE_CORES=1`),
+host threads pinned to one physical core (`taskset -c 3,9`), device-resident
+operands built on the host, warm medians of one call plus a synchronize, in
+ms (`scripts/bench_lnc_gemm.py`). The chip was shared with three other
+agents' jobs; aten's own time for one shape moved by up to 15% between runs
+(4096³ bf16: 1.04–1.21 ms), so ratios within ~5% are ties.
+
+| M×K×N | dtype | aten (A row-major) | aten (A transposed view) | old NKI kernel | `_gemm_lnc_kernel` | `_gemm_lnc_tn_kernel` |
+|---|---|---|---|---|---|---|
+| 1024³ | fp32 | **0.154** | 0.166 | 0.349 | 0.245 | 0.234 |
+| 1024³ | bf16 | **0.105** | 0.121 | 0.233 | 0.184 | 0.179 |
+| 2048³ | fp32 | **0.552** | **0.552** | 1.75 | 0.667 | 0.657 |
+| 2048³ | bf16 | 0.229 | **0.222** | 0.610 | 0.306 | 0.291 |
+| 4096³ | fp32 | **3.72** | 3.86 | 11.5 | 3.90 | 3.88 |
+| 4096³ | bf16 | **1.04** | 1.24 | 6.19 | 1.18 | 1.12 |
+| 8192³ | fp32 | **31.9** | **31.7** | (116, #65) | 32.0 | 32.3 |
+| 8192³ | bf16 | 7.47 | 8.62 | (47, #65) | 7.62 | **7.37** |
+| DF-MP2 half m, 16×128×49152 | fp32 | **0.195** | 0.203 | 0.327 | 0.239 | 0.230 |
+| DF-MP2 half l, 32×256×196608 | fp32 | 0.921 | 0.930 | 1.06 | **0.599** | 0.603 |
+| DF-MP2 half xl, 48×384×442368 | fp32 | 2.68 | 2.69 | – | **1.56** | 1.57 |
+| DF-MP2 half xxl, 64×512×786432 | fp32 | **3.95** | 6.29 | – | 3.97 | 3.97 |
+| DF-MP2 half l, 32×256×196608 | bf16 | **0.295** | 0.306 | 0.990 | 0.428 | 0.421 |
+| DF-MP2 half xl, 48×384×442368 | bf16 | **0.739** | 0.743 | – | 1.07 | 1.06 |
+| DF-MP2 half xxl, 64×512×786432 | bf16 | **1.66** | 2.07 | – | 2.02 | 2.02 |
+| DF-MP2 metric m, 1792×384×384 | fp32 | **0.119** | 0.129 | 0.254 | 0.198 | 0.190 |
+| DF-MP2 metric l, 7168×768×768 | fp32 | 0.355 | **0.325** | 0.730 | 0.466 | 0.411 |
+| DF-MP2 metric xl, 16128×1152×1152 | fp32 | 1.28 | **1.22** | 2.65 | 1.58 | 1.33 |
+| DF-MP2 metric xxl, 28672×1536×1536 | fp32 | 3.91 | **3.77** | – | 4.31 | 3.98 |
+| DF-MP2 metric l, 7168×768×768 | bf16 | 0.173 | **0.163** | 0.356 | 0.267 | 0.252 |
+| DF-MP2 metric xl, 16128×1152×1152 | bf16 | 0.405 | **0.388** | 0.980 | 0.539 | 0.483 |
+| DF-MP2 metric xxl, 28672×1536×1536 | bf16 | **1.13** | 1.16 | – | 1.57 | 1.32 |
+
+- The new kernels are 1.2–5.5x faster than the old one at every shape both ran.
+- **Against aten they win only on the DF-MP2 half-transform in fp32**
+  (`C_occ.T @ eri`, a transposed small-M left operand and a very wide right
+  one): 1.5x at `l`, 1.7x at `xl`, and 1.6x against the transposed view at
+  `xxl` (aten on a contiguous copy of `C_occ.T` ties there). `auto` routes
+  that region to `_gemm_lnc_tn_kernel` (below). 8192³ bf16 from a transposed
+  view is 1.17x faster than aten on the same view, but it is one shape and
+  6144³ / 4096×8192×4096 bf16 did not repeat it, so it is not routed.
+- At 4096³ and 8192³ the kernels are within ±5% of aten. At the metric
+  shapes (K = N ≤ 1536) aten is 5–25% faster, and below 4096³ aten wins.
+- Each call of a TorchNeuron custom op costs about 0.1 ms of host time
+  (time to issue: 0.10–0.12 ms, against 0.014–0.024 ms for an aten matmul).
+  A synchronous call pays it in full, which is most of the gap at ≤ 2048³.
+  Issued back to back, so the host cost overlaps the device, 4096³ bf16 is
+  0.97 ms (kernel) against 0.98–1.15 ms (aten) and 1024³ fp32 0.126 against
+  0.091.
+
+Device time alone (`neuron-explorer capture` of each op's NEFF, LNC=2; no
+host issue cost), ms, with the Tensor Engine's busy fraction and the mean
+activity-throttle limit (1.0 = never throttled):
+
+| shape, dtype | aten | aten, transposed view | `_gemm_lnc_tn_kernel` | `_gemm_lnc_kernel` |
+|---|---|---|---|---|
+| 4096³ fp32 | 3.61 (99.4%, 0.99) | **3.56** (99.3%, 0.99) | 3.69 (96.1%, 0.97) | 3.71 (98.7%, 0.98) |
+| 4096³ bf16 | 0.972 (97.6%, 0.97) | 1.03 (96.8%, 0.96) | **0.965** (95.2%, 0.95) | 1.02 (98.0%, 0.95) |
+| 16128×1152×1152 bf16 | 0.333 (95.5%, 0.93) | – | **0.327** (90.9%, 0.90) | 0.392 (94.6%, 0.90) |
+| 32×256×196608 fp32 | – | 0.839 (97.9%) | **0.438** (89.7%, 0.88) | – |
+| 64×512×786432 fp32 | 3.75 (99.1%, 0.86) | 6.11 (96.2%, **0.61**) | **3.52** (94.6%, 0.90) | – |
+
+- On the device the kernels are at parity with aten from 4096³ up and on
+  the larger metric shapes; the synchronous-call gap there is the ~0.1 ms
+  custom-op issue cost.
+- `_gemm_lnc_tn_kernel` at 4096³ fp32 loses 2–4% at its three M-block
+  boundaries: the next block's A^T load (8 MiB per core) is not overlapped
+  with the current block, so the Tensor Engine idles 25–38 µs, and each idle
+  is followed by ~30 µs of activity throttling (half rate). Issuing the next
+  load explicitly before the current block's matmuls, or spread across its
+  N tiles, measured 1–3% slower (it queues ahead of the current block's B
+  tiles), so the kernel does not.
+- aten on the transposed view at DF-MP2 `xxl` spends a third of its time
+  throttled (mean limit 0.61, 266 throttle events); the kernel runs the same
+  bytes at 0.90. At `l`, aten issues 7680 matmuls against the kernel's 1529
+  (Tensor Engine busy 98% for 0.84 ms vs 90% for 0.44 ms).
+- The first version of the kernel transposed A on the Tensor Engine inside
+  each M block, waiting on 128×128 DMA loads: PE stalls of 3–7 µs at every
+  block boundary tripped the throttle each time (6.5% of the run at half
+  rate), 4.07 vs 3.70 ms at 4096³ fp32. Staging the next block's rows by
+  DMA a block ahead removed most of it (3.90).
+
+Win-region boundary, fp32, A a transposed view (aten on the same view):
+
+| M×K×N | K·N | aten | `_gemm_lnc_tn_kernel` | |
+|---|---|---|---|---|
+| 16×128×49152 | 6.3M | **0.203** | 0.230 | aten |
+| 16×256×49152 | 12.6M | 0.280 | 0.273 | tie |
+| 32×256×65536 | 16.8M | 0.375 | **0.306** | kernel |
+| 32×256×98304 | 25.2M | 0.519 | **0.375** | kernel |
+| 16×128×196608 | 25.2M | 0.471 | **0.440** | kernel |
+| 64×512×49152 | 25.2M | **0.317** | 0.387 | aten (N < 256 K) |
+| 128×512×65536 | 33.6M | **0.379** | 0.460 | aten (M > 64) |
+| 128×512×196608 | 101M | **0.898** | 1.03 | aten (M > 64) |
+| 192×512×65536 | 33.6M | **0.613** | 0.710 | aten |
+| 8×64×393216 | 25.2M | **0.801** | 0.890 | aten (M < 16, K < 128) |
+
+The rule (`_lnc_gemm_wins`): fp32, A a transposed view, 16 ≤ M ≤ 64,
+128 ≤ K ≤ 512, N ≥ 256·K and K·N ≥ 2^24. bf16 never qualifies: aten on the
+transposed view is 1.1–2.6x faster at every bf16 small-M shape measured but
+`xxl` (2.07 vs 2.02 ms, where aten on contiguous A takes 1.66).
+
+Umbrella DF-MP2 profile (`examples/quantum_chemistry/df_mp2_profile.py`,
+trnsci/trnsci main, `--modes neuron --pipelines example`), warm ms, same
+session; "before" is `TRNBLAS_NATIVE_GEMM=aten` (the previous `auto` for
+device-resident operands):
+
+| size (ao/aux/occ) | half-transform before → after | total before → after | half `gemm` route after |
+|---|---|---|---|
+| m (128/384/16) | 0.7 → 0.7 | 18.0 → 14.8 | aten |
+| l (256/768/32) | 1.5 → 1.4 | 52.4 → 52.7 | kernel |
+| xl (384/1152/48) | 3.6 → 2.6 | 152.4 → 148.5 | kernel |
+
+The half-transform is a small part of the pipeline (the metric and energy
+steps dominate), so the end-to-end change is within run-to-run noise: `m`
+takes the same routes in both runs and still moved 18.0 → 14.8 ms.
+B and the energy match to the same relative error (1.9–2.0e-7, ≤ 6.9e-8).
+
+**LNC=1** (`NEURON_LOGICAL_NC_CONFIG=1`, one physical core): the same
+picture at about twice the time. 4096³ fp32: aten 7.28, kernel 7.45 (LNC=2:
+3.72 / 3.88, so the kernel scales 1.92x from one to two physical cores);
+DF-MP2 half `l` fp32: 1.74 vs 0.99; `xxl`: 8.68 (transposed view) / 6.58
+(contiguous) vs 6.40.
+
+**Accuracy.** Relative error against a float64 product equals aten's
+(fp32 1.2–2.8e-7, bf16 1.6–1.7e-3, the bf16 output rounding) at
+1×1×1, 5×7×3, 127×129×513, 129×4097×130, 257×640×2049, 300×1000×700 (and
+±1 in each dimension), 1023×1025×1031, 2047×63×1999, 300×8300×200,
+17×12289×300 and 129×16385×257 (fp32 3.1e-7 against aten's 2.1e-7), at
+LNC=2 and LNC=1, with the NKI trace cache on and off.
+
 ## DF-MP2 end-to-end — Trainium1 vs NVIDIA A10G
 
 Synthetic inputs, same seed, same three shapes on both platforms.

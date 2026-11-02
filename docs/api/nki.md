@@ -17,8 +17,10 @@ What `auto` does depends on the dispatch path (v0.9.0, #62, #63):
 
 - **Native (TorchNeuron, Trn2/Trn3)**: `gemm`, `batched_gemm`, `syrk`,
   `symm` and left `trsm` are routed by measured time. Device-resident
-  operands run as aten on the `neuron` device; aten beat the NKI GEMM at
-  every measured shape (2.4–3.2× for plain GEMM). Host operands run on the
+  operands run as aten on the `neuron` device, except one region where the
+  LNC-split GEMM kernel (#79) is faster: fp32 `gemm` with A a transposed
+  view, 16 ≤ M ≤ 64, 128 ≤ K ≤ 512, N ≥ 256·K and K·N ≥ 2^24 (the DF-MP2
+  half-transform `C_occ.T @ eri`). Host operands run on the
   host CPU below a per-op size threshold and as one upload + aten + one
   download above it; host `trsm` solves with LAPACK on the host. For
   device-resident inputs, the DF-MP2 pair energy
@@ -67,7 +69,7 @@ See [Installation](../installation.md#two-neuron-pytorch-lineages).
 | `TRNBLAS_USE_SIMULATOR=1` | Route kernel dispatch through `nki.simulate(kernel)(numpy_args)` on CPU. Bypasses `torch_xla` + NEFF compile; used for fast correctness iteration. See [docs/developing_kernels.md](../developing_kernels.md). |
 | `TRNSCI_NKI_DISPATCH=auto\|native\|xla` | Suite-wide. Forces the native or XLA dispatch path. |
 | `TRNBLAS_BATCHED_PAIR_CHUNK_THRESHOLD=<n>` | Overrides batched-pair routing (default 4096 on XLA, 3072 on native). |
-| `TRNBLAS_NATIVE_GEMM=auto\|nki\|aten\|host` | Native path. Overrides the measured GEMM-family route; see [Installation](../installation.md#runtime-environment-variables). |
+| `TRNBLAS_NATIVE_GEMM=auto\|nki\|aten\|host\|lnc` | Native path. Overrides the measured GEMM-family route; see [Installation](../installation.md#runtime-environment-variables). |
 
 ## GEMM kernel
 

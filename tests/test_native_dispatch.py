@@ -26,6 +26,8 @@ _REAL_FIND_SPEC = importlib.util.find_spec
 GEMM_OPS = {f"gemm_{tm}_{tk}_{tn}" for tm, tk, tn in dispatch._TILE_CANDIDATES}
 EXPECTED_OPS = GEMM_OPS | {
     "gemm_ragged",
+    "gemm_lnc",
+    "gemm_lnc_tn",
     "syrk",
     "mp2_energy",
     "fused_gemm_energy",
@@ -327,6 +329,8 @@ def native_stub(monkeypatch):
 
     for name in (
         "_gemm_kernel_ragged",
+        "_gemm_lnc_kernel",
+        "_gemm_lnc_tn_kernel",
         "_syrk_kernel",
         "_mp2_energy_kernel",
         "_fused_gemm_energy_kernel",
@@ -348,7 +352,8 @@ def native_stub(monkeypatch):
         return op
 
     pair = 128
-    ops = {n: rec(n, lambda a, b: a @ b) for n in GEMM_OPS | {"gemm_ragged"}}
+    ops = {n: rec(n, lambda a, b: a @ b) for n in GEMM_OPS | {"gemm_ragged", "gemm_lnc"}}
+    ops["gemm_lnc_tn"] = rec("gemm_lnc_tn", lambda at, b: at.T @ b)
     ops["syrk"] = rec("syrk", lambda a: a @ a.T)
     ops["mp2_energy"] = rec(
         "mp2_energy", lambda t, ec, ef, vc, vr: torch.zeros(1, ec.shape[1] * ef.shape[1])
@@ -744,6 +749,113 @@ class TestNativeGemmPolicy:
         assert not dispatch._gemm_via_aten(torch.randn(2, 2))
 
 
+class TestLncGemmRouting:
+    """`auto` takes the LNC-split GEMM (#79) only in its measured win region:
+    device-resident fp32, A a transposed view, 16 <= M <= 64, 128 <= K <= 512,
+    N >= 256 K, K * N >= 2^24."""
+
+    @pytest.fixture
+    def resident(self, monkeypatch, native_stub):
+        monkeypatch.setattr(dispatch, "_backend", "auto")
+        monkeypatch.delenv("TRNBLAS_NATIVE_GEMM", raising=False)
+        monkeypatch.setattr(dispatch, "_on_neuron_device", lambda *t: True)
+        monkeypatch.setattr(dispatch, "_on_host", lambda *t: False)
+        monkeypatch.setattr(dispatch, "_upload", lambda t: t)
+        return native_stub
+
+    @staticmethod
+    def _half_transform(nocc=32, nao=256, n=1 << 17, dtype=torch.float32):
+        # C_occ.T @ eri_flat: a transposed (nocc, nao) view and a wide B.
+        # K * N = nao * n; B is a zero-stride expand so the test stays small.
+        c_occ = torch.randn(nao, nocc, dtype=dtype)
+        return c_occ.T, torch.randn(nao, 1, dtype=dtype).expand(nao, n)
+
+    def test_win_region_routes_to_tn_kernel(self, resident, monkeypatch):
+        A, B = self._half_transform()
+        assert dispatch._lnc_gemm_wins(A, B)
+        assert dispatch._gemm_route(A, B) == "lnc"
+        # Run it at a size a unit test can hold.
+        monkeypatch.setattr(dispatch, "_LNC_GEMM_N_PER_K", 0)
+        monkeypatch.setattr(dispatch, "_LNC_GEMM_MIN_KN", 0)
+        A, B = torch.randn(256, 32).T, torch.randn(256, 64)
+        torch.testing.assert_close(dispatch.nki_gemm(A, B), A @ B)
+        assert resident == ["gemm_lnc_tn"]
+
+    def test_tn_kernel_gets_dense_base(self, resident, monkeypatch):
+        monkeypatch.setattr(dispatch, "_LNC_GEMM_N_PER_K", 0)
+        monkeypatch.setattr(dispatch, "_LNC_GEMM_MIN_KN", 0)
+        A, B = torch.randn(256, 32).T, torch.randn(256, 64)
+        seen = []
+        ops = dict(dispatch._native_ops)
+        ops["gemm_lnc_tn"] = lambda at, b: seen.append((at.is_contiguous(), at.shape)) or at.T @ b
+        monkeypatch.setattr(dispatch, "_native_ops", ops)
+        dispatch.nki_gemm(A, B)
+        assert seen == [(True, (256, 32))]
+
+    def test_outside_win_region_stays_aten(self, resident):
+        A, B = self._half_transform()
+        # contiguous A, bf16, M > 128, small K * N
+        assert dispatch._gemm_route(A.contiguous(), B) == "aten"
+        Ab, Bb = self._half_transform(dtype=torch.bfloat16)
+        assert dispatch._gemm_route(Ab, Bb) == "aten"
+        for nocc, nao, n in ((8, 256, 1 << 17), (65, 256, 1 << 17), (32, 64, 1 << 17)):
+            A2, B2 = self._half_transform(nocc=nocc, nao=nao, n=n)
+            assert dispatch._gemm_route(A2, B2) == "aten", (nocc, nao, n)
+        A3, B3 = self._half_transform(nao=512, n=256 * 512 - 1)  # N < 256 K
+        assert dispatch._gemm_route(A3, B3) == "aten"
+        A3, B3 = self._half_transform(nao=128, n=(1 << 17) - 1)  # K * N < 2^24
+        assert dispatch._gemm_route(A3, B3) == "aten"
+        A4, B4 = self._half_transform(nao=640, n=1 << 18)  # K > 512
+        assert dispatch._gemm_route(A4, B4) == "aten"
+        # DF-MP2 half-transform ladder (nocc, nao, nao * naux): m stays on
+        # aten, l / xl / xxl take the kernel.
+        for nocc, nao, naux, want in (
+            (16, 128, 384, "aten"),
+            (32, 256, 768, "lnc"),
+            (48, 384, 1152, "lnc"),
+            (64, 512, 1536, "lnc"),
+        ):
+            A5, B5 = self._half_transform(nocc=nocc, nao=nao, n=nao * naux)
+            assert dispatch._gemm_route(A5, B5) == want, (nocc, nao)
+        assert resident == []
+
+    def test_only_plain_gemm_routes_to_lnc(self, resident):
+        A, B = self._half_transform()
+        assert dispatch._gemm_route(A, B, op="batched_gemm") == "aten"
+        assert dispatch._gemm_route(A, B, op="syrk") == "aten"
+
+    def test_host_operands_unaffected(self, resident, monkeypatch):
+        monkeypatch.setattr(dispatch, "_on_neuron_device", lambda *t: False)
+        monkeypatch.setattr(dispatch, "_on_host", lambda *t: True)
+        A, B = self._half_transform()
+        assert dispatch._gemm_route(A, B) in ("aten", "host")
+
+    def test_env_lnc_forces_kernel(self, resident, monkeypatch):
+        monkeypatch.setenv("TRNBLAS_NATIVE_GEMM", "lnc")
+        A, B = torch.randn(300, 70), torch.randn(70, 50)
+        assert dispatch._gemm_route(A, B) == "lnc"
+        torch.testing.assert_close(dispatch.nki_gemm(A, B), A @ B)
+        assert resident == ["gemm_lnc"]
+        assert dispatch._gemm_route(A, B, op="syrk") == "aten"
+        assert dispatch._gemm_route(A.double(), B.double()) == "aten"
+
+    def test_kernel_failure_falls_back_to_aten(self, resident, monkeypatch):
+        monkeypatch.setattr(dispatch, "_REQUIRE_NKI", False)
+        ops = dict(dispatch._native_ops)
+
+        def broken(at, b):
+            raise RuntimeError("compile failed")
+
+        ops["gemm_lnc_tn"] = broken
+        monkeypatch.setattr(dispatch, "_native_ops", ops)
+        monkeypatch.setattr(dispatch, "_LNC_GEMM_N_PER_K", 0)
+        monkeypatch.setattr(dispatch, "_LNC_GEMM_MIN_KN", 0)
+        A, B = torch.randn(256, 32).T, torch.randn(256, 64)
+        with pytest.warns(dispatch.NkiFallbackWarning):
+            out = dispatch.nki_gemm(A, B)
+        torch.testing.assert_close(out, A @ B)
+
+
 class TestPairEnergySym:
     """Host-side logic of the native LNC=2 symmetric pair-energy kernel."""
 
@@ -832,6 +944,14 @@ class TestMetricInvHalf:
         n = dispatch._METRIC_HOST_MAX_NAUX
         assert dispatch._metric_solve_route(torch.empty(n, n)) == "host"
         assert dispatch._metric_solve_route(torch.empty(n + 1, n + 1)) == "device"
+
+    @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+    def test_integer_metric_raises_on_the_host_route(self, native_nki, dtype):
+        """The host route used to truncate the float64 factor to J's int dtype (#86)."""
+        J = (torch.eye(4) * 10 + 1).to(dtype)
+        assert dispatch._metric_solve_route(J) == "host"
+        with pytest.raises(NotImplementedError, match="floating point"):
+            trnblas.metric_inv_half(J)
 
     def test_route_env_override(self, native_nki, monkeypatch):
         monkeypatch.setenv("TRNBLAS_METRIC_SOLVE", "device")
