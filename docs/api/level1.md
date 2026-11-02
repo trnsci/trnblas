@@ -21,8 +21,12 @@ In-place scaling `x = α·x`.
 
 ## `asum(x)`
 
-Sum of absolute values `Σ|xᵢ|`.
+Sum of absolute values `Σ|xᵢ|`, as BLAS `?asum`. For complex `x` this is
+`Σ(|Re xᵢ| + |Im xᵢ|)`, as `scasum` / `dzasum` / `cublasScasum`, not the
+modulus (since 0.11.0, #75). The result is real.
 
 ## `iamax(x)`
 
-Index of element with largest absolute value.
+0-based index of the first element of largest absolute value, as BLAS
+`i?amax` (cuBLAS is 1-based). For complex `x` the magnitude is
+`|Re xᵢ| + |Im xᵢ|`, as `icamax` / `izamax` (since 0.11.0, #75).
