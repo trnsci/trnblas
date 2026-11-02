@@ -96,6 +96,16 @@ _KERNELS = {
     # Every remainder branch (M, K and N edge tiles plus the corner).
     "gemm_ragged": (lambda d: d._gemm_kernel_ragged, lambda: (_f32(300, 200), _f32(200, 600))),
     "gemm_ragged_small": (lambda d: d._gemm_kernel_ragged, lambda: (_f32(1, 1), _f32(1, 1))),
+    # LNC-split GEMM (#79): M, N and K remainders, the row split (M >= 256)
+    # and the column split (small M), from row-major A and from A^T.
+    "gemm_lnc": (lambda d: d._gemm_lnc_kernel, lambda: (_f32(301, 200), _f32(200, 613))),
+    "gemm_lnc_small_m": (lambda d: d._gemm_lnc_kernel, lambda: (_f32(17, 130), _f32(130, 2051))),
+    "gemm_lnc_tn": (lambda d: d._gemm_lnc_tn_kernel, lambda: (_f32(200, 301), _f32(200, 613))),
+    "gemm_lnc_tn_small_m": (
+        lambda d: d._gemm_lnc_tn_kernel,
+        lambda: (_f32(130, 17), _f32(130, 2051)),
+    ),
+    "gemm_lnc_tiny": (lambda d: d._gemm_lnc_kernel, lambda: (_f32(1, 1), _f32(1, 1))),
     "syrk": (lambda d: d._syrk_kernel, lambda: (_f32(256, 128),)),
     "mp2_energy": (lambda d: d._mp2_energy_kernel, _mp2_inputs),
     "fused_gemm_energy": (lambda d: d._fused_gemm_energy_kernel, _fused_inputs),
@@ -107,7 +117,14 @@ _KERNELS = {
 # Native-only kernels that split work across the cores of an LNC=2 logical
 # core by program_id (and degrade to one program at LNC=1): verified on trn2
 # at both lnc=1 and lnc=2, the only target they are dispatched on.
-_LNC2 = {"pair_energy_sym"}
+_LNC2 = {
+    "pair_energy_sym",
+    "gemm_lnc",
+    "gemm_lnc_small_m",
+    "gemm_lnc_tn",
+    "gemm_lnc_tn_small_m",
+    "gemm_lnc_tiny",
+}
 
 
 @pytest.fixture(autouse=True)
