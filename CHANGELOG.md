@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Complex `asum` and `iamax` use the BLAS magnitude |Re| + |Im| (#75).
+  Results change for complex input.** Through 0.10.0 they used the modulus
+  |x|, unlike `scasum`/`dzasum`/`icamax`/`izamax` and their cuBLAS
+  equivalents. Now `asum(x)` returns `sum(|Re x_i| + |Im x_i|)`, which is up
+  to √2 larger than the old value, and `iamax(x)` picks the largest
+  `|Re x_i| + |Im x_i|`, so it can return a different index (for
+  `[3, 2+2j]` it now returns 1, not 0). Real input is unchanged. This is a
+  correctness fix to match BLAS, with no deprecation period. To keep the old
+  values, use `x.abs().sum()` and `x.abs().argmax()`. `iamax` stays 0-based
+  (cuBLAS is 1-based); the docstring and `docs/api/level1.md` now say so.
+
 ## [0.10.0] — 2026-11-02
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.

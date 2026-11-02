@@ -16,8 +16,8 @@ and fp64 ``gradcheck``/``gradgradcheck``.
 
 Known needs-decision behaviour is ``xfail(strict=True)`` with the issue
 number, so the case flips to XPASS (a failure) once it is decided:
-trnblas#74 (``syrk`` ignores ``uplo``) and trnblas#75 (complex ``asum`` /
-``iamax`` use the modulus, not BLAS |Re|+|Im|).
+trnblas#74 (``syrk`` ignores ``uplo``). trnblas#75 is decided: complex
+``asum`` / ``iamax`` use BLAS |Re|+|Im| (``scasum`` / ``icamax``).
 
 CPU CI runs it with the defaults (``pytest -m "not neuron"``). On a Trainium
 box the same cases run through the NKI/auto paths with device inputs::
@@ -148,6 +148,11 @@ def _sym(A, uplo):
     return t + t.mT - torch.diag(torch.diag(A))
 
 
+def _abs1(x):
+    """BLAS |x|: |Re| + |Im| for complex (scasum / icamax)."""
+    return x.real.abs() + x.imag.abs() if x.is_complex() else x.abs()
+
+
 def _addC(r, beta, C):
     return r + beta * C if (C is not None and beta != 0.0) else r
 
@@ -207,7 +212,7 @@ REF = {
     "dot": lambda x, y: (x.reshape(-1) * y.reshape(-1)).sum(),
     "nrm2": lambda x: x.reshape(-1).abs().pow(2).sum().sqrt(),
     "scal": lambda alpha, x: alpha * x,
-    "asum": lambda x: x.reshape(-1).abs().sum(),  # modulus: documented (see #75)
+    "asum": lambda x: _abs1(x.reshape(-1)).sum(),  # BLAS |Re|+|Im| for complex (#75)
     "gemv": R_gemv,
     "symv": R_symv,
     "trmv": R_trmv,
@@ -331,7 +336,7 @@ def test_level1_stride0():
 
 
 def _iamax_ref(x):
-    return int(torch.argmax(hi(x).reshape(-1).abs()).item())
+    return int(torch.argmax(_abs1(hi(x).reshape(-1))).item())
 
 
 @P("dtype", DTYPES, ids=_id)
@@ -350,15 +355,7 @@ def test_iamax_first_of_ties_and_matrix():
     assert tb.iamax(to_dev(A.mT)) == _iamax_ref(A.mT)
 
 
-# BLAS (and cuBLAS icamax/scasum) use |Re| + |Im| for complex input.
-_75 = pytest.mark.xfail(
-    strict=True,
-    reason="trnsci/trnblas#75 needs decision: complex asum/iamax use the modulus, "
-    "BLAS uses |Re|+|Im|",
-)
-
-
-@_75
+# BLAS (and cuBLAS icamax/scasum) use |Re| + |Im| for complex input (#75).
 @P("dtype", [C64, C128], ids=_id)
 def test_asum_complex_blas(dtype):
     x = torch.tensor([3 + 4j, -1 + 2j, 0.5 - 0.5j], dtype=dtype)
@@ -366,7 +363,6 @@ def test_asum_complex_blas(dtype):
     assert torch.allclose(hi(tb.asum(to_dev(x))), hi(want))
 
 
-@_75
 @P("dtype", [C64, C128], ids=_id)
 def test_iamax_complex_blas(dtype):
     # modulus picks 0 (3 > 2.83); |Re|+|Im| picks 1 (4 > 3).
