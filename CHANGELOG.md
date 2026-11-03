@@ -114,6 +114,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   BLAS would read only the diagonal of such a C; the fallback will be removed
   in a later minor release. Same rule as trnsparse `spmv_symmetric`
   (trnsci/trnsparse#52). A diagonal-only C gives no warning.
+- **Complex `asum` and `iamax` use the BLAS magnitude |Re| + |Im| (#75).
+  Results change for complex input.** Through 0.10.0 they used the modulus
+  |x|, unlike `scasum`/`dzasum`/`icamax`/`izamax` and their cuBLAS
+  equivalents. Now `asum(x)` returns `sum(|Re x_i| + |Im x_i|)`, which is up
+  to √2 larger than the old value, and `iamax(x)` picks the largest
+  `|Re x_i| + |Im x_i|`, so it can return a different index (for
+  `[3, 2+2j]` it now returns 1, not 0). Real input is unchanged. This is a
+  correctness fix to match BLAS, with no deprecation period. To keep the old
+  values, use `x.abs().sum()` and `x.abs().argmax()`. `iamax` stays 0-based
+  (cuBLAS is 1-based); the docstring and `docs/api/level1.md` now say so.
+### Fixed
+
+- **Mixed-dtype GEMM operands raise the same error as `torch.matmul` on every
+  backend (#90).** The NKI dtype check looked at each operand on its own, so
+  `gemm(1.0, A_fp32, B_bf16)` (and `batched_gemm`, `symm`) took the NKI kernel
+  route under `set_backend("nki")`, the XLA path or `TRNBLAS_NATIVE_GEMM=nki`/`lnc`,
+  and returned a result in the left operand's dtype, where the pytorch backend
+  raises `RuntimeError`. Affects 0.2.0 through 0.10.0. Mixed operands now go to
+  torch before any kernel route and raise torch's error (also under
+  `TRNBLAS_REQUIRE_NKI=1`). A mixed `trsm` computes in torch, as on the pytorch
+  backend.
 
 ## [0.10.0] — 2026-11-02
 

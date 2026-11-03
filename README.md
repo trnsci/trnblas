@@ -154,6 +154,18 @@ Runs SCF + density fitting via PySCF, feeds the integrals through trnblas, and c
 - [x] Benchmarks vs cuBLAS
 - [ ] Double-double FP64 emulation
 
+## Known issues in earlier releases
+
+Silent wrong-result bugs fixed in the 2026-10-31 to 2026-11-02 releases. Upgrade to 0.10.0 or later. Details are in [CHANGELOG.md](CHANGELOG.md).
+
+| Bug | Affected | Fixed in |
+|-----|----------|----------|
+| BLAS letter flags (`uplo="U"`, `diag="U"`, `trans="N"`) ran the opposite branch (#73) | 0.2.0–0.9.1, every backend | 0.10.0 |
+| `gemm(transA=True)` / `transB=True` on batched (>= 3-D) operands reversed every dimension (#72) | 0.2.0–0.9.1, every backend | 0.10.0 |
+| `batched_gemm` on the NKI route ignored batch broadcasting and returned only `A[0] @ B[0]` (#84) | 0.3.0–0.9.1, NKI route | 0.10.0 |
+| `metric_inv_half` with an integer `J` on the `neuron` device returned a truncated (mostly zero) factor (#86) | 0.8.0–0.9.1, native route | 0.10.0 |
+| float64 `gemm` / `syrk` / `trsm` under `set_backend("nki")` returned non-finite values (#68) | 0.2.0–0.9.0, `set_backend("nki")` | 0.9.1 |
+
 ## Related Projects
 
 | Project | What |

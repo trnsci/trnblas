@@ -1256,3 +1256,75 @@ class TestKernelDtypes:
         A = torch.randn(150, 140, dtype=torch.float64)
         with pytest.raises(NotImplementedError, match="float64"):
             trnblas.gemm(1.0, A, A.T)
+
+
+class TestMixedDtypeOperands:
+    """Mixed GEMM operands (fp32 @ bf16) raise torch.matmul's error on every
+    route, before any kernel (#90). Each operand used to be checked on its
+    own, so a mixed call took the NKI GEMM route under set_backend("nki")."""
+
+    @pytest.fixture
+    def nki_backend(self, monkeypatch):
+        from trnblas.nki import dispatch
+
+        seen = []
+
+        def gemm_impl(A, B):
+            seen.append((A.dtype, B.dtype))
+            return A @ B.to(A.dtype)
+
+        monkeypatch.setattr(dispatch, "_backend", "nki")
+        monkeypatch.setattr(dispatch, "_nki_gemm_impl", gemm_impl)
+        return seen
+
+    @staticmethod
+    def _torch_error(fn):
+        with pytest.raises(RuntimeError) as exc:
+            fn()
+        return str(exc.value)
+
+    @pytest.mark.parametrize("require_nki", [False, True])
+    def test_gemm_raises_like_torch(self, nki_backend, monkeypatch, require_nki):
+        import trnblas
+        from trnblas.nki import dispatch
+
+        monkeypatch.setattr(dispatch, "_REQUIRE_NKI", require_nki)
+        A = torch.randn(150, 140)
+        B = torch.randn(140, 130, dtype=torch.bfloat16)
+        msg = self._torch_error(lambda: torch.matmul(A, B))
+        with pytest.raises(RuntimeError) as exc:
+            trnblas.gemm(1.0, A, B)
+        assert str(exc.value) == msg
+        msg = self._torch_error(lambda: torch.matmul(A[None], B[None]))
+        with pytest.raises(RuntimeError) as exc:
+            trnblas.batched_gemm(1.0, A[None], B[None])
+        assert str(exc.value) == msg
+        assert nki_backend == []
+
+    def test_trsm_matches_pytorch_backend(self, nki_backend):
+        import trnblas
+
+        g = torch.Generator().manual_seed(0)
+        T = torch.randn(300, 300, generator=g) * 0.05 + 2 * torch.eye(300)
+        R = torch.randn(300, 20, generator=g).to(torch.bfloat16)
+        X = trnblas.trsm(0.7, T, R, side="left", uplo="lower")
+        trnblas.set_backend("pytorch")
+        try:
+            ref = trnblas.trsm(0.7, T, R, side="left", uplo="lower")
+        finally:
+            trnblas.set_backend("auto")
+        assert X.dtype == ref.dtype
+        torch.testing.assert_close(X, ref)
+        assert nki_backend == []
+
+    @pytest.mark.parametrize("policy", ["nki", "lnc", "aten", "host", "auto"])
+    def test_native_route_is_torch(self, monkeypatch, policy):
+        from trnblas.nki import dispatch
+
+        monkeypatch.setattr(dispatch, "_use_nki", lambda: True)
+        monkeypatch.setattr(dispatch, "_get_dispatch_path", lambda: "native")
+        monkeypatch.setattr(dispatch, "_native_gemm_policy", lambda: policy)
+        A = torch.randn(64, 64)
+        B = torch.randn(64, 64, dtype=torch.bfloat16)
+        assert dispatch._gemm_route(A, B) == "torch"
+        assert dispatch._trsm_route(A, B) == "torch"

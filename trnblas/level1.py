@@ -39,13 +39,31 @@ def scal(alpha: float, x: torch.Tensor) -> torch.Tensor:
     return alpha * x
 
 
+def _abs1(x: torch.Tensor) -> torch.Tensor:
+    """BLAS |x|: |Re x| + |Im x| for complex input (scasum/icamax), |x| for real."""
+    if x.is_complex():
+        return x.real.abs() + x.imag.abs()
+    return torch.abs(x)
+
+
 @_fp64_host_guard("asum")
 def asum(x: torch.Tensor) -> torch.Tensor:
-    """Sum of absolute values: sum(|x_i|)"""
-    return torch.abs(x).sum()
+    """Sum of absolute values, as BLAS ``?asum``: sum(|x_i|) for real x.
+
+    For complex x this is sum(|Re x_i| + |Im x_i|), as ``scasum`` /
+    ``dzasum`` / ``cublasScasum`` (not the modulus; changed in 0.11.0, #75).
+    The result is real.
+    """
+    return _abs1(x).sum()
 
 
 @_fp64_host_guard("iamax")
 def iamax(x: torch.Tensor) -> int:
-    """Index of element with maximum absolute value."""
-    return torch.argmax(torch.abs(x.reshape(-1))).item()
+    """0-based index of the first element of largest absolute value.
+
+    As BLAS ``i?amax``, but 0-based (cuBLAS ``cublasIsamax`` is 1-based). For
+    complex x the magnitude is |Re x_i| + |Im x_i|, as ``icamax`` /
+    ``izamax`` (not the modulus; changed in 0.11.0, #75). A matrix is
+    flattened in row-major order.
+    """
+    return torch.argmax(_abs1(x.reshape(-1))).item()
