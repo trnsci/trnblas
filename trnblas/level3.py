@@ -134,7 +134,7 @@ def batched_gemm(
     return _scale_add(nki_batched_gemm(a, b), alpha, beta, C)
 
 
-@_fp64_host_guard("symm")
+@_fp64_host_guard("symm", kernel=False)
 def symm(
     alpha: float,
     A: torch.Tensor,
@@ -317,7 +317,7 @@ def metric_inv_half(J: torch.Tensor) -> torch.Tensor:
     return nki_metric_inv_half(J)
 
 
-@_fp64_host_guard("trmm")
+@_fp64_host_guard("trmm", kernel=False)
 def trmm(
     alpha: float,
     A: torch.Tensor,

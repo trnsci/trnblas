@@ -810,6 +810,81 @@ class TestNativeGemmPolicy:
         ref = torch.linalg.solve_triangular(L.float(), B.float(), upper=False)
         torch.testing.assert_close(X.float(), ref, atol=2e-2, rtol=2e-2)
 
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+    @pytest.mark.parametrize("uplo", ["lower", "upper"])
+    @pytest.mark.parametrize("trans", [False, True])
+    @pytest.mark.parametrize("diag", ["nonunit", "unit"])
+    def test_trsm_host_route_keeps_autograd(self, nki_backend, dtype, uplo, trans, diag):
+        """Native `auto` host route: gradients reach A and B and match torch (#101).
+
+        `_trsm_on_host` used to detach both operands (0.9.0-0.11.0), so
+        `trsm` and trnsolver's `eigh_generalized` lost their gradients on a
+        Neuron host.
+        """
+        g = torch.Generator().manual_seed(101)
+        n, k = 9, 4
+        A0 = torch.randn(n, n, generator=g, dtype=dtype) * 0.3 + 3 * torch.eye(n, dtype=dtype)
+        B0 = torch.randn(n, k, generator=g, dtype=dtype)
+        W = torch.randn(n, k, generator=g, dtype=dtype)
+        assert dispatch._trsm_route(A0, B0) == "host"
+
+        A, B = A0.clone().requires_grad_(True), B0.clone().requires_grad_(True)
+        X = trnblas.trsm(0.7, A, B, uplo=uplo, trans=trans, diag=diag)
+        assert X.requires_grad and X.grad_fn is not None
+        (X * W).sum().backward()
+
+        Ar, Br = A0.clone().requires_grad_(True), B0.clone().requires_grad_(True)
+        tri = torch.triu(Ar) if uplo == "upper" else torch.tril(Ar)
+        if diag == "unit":
+            tri = tri - torch.diag(torch.diag(tri)) + torch.eye(n, dtype=dtype)
+        mat = tri.T if trans else tri
+        upper = (uplo == "upper") != trans
+        Xr = 0.7 * torch.linalg.solve_triangular(mat, Br, upper=upper)
+        (Xr * W).sum().backward()
+
+        tol = {"atol": 1e-5, "rtol": 1e-5} if dtype == torch.float32 else {}
+        torch.testing.assert_close(X, Xr, **tol)
+        torch.testing.assert_close(A.grad, Ar.grad, **tol)
+        torch.testing.assert_close(B.grad, Br.grad, **tol)
+
+    def test_trsm_host_route_gradcheck(self, nki_backend):
+        """float64 gradcheck / gradgradcheck through the native `auto` host route (#101)."""
+        g = torch.Generator().manual_seed(7)
+        n = 5
+        A = torch.randn(n, n, generator=g, dtype=torch.float64) + 4 * torch.eye(
+            n, dtype=torch.float64
+        )
+        B = torch.randn(n, 3, generator=g, dtype=torch.float64)
+        assert dispatch._trsm_route(A, B) == "host"
+        A.requires_grad_(True)
+        B.requires_grad_(True)
+
+        def f(a, b):
+            return trnblas.trsm(1.0, a, b, side="left", uplo="lower")
+
+        assert torch.autograd.gradcheck(f, (A, B))
+        assert torch.autograd.gradgradcheck(f, (A, B))
+
+    def test_trsm_host_route_bf16_keeps_autograd(self, nki_backend):
+        """bf16 host operands solve in fp32 and still carry gradients (#101)."""
+        L = (torch.tril(torch.randn(16, 16)) * 0.1 + 4 * torch.eye(16)).bfloat16()
+        B = torch.randn(16, 3).bfloat16()
+        L.requires_grad_(True)
+        B.requires_grad_(True)
+        X = dispatch.nki_trsm(L, B, uplo="lower")
+        assert X.dtype == torch.bfloat16 and X.requires_grad
+        X.float().sum().backward()
+        assert L.grad is not None and L.grad.dtype == torch.bfloat16
+        assert B.grad is not None and B.grad.dtype == torch.bfloat16
+
+    def test_trsm_host_route_no_grad_unchanged(self, nki_backend):
+        """Operands without requires_grad: same values, no graph."""
+        L = torch.tril(torch.randn(32, 32)) + 32 * torch.eye(32)
+        B = torch.randn(32, 5)
+        X = trnblas.trsm(1.0, L, B, uplo="lower")
+        assert not X.requires_grad
+        torch.testing.assert_close(L @ X, B, atol=1e-5, rtol=1e-5)
+
     def test_env_overrides(self, monkeypatch, nki_backend):
         A, B = torch.randn(64, 64), torch.randn(64, 64)
         monkeypatch.setenv("TRNBLAS_NATIVE_GEMM", "aten")
@@ -1090,6 +1165,37 @@ class TestMetricInvHalf:
         monkeypatch.setattr(dispatch, "_use_simulator", lambda: False)
         monkeypatch.setattr(dispatch, "_backend", "pytorch")
         assert dispatch._metric_solve_route(torch.empty(8, 8)) == "device"
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+    def test_host_route_keeps_autograd(self, native_nki, dtype):
+        """The host metric factor is differentiable in J and matches torch (#101).
+
+        `_host_inv_chol_factor` used to detach J (0.8.0-0.11.0).
+        """
+        n = 7
+        J0 = self._spd(n, seed=3, dtype=dtype)
+        W = torch.randn(n, n, generator=torch.Generator().manual_seed(4), dtype=dtype)
+        assert dispatch._metric_solve_route(J0) == "host"
+
+        J = J0.clone().requires_grad_(True)
+        X = trnblas.metric_inv_half(J)
+        assert X.requires_grad and X.dtype == dtype
+        (X * W).sum().backward()
+
+        Jr = J0.clone().requires_grad_(True)
+        Lr = torch.linalg.cholesky(Jr.double())
+        Xr = torch.linalg.solve_triangular(Lr.T, torch.eye(n, dtype=torch.float64), upper=True)
+        (Xr.to(dtype) * W).sum().backward()
+
+        tol = {"atol": 1e-5, "rtol": 1e-5} if dtype == torch.float32 else {}
+        torch.testing.assert_close(X, Xr.to(dtype), **tol)
+        torch.testing.assert_close(J.grad, Jr.grad, **tol)
+
+    def test_host_route_gradcheck(self, native_nki):
+        J = self._spd(5, seed=5, dtype=torch.float64).requires_grad_(True)
+        assert dispatch._metric_solve_route(J) == "host"
+        # Cholesky reads one triangle; check through a symmetric parametrisation.
+        assert torch.autograd.gradcheck(lambda a: trnblas.metric_inv_half(0.5 * (a + a.T)), (J,))
 
     @pytest.mark.parametrize("n", [1, 7, 71, 300])
     def test_host_factor_is_inverse_cholesky(self, n):

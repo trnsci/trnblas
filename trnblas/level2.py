@@ -12,7 +12,7 @@ from ._flags import diag_flag, trans_flag, uplo_flag
 from .nki.dispatch import _fp64_host_guard
 
 
-@_fp64_host_guard("gemv")
+@_fp64_host_guard("gemv", kernel=False)
 def gemv(
     alpha: float,
     A: torch.Tensor,
@@ -33,7 +33,7 @@ def gemv(
     return result
 
 
-@_fp64_host_guard("symv")
+@_fp64_host_guard("symv", kernel=False)
 def symv(
     alpha: float,
     A: torch.Tensor,
@@ -57,7 +57,7 @@ def symv(
     return result
 
 
-@_fp64_host_guard("trmv")
+@_fp64_host_guard("trmv", kernel=False)
 def trmv(
     A: torch.Tensor,
     x: torch.Tensor,
@@ -85,7 +85,7 @@ def trmv(
     return torch.mv(mat, x)
 
 
-@_fp64_host_guard("ger")
+@_fp64_host_guard("ger", kernel=False)
 def ger(
     alpha: float,
     x: torch.Tensor,

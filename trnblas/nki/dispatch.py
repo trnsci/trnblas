@@ -473,7 +473,25 @@ def _warn_fp64_host(op: str) -> None:
     )
 
 
-def _fp64_host_guard(op: str):
+def _warn_fp32_device(op: str) -> None:
+    """One UserWarning per op (shared with `_warn_fp32_cast`): explicit `nki`,
+    an op with no NKI kernel, float64 / complex128 on the neuron device, so
+    device aten computes it at fp32 precision."""
+    if op in _fp32_cast_warned:
+        return
+    _fp32_cast_warned.add(op)
+    warnings.warn(
+        f"trnblas {op}: set_backend('nki') has no NKI kernel for this op, so float64 / "
+        "complex128 operands on the neuron device run on device aten; precision is reduced to "
+        "float32 (device arithmetic is fp32; the result keeps its dtype). Use "
+        "set_backend('auto') for float64 accuracy on the host, or set "
+        "TRNBLAS_REQUIRE_NKI=1 to raise instead.",
+        UserWarning,
+        stacklevel=3,
+    )
+
+
+def _fp64_host_guard(op: str, kernel: bool = True):
     """Decorator for a public op: device-resident float64 runs on the host.
 
     Applies under `set_backend("auto")` when some tensor argument is float64
@@ -482,6 +500,11 @@ def _fp64_host_guard(op: str):
     the op runs there (host float64 takes host torch), and tensor results
     are moved back to the device of the first such operand, in their dtype.
     Nested guarded calls inside the host call do nothing.
+
+    `kernel=False` marks an op with no NKI kernel (Level 1/2, `symm`,
+    `trmm`): under an explicit `set_backend("nki")` its device-resident
+    float64 / complex128 runs on device aten at fp32 precision, which warns
+    once per op, as the kernel ops' float32 cast does (`_warn_fp32_cast`).
     """
 
     def deco(fn):
@@ -490,6 +513,14 @@ def _fp64_host_guard(op: str):
             nested = getattr(_fp64_host_state, "active", False)
             if _REQUIRE_NKI and not nested and _use_nki():
                 _refuse_device_fp64(op, (args, kwargs))
+            if (
+                not kernel
+                and _backend == "nki"
+                and not nested
+                and _use_nki()
+                and _any_tensor((args, kwargs), _fp64_device_resident)
+            ):
+                _warn_fp32_device(op)
             if (
                 _backend != "auto"
                 or _FP64_ON_DEVICE
@@ -1124,11 +1155,16 @@ def _trsm_route(A: torch.Tensor, B: torch.Tensor) -> str:
 def _trsm_on_host(
     alpha: float, A: torch.Tensor, B: torch.Tensor, uplo: str, trans: bool, diag: str
 ) -> torch.Tensor:
-    """Left TRSM with LAPACK on the host; the result has B's device and dtype."""
+    """Left TRSM with LAPACK on the host; the result has B's device and dtype.
+
+    Differentiable: the copies and casts are autograd ops and the solve is
+    `torch.linalg.solve_triangular`, so gradients reach A and B (#101; the
+    operands were detached in 0.9.0-0.11.0).
+    """
     dev, dt = B.device, B.dtype
     cdt = torch.float32 if dt in (torch.bfloat16, torch.float16) else dt
-    Ah = A.detach().to(device="cpu", dtype=cdt)
-    Bh = B.detach().to(device="cpu", dtype=cdt)
+    Ah = A.to(device="cpu", dtype=cdt)
+    Bh = B.to(device="cpu", dtype=cdt)
     X = _trsm_torch(alpha, Ah, Bh, "left", uplo, trans, diag)
     if X.dtype != dt:
         X = X.to(dt)
@@ -1288,8 +1324,11 @@ def _host_inv_chol_factor(J: torch.Tensor) -> torch.Tensor:
     torch's own LAPACK, not SciPy's: a second BLAS runtime in the process
     brings a second spinning thread pool, which on a few pinned cores made
     torch's own LAPACK calls several times slower when the two interleaved.
+
+    Differentiable in J (every step is an autograd op; J was detached in
+    0.8.0-0.11.0, #101).
     """
-    Jd = J.detach().to(device="cpu", dtype=torch.float64)
+    Jd = J.to(device="cpu", dtype=torch.float64)
     L, info = torch.linalg.cholesky_ex(Jd)
     if int(info) != 0:
         raise torch.linalg.LinAlgError(

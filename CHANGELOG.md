@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Autograd on the native `auto` host routes (#101).** On a Neuron host
+  (TorchNeuron dispatch) under the default `auto` backend, `trsm` on host
+  operands went through `_trsm_on_host`, which detached `A` and `B` before
+  the LAPACK solve, so the result had no graph and gradients silently
+  stopped. trnsolver's `eigh_generalized` inherited it (its eigenvalues came
+  back with `requires_grad=False`). Affected 0.9.0–0.11.0. The host solve
+  now keeps autograd (the copies, casts and `torch.linalg.solve_triangular`
+  are all differentiable); values, routing, the float64 policy and the
+  kernel dtype guard are unchanged. The same `.detach()` was in the host
+  route of `metric_inv_half` for a device-resident metric `J`
+  (`_host_inv_chol_factor`, 0.8.0–0.11.0, under `auto` and `nki`), fixed
+  the same way. CPU-only hosts, the `pytorch` backend, and `trsm` under
+  `nki` were not affected.
+- **Explicit `nki`, ops with no kernel: device float64 now warns.** Under
+  `set_backend("nki")`, the ops with no NKI kernel (`axpy`, `dot`, `nrm2`,
+  `scal`, `asum`, `iamax`, `gemv`, `symv`, `trmv`, `ger`, `symm`, `trmm`)
+  computed float64 / complex128 operands on the `neuron` device on device
+  aten at fp32 precision with no warning (probe table on #91). They now
+  emit the policy's one `UserWarning` per op ("precision is reduced to
+  float32"), as the kernel ops do for their float32 cast. Values, routing,
+  `auto`, `pytorch`, host operands and `TRNBLAS_REQUIRE_NKI=1` (which still
+  raises first) are unchanged.
+
 ## [0.11.0] — 2026-11-04
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
