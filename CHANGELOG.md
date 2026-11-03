@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.1] — 2026-11-04
+
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
+
+Headline: trsm and metric_inv_half keep autograd on native auto host routes (#101); no-kernel ops warn on device float64 under explicit nki.
+
 ### Fixed
 
 - **Autograd on the native `auto` host routes (#101).** On a Neuron host
