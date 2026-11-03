@@ -481,3 +481,103 @@ class TestNativeHostOutput:
         R = _host(n, 1024, seed=2)
         T = trnblas.trsm(1.0, L, R, uplo="lower")
         assert _rel(L.double() @ T.double(), R.double()) < 1e-5
+
+
+class TestNativeAutoAutograd:
+    """Under the default `auto` backend the host routes keep autograd (#101).
+
+    In 0.9.0-0.11.0 `_trsm_on_host` detached host operands (and since 0.8.0
+    `_host_inv_chol_factor` detached J), so `trsm` and trnsolver's
+    `eigh_generalized` returned results without a graph on a Neuron host.
+    No custom op runs on these routes (NKI kernels are not differentiable).
+    """
+
+    @pytest.fixture
+    def auto(self, monkeypatch):
+        old = trnblas.get_backend()
+        trnblas.set_backend("auto")
+        monkeypatch.delenv("TRNBLAS_NATIVE_GEMM", raising=False)
+        monkeypatch.delenv("TRNBLAS_METRIC_SOLVE", raising=False)
+        monkeypatch.setattr(D, "_nki_gemm_impl", lambda *a: pytest.fail("NKI GEMM launched"))
+        yield
+        trnblas.set_backend(old)
+
+    @staticmethod
+    def _ref_trsm(alpha, A, B, uplo, trans):
+        tri = torch.tril(A) if uplo == "lower" else torch.triu(A)
+        mat = tri.T if trans else tri
+        return alpha * torch.linalg.solve_triangular(mat, B, upper=(uplo == "upper") != trans)
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+    @pytest.mark.parametrize(("uplo", "trans"), [("lower", False), ("upper", True)])
+    def test_trsm_host_operands_keep_grad(self, auto, dtype, uplo, trans):
+        n, k = 64, 16
+        A0 = (torch.tril(_host(n, n)) * 0.05 + 3 * torch.eye(n)).to(dtype)
+        if uplo == "upper":
+            A0 = A0.T.contiguous()
+        B0, W = _host(n, k, seed=1).to(dtype), _host(n, k, seed=2).to(dtype)
+        assert D._trsm_route(A0, B0) == "host"
+        A, B = A0.clone().requires_grad_(True), B0.clone().requires_grad_(True)
+        X = trnblas.trsm(0.5, A, B, uplo=uplo, trans=trans)
+        assert X.requires_grad and X.device.type == "cpu"
+        (X * W).sum().backward()
+        Ar, Br = A0.clone().requires_grad_(True), B0.clone().requires_grad_(True)
+        (self._ref_trsm(0.5, Ar, Br, uplo, trans) * W).sum().backward()
+        tol = {"atol": 1e-5, "rtol": 1e-4} if dtype == torch.float32 else {}
+        torch.testing.assert_close(A.grad, Ar.grad, **tol)
+        torch.testing.assert_close(B.grad, Br.grad, **tol)
+
+    def test_trsm_host_gradcheck(self, auto):
+        A = (_host(6, 6).double() + 4 * torch.eye(6, dtype=torch.float64)).requires_grad_(True)
+        B = _host(6, 3, seed=1).double().requires_grad_(True)
+        assert D._trsm_route(A, B) == "host"
+
+        def f(a, b):
+            return trnblas.trsm(1.0, a, b, side="left", uplo="lower")
+
+        assert torch.autograd.gradcheck(f, (A, B))
+        assert torch.autograd.gradgradcheck(f, (A, B))
+
+    def test_metric_inv_half_device_J_keeps_grad(self, auto):
+        n = 71
+        R = _host(n, n, seed=5).double()
+        J0 = (R @ R.T / n + torch.eye(n, dtype=torch.float64)).float()
+        W = _host(n, n, seed=6)
+        J = J0.to(DEV).requires_grad_(True)
+        assert D._metric_solve_route(J) == "host"
+        X = trnblas.metric_inv_half(J)
+        assert X.requires_grad and X.device.type == DEV
+        (X * W.to(DEV)).sum().backward()
+        assert J.grad is not None and J.grad.device.type == DEV
+        Jr = J0.detach().double().requires_grad_(True)
+        Lr = torch.linalg.cholesky(Jr)
+        Xr = torch.linalg.solve_triangular(Lr.T, torch.eye(n, dtype=torch.float64), upper=True)
+        (Xr * W.double()).sum().backward()
+        assert _rel(J.grad.cpu(), Jr.grad) < 1e-5
+
+    def test_trnsolver_eigh_generalized_grad(self, auto):
+        trnsolver = pytest.importorskip("trnsolver")
+        n = 5
+        R, S = _host(n, n, seed=7).double(), _host(n, n, seed=8).double()
+        A = (0.5 * (R + R.T)).requires_grad_(True)
+        B = (S @ S.T / n + torch.eye(n, dtype=torch.float64)).requires_grad_(True)
+        w = trnsolver.eigh_generalized(A, B)[0]
+        assert w.requires_grad, "eigh_generalized output detached from its inputs"
+
+        def f(a, b):
+            return trnsolver.eigh_generalized(0.5 * (a + a.T), 0.5 * (b + b.T))[0]
+
+        assert torch.autograd.gradcheck(f, (A, B))
+
+        def fr(a, b):  # torch: eigenvalues of L^-1 A L^-T
+            L = torch.linalg.cholesky(0.5 * (b + b.T))
+            Li = torch.linalg.solve_triangular(L, torch.eye(n, dtype=b.dtype), upper=False)
+            return torch.linalg.eigvalsh(Li @ (0.5 * (a + a.T)) @ Li.T)
+
+        gw = torch.arange(1.0, n + 1, dtype=torch.float64)
+        w, wr = f(A, B), fr(A, B)
+        torch.testing.assert_close(w, wr)
+        ga, gb = torch.autograd.grad((w * gw).sum(), (A, B))
+        gar, gbr = torch.autograd.grad((wr * gw).sum(), (A, B))
+        torch.testing.assert_close(ga, gar)
+        torch.testing.assert_close(gb, gbr)

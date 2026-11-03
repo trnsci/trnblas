@@ -1124,11 +1124,16 @@ def _trsm_route(A: torch.Tensor, B: torch.Tensor) -> str:
 def _trsm_on_host(
     alpha: float, A: torch.Tensor, B: torch.Tensor, uplo: str, trans: bool, diag: str
 ) -> torch.Tensor:
-    """Left TRSM with LAPACK on the host; the result has B's device and dtype."""
+    """Left TRSM with LAPACK on the host; the result has B's device and dtype.
+
+    Differentiable: the copies and casts are autograd ops and the solve is
+    `torch.linalg.solve_triangular`, so gradients reach A and B (#101; the
+    operands were detached in 0.9.0-0.11.0).
+    """
     dev, dt = B.device, B.dtype
     cdt = torch.float32 if dt in (torch.bfloat16, torch.float16) else dt
-    Ah = A.detach().to(device="cpu", dtype=cdt)
-    Bh = B.detach().to(device="cpu", dtype=cdt)
+    Ah = A.to(device="cpu", dtype=cdt)
+    Bh = B.to(device="cpu", dtype=cdt)
     X = _trsm_torch(alpha, Ah, Bh, "left", uplo, trans, diag)
     if X.dtype != dt:
         X = X.to(dt)
@@ -1288,8 +1293,11 @@ def _host_inv_chol_factor(J: torch.Tensor) -> torch.Tensor:
     torch's own LAPACK, not SciPy's: a second BLAS runtime in the process
     brings a second spinning thread pool, which on a few pinned cores made
     torch's own LAPACK calls several times slower when the two interleaved.
+
+    Differentiable in J (every step is an autograd op; J was detached in
+    0.8.0-0.11.0, #101).
     """
-    Jd = J.detach().to(device="cpu", dtype=torch.float64)
+    Jd = J.to(device="cpu", dtype=torch.float64)
     L, info = torch.linalg.cholesky_ex(Jd)
     if int(info) != 0:
         raise torch.linalg.LinAlgError(
