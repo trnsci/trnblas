@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-11-04
+
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
+
+Headline: the trnsci float64 policy with one dtype check at the NKI kernel boundary (#89, #91); `syrk` honours `uplo` as in BLAS (#74); complex `asum`/`iamax` use |Re|+|Im| (#75); mixed-dtype GEMM raises like `torch.matmul` (#90).
+
 ### Changed
 
 - **float64 policy (suite-wide, #89; behaviour change).** float64 under
