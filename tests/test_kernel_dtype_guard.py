@@ -929,21 +929,58 @@ def test_device_float64_host_path_is_auto_only(fake_neuron, backend, name):
     assert got.dtype == ref.dtype
 
 
-@pytest.mark.parametrize("name", ["gemm", "trsm", "nki_mp2_energy", "nki_batched_pair_energy"])
-def test_require_nki_device_float64_skips_host_path(fake_neuron, monkeypatch, name):
-    """TRNBLAS_REQUIRE_NKI=1 keeps refusing float64: no host copy, no warning."""
+# TRNBLAS_REQUIRE_NKI=1 with float64 / complex128 on the neuron device: every
+# public op raises, before any host copy, kernel or device aten. The routes
+# with no kernel (`auto` gemm / batched_gemm / syrk / symm / trsm on device
+# aten, Level 1/2) used to compute them at fp32 precision with no error.
+REQUIRE_DEV_CASES = [(n, d, e) for n, d, e in DEV_CASES]
+
+
+@pytest.mark.parametrize("backend", ["auto", "nki"])
+@pytest.mark.parametrize("name,d,e", REQUIRE_DEV_CASES, ids=[_id(c) for c in REQUIRE_DEV_CASES])
+def test_require_nki_device_float64_raises(fake_neuron, monkeypatch, backend, name, d, e):
     monkeypatch.setattr(dispatch, "_REQUIRE_NKI", True)
-    fn, args, _ = _dev_case(name, F64, F32)
+    monkeypatch.setattr(dispatch, "_on_neuron_device", lambda *t: True)  # device routes
+    fn, args, _ = _dev_case(name, d, e)
     dev_args = [fake_neuron.mark(a) for a in args]
-    dispatch.set_backend("auto")
+    dispatch.set_backend(backend)
     with warnings.catch_warnings(record=True) as rec:
         warnings.simplefilter("always")
-        if name in ENERGY_APIS:
-            with pytest.raises(NotImplementedError):
-                fn(*dev_args)
-        else:
-            fn(*dev_args)  # native `auto` GEMM family: torch, nothing to refuse
-    assert not fake_neuron.down and not _host_warnings(rec)
+        with pytest.raises(NotImplementedError, match="TRNBLAS_REQUIRE_NKI") as err:
+            fn(*dev_args)
+    assert f"trnblas {DEV_OP[name]}:" in str(err.value)
+    assert "neuron device" in str(err.value)
+    assert not fake_neuron.down and not fake_neuron.up  # no host copy
+    assert not fake_neuron.stubs.calls  # no kernel
+    assert not _host_warnings(rec) and not _cast_warnings(rec)
+
+
+@pytest.mark.parametrize("name", ["gemm", "symm", "dot", "trsm"])
+def test_require_nki_device_float64_raises_ahead_of_the_override(fake_neuron, monkeypatch, name):
+    """REQUIRE_NKI takes precedence over TRNBLAS_FP64_ON_DEVICE=1 (device aten)."""
+    monkeypatch.setattr(dispatch, "_REQUIRE_NKI", True)
+    monkeypatch.setattr(dispatch, "_FP64_ON_DEVICE", True)
+    monkeypatch.setattr(dispatch, "_on_neuron_device", lambda *t: True)
+    fn, args, _ = _dev_case(name, F64, F32)
+    dispatch.set_backend("auto")
+    with pytest.raises(NotImplementedError, match="TRNBLAS_REQUIRE_NKI"):
+        fn(*[fake_neuron.mark(a) for a in args])
+
+
+@pytest.mark.parametrize("name", ["gemm", "symm", "dot", "trsm"])
+def test_require_nki_device_refusal_leaves_other_inputs(fake_neuron, monkeypatch, name):
+    """Under REQUIRE_NKI: device float32 runs, host float64 keeps its host
+    torch route, and the pytorch backend ignores the variable."""
+    monkeypatch.setattr(dispatch, "_REQUIRE_NKI", True)
+    dispatch.set_backend("auto")
+    fn, args32, _ = _dev_case(name, F32, F32)
+    fn(*[fake_neuron.mark(a) for a in args32])
+    fn, args, ref = _dev_case(name, F64, F32)
+    torch.testing.assert_close(fn(*args), ref, rtol=1e-12, atol=1e-12)
+    dispatch.set_backend("pytorch")
+    got = fn(*[fake_neuron.mark(a) for a in args])
+    assert got.dtype == ref.dtype
+    assert not fake_neuron.down
 
 
 @pytest.mark.parametrize("name", ["gemm", "symm", "nki_mp2_energy", "metric_inv_half"])

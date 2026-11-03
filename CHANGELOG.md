@@ -41,7 +41,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     dtype is not cast (torch semantics, as before; #90 is separate).
   - `TRNBLAS_REQUIRE_NKI=1`: float64 raises `NotImplementedError` (the
     #68 `_no_kernel_for_dtype` convention) before any cast; it takes
-    precedence over the `nki` cast.
+    precedence over the `nki` cast. float64 / complex128 on the `neuron`
+    device raise at every public op (backends `auto` and `nki`, ahead of
+    `TRNBLAS_FP64_ON_DEVICE=1`), with no host copy. Before, the routes with
+    no kernel computed them in device aten at fp32 precision with no error:
+    `gemm`, `batched_gemm`, `syrk`, `symm` and left `trsm` under `auto` on
+    the native path, `symm` under `nki`, and Level 1/2.
   - Result dtype: every route returns what the pytorch backend returns for
     the same inputs. The GEMM family already did; the energy kernels
     (`nki_mp2_energy`, `nki_fused_gemm_energy`, `nki_batched_pair_energy`

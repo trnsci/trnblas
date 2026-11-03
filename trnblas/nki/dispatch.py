@@ -373,7 +373,12 @@ def _as_result_dtype(out, dtype: torch.dtype):
 # float64) and the result comes back to the original device in float64, with
 # one UserWarning per op. TRNBLAS_FP64_ON_DEVICE=1 keeps device aten (fp32
 # precision) for callers who prefer speed. Host-resident float64 is unchanged
-# (host torch). TRNBLAS_REQUIRE_NKI=1 still raises for float64 (no host copy).
+# (host torch). TRNBLAS_REQUIRE_NKI=1 raises NotImplementedError for float64 /
+# complex128 on the neuron device at every public op, with no host copy
+# (`_refuse_device_fp64`), under `auto` and `nki` alike and ahead of
+# TRNBLAS_FP64_ON_DEVICE: no NKI kernel computes them at float64 accuracy,
+# and the routes without a kernel (device aten: `auto` gemm, symm, Level 1/2)
+# would compute them at fp32 precision with no error.
 _FP64_ON_DEVICE = os.environ.get("TRNBLAS_FP64_ON_DEVICE", "").lower() in ("1", "true", "yes")
 _FP64_DTYPES = frozenset({torch.float64, torch.complex128})
 _fp64_host_warned: set[str] = set()
@@ -434,6 +439,26 @@ def _first_tensor(obj, pred):
     return None
 
 
+def _refuse_device_fp64(op: str, obj) -> None:
+    """Under TRNBLAS_REQUIRE_NKI (NKI backends), raise for float64 / complex128
+    on the neuron device anywhere in `obj` (see the section comment above)."""
+    found: list[torch.Tensor] = []
+
+    def visit(t):
+        if _fp64_device_resident(t):
+            found.append(t)
+        return t
+
+    _map_tensors(obj, visit)
+    if found:
+        dts = sorted({str(t.dtype) for t in found})
+        raise NotImplementedError(
+            f"trnblas {op}: no NKI kernel computes {dts} on the neuron device at float64 "
+            "accuracy (device arithmetic is fp32). Unset TRNBLAS_REQUIRE_NKI to compute "
+            "on the host at float64 accuracy, or pass float32."
+        )
+
+
 def _warn_fp64_host(op: str) -> None:
     """One UserWarning per op: device-resident float64 computed on the host."""
     if op in _fp64_host_warned:
@@ -453,7 +478,7 @@ def _fp64_host_guard(op: str):
 
     Applies under `set_backend("auto")` when some tensor argument is float64
     or complex128 on the `neuron` device, unless TRNBLAS_FP64_ON_DEVICE=1 or
-    TRNBLAS_REQUIRE_NKI=1. Neuron-resident operands are copied to the host,
+    TRNBLAS_REQUIRE_NKI=1 (which raises for such operands, `_refuse_device_fp64`). Neuron-resident operands are copied to the host,
     the op runs there (host float64 takes host torch), and tensor results
     are moved back to the device of the first such operand, in their dtype.
     Nested guarded calls inside the host call do nothing.
@@ -462,6 +487,9 @@ def _fp64_host_guard(op: str):
     def deco(fn):
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
+            nested = getattr(_fp64_host_state, "active", False)
+            if _REQUIRE_NKI and not nested and _use_nki():
+                _refuse_device_fp64(op, (args, kwargs))
             if (
                 _backend != "auto"
                 or _FP64_ON_DEVICE

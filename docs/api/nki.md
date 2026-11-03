@@ -46,7 +46,7 @@ accuracy. trnblas follows the trnsci suite-wide policy (#89):
 |---|---|
 | `set_backend("auto")` | Run in host torch at float64 accuracy. No kernel is called. float64 / complex128 operands already on the `neuron` device are copied to the host, computed there, and the result is returned on the device in float64 (one `UserWarning` per op; see below). |
 | `set_backend("nki")` | Cast to float32, run on the NKI kernel, result cast back. One `UserWarning` per op says precision is reduced to float32. |
-| `TRNBLAS_REQUIRE_NKI=1` | `NotImplementedError`. Takes precedence over the `nki` cast. |
+| `TRNBLAS_REQUIRE_NKI=1` | `NotImplementedError`. Takes precedence over the `nki` cast. float64 / complex128 on the `neuron` device raise at every public op, including the routes with no kernel (see below). |
 | `set_backend("pytorch")` | torch, as always. |
 
 - **Device-resident float64.** On Trainium, aten on the `neuron` device
@@ -62,8 +62,13 @@ accuracy. trnblas follows the trnsci suite-wide policy (#89):
   the device at full speed, pass float32. Host-resident float64 is unchanged
   (host torch), and with this release a forced `TRNBLAS_NATIVE_GEMM=aten|lnc`
   no longer uploads host float64 to device aten unless
-  `TRNBLAS_FP64_ON_DEVICE=1` is set. `set_backend("nki")`, `"pytorch"` and
-  `TRNBLAS_REQUIRE_NKI=1` are not affected. The `trnblas.parallel`
+  `TRNBLAS_FP64_ON_DEVICE=1` is set. `set_backend("nki")` and `"pytorch"`
+  are not affected. Under `TRNBLAS_REQUIRE_NKI=1` (backends `auto` and
+  `nki`), a float64 / complex128 operand on the device raises
+  `NotImplementedError` at every public op, with no host copy, ahead of
+  `TRNBLAS_FP64_ON_DEVICE`; before, the routes with no kernel (`auto`
+  GEMM-family device aten, `symm`, Level 1/2) computed it at fp32 precision
+  with no error. The `trnblas.parallel`
   (multi-process) helpers are float32 pipelines and are not covered.
 - The GEMM / SYRK kernels take float32, bfloat16 and float16 (FP32 PSUM
   accumulation, output in the input dtype). The DF-MP2 energy kernels take
