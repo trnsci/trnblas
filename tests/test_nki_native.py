@@ -581,3 +581,67 @@ class TestNativeAutoAutograd:
         gar, gbr = torch.autograd.grad((wr * gw).sum(), (A, B))
         torch.testing.assert_close(ga, gar)
         torch.testing.assert_close(gb, gbr)
+
+
+class TestNativeNoKernelFloat64Warning:
+    """Explicit `nki`, ops with no kernel, float64 on the device: device aten at
+    fp32 precision with one UserWarning per op (probe table on #91)."""
+
+    @pytest.fixture
+    def nki_backend(self, monkeypatch):
+        old = trnblas.get_backend()
+        trnblas.set_backend("nki")
+        monkeypatch.setattr(D, "_fp32_cast_warned", set())
+        monkeypatch.setattr(D, "_fp64_host_warned", set())
+        yield
+        trnblas.set_backend(old)
+
+    @staticmethod
+    def _cases():
+        S = _host(64, 64, seed=3).double()
+        return {
+            "symm": (
+                lambda A, B: trnblas.symm(1.0, A, B),
+                (S + S.T, _host(64, 32, seed=4).double()),
+            ),
+            "dot": (trnblas.dot, (_host(4096, seed=5).double(), _host(4096, seed=6).double())),
+        }
+
+    @pytest.mark.parametrize("name", ["symm", "dot"])
+    def test_device_float64_warns_once(self, nki_backend, name):
+        import warnings
+
+        fn, args = self._cases()[name]
+        ref = fn(*args)
+        dev = [a.to(DEV) for a in args]
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            outs = [fn(*dev) for _ in range(3)]
+        msgs = [w for w in rec if "precision is reduced to float32" in str(w.message)]
+        assert len(msgs) == 1, [str(w.message) for w in rec]
+        assert f"trnblas {name}:" in str(msgs[0].message)
+        for got in outs:
+            assert got.device.type == "neuron" and got.dtype == torch.float64
+            assert _rel(got.cpu(), ref) < 1e-5  # fp32 precision, as the warning says
+
+    @pytest.mark.parametrize("name", ["symm", "dot"])
+    def test_require_nki_still_raises(self, nki_backend, monkeypatch, name):
+        monkeypatch.setattr(D, "_REQUIRE_NKI", True)
+        fn, args = self._cases()[name]
+        with pytest.raises(NotImplementedError, match="TRNBLAS_REQUIRE_NKI"):
+            fn(*[a.to(DEV) for a in args])
+
+    @pytest.mark.parametrize("name", ["symm", "dot"])
+    def test_host_float64_and_auto_unchanged(self, nki_backend, name):
+        import warnings
+
+        fn, args = self._cases()[name]
+        ref = fn(*args)
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            got_host = fn(*args)  # host float64 under nki: torch at float64
+            trnblas.set_backend("auto")
+            got_auto = fn(*[a.to(DEV) for a in args])  # host route, its own warning
+        assert not [w for w in rec if "precision is reduced to float32" in str(w.message)]
+        torch.testing.assert_close(got_host, ref, rtol=1e-12, atol=1e-12)
+        torch.testing.assert_close(got_auto.cpu(), ref, rtol=1e-12, atol=1e-12)
