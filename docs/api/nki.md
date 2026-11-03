@@ -45,7 +45,7 @@ accuracy. trnblas follows the trnsci suite-wide policy (#89):
 | Mode | float64 operands |
 |---|---|
 | `set_backend("auto")` | Run in host torch at float64 accuracy. No kernel is called. float64 / complex128 operands already on the `neuron` device are copied to the host, computed there, and the result is returned on the device in float64 (one `UserWarning` per op; see below). |
-| `set_backend("nki")` | Cast to float32, run on the NKI kernel, result cast back. One `UserWarning` per op says precision is reduced to float32. |
+| `set_backend("nki")` | Cast to float32, run on the NKI kernel, result cast back. One `UserWarning` per op says precision is reduced to float32. Ops with no kernel (Level 1/2, `symm`, `trmm`) run in torch on the operands' device: host float64 keeps float64 accuracy with no warning, and float64 / complex128 on the `neuron` device runs on device aten at fp32 precision with the same once-per-op warning. |
 | `TRNBLAS_REQUIRE_NKI=1` | `NotImplementedError`. Takes precedence over the `nki` cast. float64 / complex128 on the `neuron` device raise at every public op, including the routes with no kernel (see below). |
 | `set_backend("pytorch")` | torch, as always. |
 

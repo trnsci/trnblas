@@ -929,6 +929,74 @@ def test_device_float64_host_path_is_auto_only(fake_neuron, backend, name):
     assert got.dtype == ref.dtype
 
 
+# Explicit `nki` on an op with no NKI kernel (Level 1/2, symm, trmm): device
+# float64 / complex128 runs on device aten at fp32 precision. That is the same
+# precision loss as the kernel ops' float32 cast, so it warns once per op too.
+NO_KERNEL_OPS = {
+    "axpy", "dot", "nrm2", "scal", "asum", "iamax",
+    "gemv", "symv", "trmv", "ger", "symm", "trmm",
+}  # fmt: skip
+NO_KERNEL_DEV_CASES = [(n, d, e) for n, d, e in DEV_CASES if n in NO_KERNEL_OPS]
+
+
+@pytest.mark.parametrize("name,d,e", NO_KERNEL_DEV_CASES, ids=[_id(c) for c in NO_KERNEL_DEV_CASES])
+def test_nki_device_float64_without_kernel_warns_once(fake_neuron, name, d, e):
+    fn, args, ref = _dev_case(name, d, e)
+    dev_args = [fake_neuron.mark(a) for a in args]
+    dispatch.set_backend("nki")
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        outs = [fn(*dev_args) for _ in range(3)]
+    msgs = _cast_warnings(rec)
+    assert len(msgs) == 1, [str(w.message) for w in rec]
+    assert msgs[0].category is UserWarning
+    text = str(msgs[0].message)
+    assert f"trnblas {name}:" in text and "no NKI kernel" in text
+    assert not _host_warnings(rec)
+    assert not fake_neuron.down and not fake_neuron.up  # stays on the device
+    assert not fake_neuron.stubs.calls  # no kernel
+    for got in outs:
+        if isinstance(ref, torch.Tensor):
+            assert got.dtype == ref.dtype
+
+
+@pytest.mark.parametrize("name", sorted(NO_KERNEL_OPS))
+def test_no_kernel_cast_warning_is_nki_device_only(fake_neuron, name):
+    """No fp32 warning for host float64 under `nki`, device float32 under
+    `nki`, or device float64 under `auto` (host, its own warning) / `pytorch`."""
+    for backend, d, marked in [
+        ("nki", F64, False),
+        ("nki", F32, True),
+        ("auto", F64, True),
+        ("pytorch", F64, True),
+    ]:
+        fn, args, _ = _dev_case(name, d, F32)
+        if marked:
+            args = [fake_neuron.mark(a) for a in args]
+        dispatch.set_backend(backend)
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            fn(*args)
+        assert not _cast_warnings(rec), (backend, d, marked, [str(w.message) for w in rec])
+
+
+@pytest.mark.parametrize("name", ["gemm", "syrk", "trsm"])
+def test_kernel_ops_keep_their_own_cast_warning(fake_neuron, name):
+    """Device float64 under `nki` on an op with a kernel: the kernel's float32
+    cast warning, once, not the no-kernel one."""
+    fn, args, _ = _dev_case(name, F64, F32)
+    dev_args = [fake_neuron.mark(a) for a in args]
+    dispatch.set_backend("nki")
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        for _ in range(3):
+            fn(*dev_args)
+    msgs = _cast_warnings(rec)
+    assert len(msgs) == 1, [str(w.message) for w in rec]
+    assert "no NKI kernel" not in str(msgs[0].message)
+    assert fake_neuron.stubs.calls  # the FP32 kernel ran
+
+
 # TRNBLAS_REQUIRE_NKI=1 with float64 / complex128 on the neuron device: every
 # public op raises, before any host copy, kernel or device aten. The routes
 # with no kernel (`auto` gemm / batched_gemm / syrk / symm / trsm on device

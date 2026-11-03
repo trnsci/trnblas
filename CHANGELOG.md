@@ -22,6 +22,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`_host_inv_chol_factor`, 0.8.0–0.11.0, under `auto` and `nki`), fixed
   the same way. CPU-only hosts, the `pytorch` backend, and `trsm` under
   `nki` were not affected.
+- **Explicit `nki`, ops with no kernel: device float64 now warns.** Under
+  `set_backend("nki")`, the ops with no NKI kernel (`axpy`, `dot`, `nrm2`,
+  `scal`, `asum`, `iamax`, `gemv`, `symv`, `trmv`, `ger`, `symm`, `trmm`)
+  computed float64 / complex128 operands on the `neuron` device on device
+  aten at fp32 precision with no warning (probe table on #91). They now
+  emit the policy's one `UserWarning` per op ("precision is reduced to
+  float32"), as the kernel ops do for their float32 cast. Values, routing,
+  `auto`, `pytorch`, host operands and `TRNBLAS_REQUIRE_NKI=1` (which still
+  raises first) are unchanged.
 
 ## [0.11.0] — 2026-11-04
 
