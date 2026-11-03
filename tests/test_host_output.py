@@ -224,9 +224,12 @@ class TestWrappersThroughCache:
         )
         L = torch.tril(L) if uplo == "lower" else torch.triu(L)
         B = torch.randn(n, 1000, generator=g, dtype=torch.float64)
+        # float32 operands: the blocked NKI route (float64 under explicit nki
+        # would be cast to float32 with a warning, trnblas#89).
+        L, B = L.float(), B.float()
         B0 = B.clone()
         X = trnblas.trsm(0.5, L, B, uplo=uplo)
-        torch.testing.assert_close(L @ X, 0.5 * B0)
+        torch.testing.assert_close(L @ X, 0.5 * B0, rtol=1e-4, atol=1e-4)
         assert torch.equal(B, B0)  # input untouched
 
 

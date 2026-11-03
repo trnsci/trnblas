@@ -30,9 +30,18 @@ box the same cases run through the NKI/auto paths with device inputs::
 
 With ``--backend nki|auto`` the fp32/complex64 tolerances are relaxed 50x
 (PSUM accumulation order). fp64 gradchecks are skipped for device inputs.
-Under ``TRNBLAS_REQUIRE_NKI=1``, fp64/complex/int GEMM/SYRK/TRSM raise by
-design (#68); run those configurations with ``-k "not float64 and not
-complex"``.
+
+float64 follows the suite-wide policy (trnblas#89). Under ``--backend auto``
+float64 computes in host torch, so fp64/complex128 cases keep the fp64
+tolerance; with ``--conformance-device neuron`` the operands are copied to the
+host for that (device aten computes float64 at fp32 precision). With
+``TRNBLAS_FP64_ON_DEVICE=1`` device-resident float64 stays on device aten and
+gets the relaxed fp32 tolerance. Under
+``--backend nki`` float64 GEMM/SYRK/TRSM operands are cast to float32 for the
+kernel (one UserWarning per op), so fp64 cases there get the relaxed fp32
+tolerance and the fp64 gradchecks are skipped. Under ``TRNBLAS_REQUIRE_NKI=1``, fp64/complex/int GEMM/SYRK/TRSM
+raise by design (#68); run those configurations with ``-k "not f64 and not
+c64 and not c128"``.
 """
 
 from __future__ import annotations
@@ -275,10 +284,29 @@ def check(op, args, kwargs=None, *, dtype, ref=None, scale=None, tol_mult=1.0):
     s = scale if scale is not None else want.abs().max().item()
     err = (o - want).abs().max().item() / max(s, 1e-30)
     tol = BASE_TOL[dtype] * tol_mult
+    if _CFG["backend"] == "nki" and dtype == F64:
+        # Explicit nki runs float64 on the FP32 kernels (trnblas#89); auto
+        # computes float64 in host torch (device-resident operands are copied
+        # to the host) and keeps the fp64 tolerance.
+        tol = max(tol, BASE_TOL[F32] * tol_mult * DEVICE_TOL_FACTOR)
+    if (
+        _CFG["backend"] == "auto"
+        and _CFG["device"].type == "neuron"
+        and dtype in (F64, C128)
+        and _fp64_on_device()
+    ):
+        # TRNBLAS_FP64_ON_DEVICE=1: device aten, float64 at fp32 precision.
+        tol = max(tol, BASE_TOL[C64 if dtype == C128 else F32] * tol_mult * DEVICE_TOL_FACTOR)
     if _CFG["backend"] != "pytorch" and dtype in (F32, C64, torch.bfloat16, torch.float16):
         tol *= DEVICE_TOL_FACTOR
     assert err <= tol, f"relerr {err:.3g} > {tol:.1g}"
     return out
+
+
+def _fp64_on_device() -> bool:
+    from trnblas.nki import dispatch
+
+    return dispatch._FP64_ON_DEVICE
 
 
 def _id(v):
@@ -887,7 +915,8 @@ def test_metric_inv_half(n, lay, dtype):
     Xh = hi(X)
     assert torch.equal(Xh, torch.triu(Xh))
     err = (hi(J) @ Xh @ Xh.mT - torch.eye(n, dtype=F64)).abs().max().item()
-    assert err < (1e-3 if dtype == F32 else 1e-10)
+    # Explicit nki computes float64 on the FP32 kernels (trnblas#89).
+    assert err < (1e-3 if dtype == F32 or _CFG["backend"] == "nki" else 1e-10)
 
 
 def test_metric_inv_half_empty():
@@ -970,6 +999,8 @@ def test_autograd(name):
     """fp64 gradcheck + gradgradcheck, and gradients equal the reference's."""
     if _CFG["device"].type != "cpu":
         pytest.skip("fp64 gradcheck runs on host inputs only")
+    if _CFG["backend"] == "nki":
+        pytest.skip("explicit nki computes float64 on the FP32 kernels (trnblas#89)")
     from torch.autograd import gradcheck, gradgradcheck
 
     op = name.split(":")[0]

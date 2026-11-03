@@ -22,6 +22,7 @@ import warnings
 import torch
 
 from ._flags import diag_flag, side_flag, trans_flag, uplo_flag
+from .nki.dispatch import _fp64_host_guard
 
 
 def _owned_inplace_ok(result: torch.Tensor) -> bool:
@@ -65,6 +66,7 @@ def _scale_add(
     return result
 
 
+@_fp64_host_guard("gemm")
 def gemm(
     alpha: float,
     A: torch.Tensor,
@@ -107,6 +109,7 @@ def gemm(
     return _scale_add(result, alpha, beta, C)
 
 
+@_fp64_host_guard("batched_gemm")
 def batched_gemm(
     alpha: float,
     A: torch.Tensor,
@@ -131,6 +134,7 @@ def batched_gemm(
     return _scale_add(nki_batched_gemm(a, b), alpha, beta, C)
 
 
+@_fp64_host_guard("symm")
 def symm(
     alpha: float,
     A: torch.Tensor,
@@ -177,6 +181,7 @@ def symm(
     return _scale_add(result, alpha, beta, C)
 
 
+@_fp64_host_guard("syrk")
 def syrk(
     alpha: float,
     A: torch.Tensor,
@@ -261,6 +266,7 @@ def _resolve_syrk_uplo(C: torch.Tensor, uplo: str) -> str:
     return uplo
 
 
+@_fp64_host_guard("trsm")
 def trsm(
     alpha: float,
     A: torch.Tensor,
@@ -293,6 +299,7 @@ def trsm(
     return nki_trsm(A, B, side=side, uplo=uplo, trans=trans, diag=diag, alpha=alpha)
 
 
+@_fp64_host_guard("metric_inv_half")
 def metric_inv_half(J: torch.Tensor) -> torch.Tensor:
     """Cholesky inverse factor of an SPD metric: X = L^-T where J = L @ L^T.
 
@@ -310,6 +317,7 @@ def metric_inv_half(J: torch.Tensor) -> torch.Tensor:
     return nki_metric_inv_half(J)
 
 
+@_fp64_host_guard("trmm")
 def trmm(
     alpha: float,
     A: torch.Tensor,

@@ -261,7 +261,7 @@ class TestLaunchRouting:
             seen["args"] = (a, b)
             return a + b
 
-        monkeypatch.setattr(dispatch, "_native_ops", {"fake": op})
+        monkeypatch.setattr(dispatch, "_native_ops", {"gemm_ragged": op})
 
         def no_xla(*t):
             raise AssertionError("_to_xla must not run on the native path")
@@ -270,7 +270,7 @@ class TestLaunchRouting:
             raise AssertionError("raw kernel must not be called on the native path")
 
         monkeypatch.setattr(dispatch, "_to_xla", no_xla)
-        out = dispatch._launch(no_kernel, "fake", torch.ones(2, 1), torch.ones(2, 1))
+        out = dispatch._launch(no_kernel, "gemm_ragged", torch.ones(2, 1), torch.ones(2, 1))
         assert torch.equal(out, torch.full((2, 1), 2.0))
         assert out.device.type == "cpu"
 
@@ -288,7 +288,7 @@ class TestLaunchRouting:
             raise AssertionError("native ops must not load on the XLA path")
 
         monkeypatch.setattr(dispatch, "_get_native_ops", no_ops)
-        out = dispatch._launch(lambda x: x * 3, "unused", torch.ones(4, 1))
+        out = dispatch._launch(lambda x: x * 3, "syrk", torch.ones(4, 1))
         assert moved == [1]
         assert torch.equal(out, torch.full((4, 1), 3.0))
 
@@ -298,7 +298,7 @@ class TestLaunchRouting:
         monkeypatch.setattr(dispatch, "_dispatch_path", "cpu")
         monkeypatch.setitem(sys.modules, "torch_xla", None)
         with pytest.raises(ImportError):
-            dispatch._launch(lambda x: x, "unused", torch.ones(1, 1))
+            dispatch._launch(lambda x: x, "syrk", torch.ones(1, 1))
 
 
 class _FakeKernel:
@@ -308,7 +308,10 @@ class _FakeKernel:
 
 
 class TestEagerHandle:
-    """Eager native calls go through a cached handle, not the custom op."""
+    """Eager native calls go through a cached handle, not the custom op.
+
+    The op name is a real kernel ("syrk"): `_call_kernel` refuses names with
+    no `_KERNEL_DTYPES` entry (trnsci/trnsci#35)."""
 
     @pytest.fixture
     def eager(self, monkeypatch):
@@ -326,30 +329,30 @@ class TestEagerHandle:
         def op(*t):
             return ("op", t)
 
-        monkeypatch.setattr(dispatch, "_native_ops", {"k": op})
+        monkeypatch.setattr(dispatch, "_native_ops", {"syrk": op})
         return built
 
     def test_handle_built_once_and_skips_op(self, eager):
         k = _FakeKernel()
         x = torch.ones(1)
         for _ in range(3):
-            assert dispatch._call_kernel(k, "k", x)[0] == "handle"
+            assert dispatch._call_kernel(k, "syrk", x)[0] == "handle"
         assert eager == [k]
 
     def test_one_handle_per_kernel(self, eager):
         k1, k2 = _FakeKernel(), _FakeKernel()
-        dispatch._call_kernel(k1, "k", torch.ones(1))
-        dispatch._call_kernel(k2, "k", torch.ones(1))
-        dispatch._call_kernel(k1, "k", torch.ones(1))
+        dispatch._call_kernel(k1, "syrk", torch.ones(1))
+        dispatch._call_kernel(k2, "syrk", torch.ones(1))
+        dispatch._call_kernel(k1, "syrk", torch.ones(1))
         assert eager == [k1, k2]
 
     def test_non_jit_callable_uses_op(self, eager):
-        assert dispatch._call_kernel(lambda x: x, "k", torch.ones(1))[0] == "op"
+        assert dispatch._call_kernel(lambda x: x, "syrk", torch.ones(1))[0] == "op"
         assert eager == []
 
     def test_no_handle_api_uses_op(self, eager, monkeypatch):
         monkeypatch.setattr(dispatch, "_wrap_nki", False)
-        assert dispatch._call_kernel(_FakeKernel(), "k", torch.ones(1))[0] == "op"
+        assert dispatch._call_kernel(_FakeKernel(), "syrk", torch.ones(1))[0] == "op"
 
     def test_missing_nki_api_resolves_to_unavailable(self, monkeypatch):
         monkeypatch.setattr(dispatch, "_eager_handles", {})
@@ -1186,27 +1189,57 @@ class TestKernelDtypes:
         monkeypatch.setattr(dispatch, "_nki_syrk_impl", syrk_impl)
         return seen
 
-    def test_float64_runs_torch(self, poisoned_kernels):
-        import trnblas
-
+    @staticmethod
+    def _float64_calls(trnblas):
         g = torch.Generator().manual_seed(0)
         A = torch.randn(150, 140, generator=g, dtype=torch.float64)
         B = torch.randn(140, 130, generator=g, dtype=torch.float64)
         C = torch.randn(150, 130, generator=g, dtype=torch.float64)
-        torch.testing.assert_close(trnblas.gemm(0.7, A, B, beta=0.5, C=C), 0.7 * A @ B + 0.5 * C)
         S = torch.randn(150, 150, generator=g, dtype=torch.float64)
         S = S + S.T
-        torch.testing.assert_close(
-            trnblas.syrk(0.7, A, beta=0.5, C=S, uplo="lower").tril(),
-            (0.7 * A @ A.T + 0.5 * S).tril(),
-        )
         T = torch.randn(300, 300, generator=g, dtype=torch.float64) * 0.05 + 2 * torch.eye(
             300, dtype=torch.float64
         )
         R = torch.randn(300, 20, generator=g, dtype=torch.float64)
-        X = trnblas.trsm(0.7, T, R, side="left", uplo="lower")
-        torch.testing.assert_close(torch.tril(T) @ X, 0.7 * R)
+        return [
+            (trnblas.gemm(0.7, A, B, beta=0.5, C=C), 0.7 * A @ B + 0.5 * C),
+            (
+                trnblas.syrk(0.7, A, beta=0.5, C=S, uplo="lower").tril(),
+                (0.7 * A @ A.T + 0.5 * S).tril(),
+            ),
+            (torch.tril(T) @ trnblas.trsm(0.7, T, R, side="left", uplo="lower"), 0.7 * R),
+        ]
+
+    def test_float64_under_auto_runs_torch(self, poisoned_kernels, monkeypatch):
+        """`auto` (XLA / simulator / forced-kernel paths): float64 in torch at
+        float64 accuracy, no kernel (trnblas#89)."""
+        import trnblas
+        from trnblas.nki import dispatch
+
+        monkeypatch.setattr(dispatch, "_backend", "auto")
+        monkeypatch.setattr(dispatch, "HAS_NKI", True)
+        monkeypatch.setattr(dispatch, "_dispatch_path", "xla")
+        for got, want in self._float64_calls(trnblas):
+            assert got.dtype == torch.float64
+            torch.testing.assert_close(got, want)
         assert poisoned_kernels == []
+
+    def test_float64_under_nki_casts_to_float32(self, poisoned_kernels, monkeypatch):
+        """Explicit `nki`: float64 runs the FP32 kernels on float32 copies,
+        returns float64, and warns once per op (trnblas#89)."""
+        import trnblas
+        from trnblas.nki import dispatch
+
+        monkeypatch.setattr(dispatch, "_fp32_cast_warned", set())
+        with pytest.warns(UserWarning, match="precision is reduced to float32") as rec:
+            results = self._float64_calls(trnblas)
+            self._float64_calls(trnblas)
+        for got, want in results:
+            assert got.dtype == torch.float64
+            torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-4)
+        assert poisoned_kernels and set(poisoned_kernels) == {torch.float32}
+        ops = sorted(str(w.message).split(":")[0] for w in rec if "reduced" in str(w.message))
+        assert ops == ["trnblas gemm", "trnblas syrk", "trnblas trsm"]
 
     def test_float32_still_uses_kernels(self, poisoned_kernels):
         import trnblas

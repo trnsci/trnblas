@@ -32,8 +32,63 @@ What `auto` does depends on the dispatch path (v0.9.0, #62, #63):
 - **No device**: PyTorch.
 
 `set_backend("nki")` always runs the NKI kernels, for device-resident operands
-too. Dtypes the kernels do not compute (float64, for example) run in torch,
-or raise `NotImplementedError` under `TRNBLAS_REQUIRE_NKI=1` (v0.9.1, #68).
+too. float64 is cast to float32 for the kernels (see
+[Precision and dtypes](#precision-and-dtypes)); other dtypes the kernels do
+not compute (integer, bool, complex) run in torch, or raise
+`NotImplementedError` under `TRNBLAS_REQUIRE_NKI=1` (v0.9.1, #68).
+
+## Precision and dtypes
+
+Trainium computes float64 at fp32 precision, so no NKI kernel gives float64
+accuracy. trnblas follows the trnsci suite-wide policy (#89):
+
+| Mode | float64 operands |
+|---|---|
+| `set_backend("auto")` | Run in host torch at float64 accuracy. No kernel is called. float64 / complex128 operands already on the `neuron` device are copied to the host, computed there, and the result is returned on the device in float64 (one `UserWarning` per op; see below). |
+| `set_backend("nki")` | Cast to float32, run on the NKI kernel, result cast back. One `UserWarning` per op says precision is reduced to float32. |
+| `TRNBLAS_REQUIRE_NKI=1` | `NotImplementedError`. Takes precedence over the `nki` cast. float64 / complex128 on the `neuron` device raise at every public op, including the routes with no kernel (see below). |
+| `set_backend("pytorch")` | torch, as always. |
+
+- **Device-resident float64.** On Trainium, aten on the `neuron` device
+  computes float64 at fp32 precision (measured on Trn2), so under `auto` a
+  float64 or complex128 operand on the device does not run as device aten.
+  Every public op (`trnblas.*` and `trnblas.nki.*`) copies the
+  device-resident operands to the host, computes in host torch at float64,
+  and returns the result on the original device in float64. One
+  `UserWarning` per op says "float64 on the neuron device is computed on the
+  host for float64 accuracy (device arithmetic is fp32); pass float32 to
+  stay on device". The cost is the host-link round trip. To keep device aten
+  (fp32 precision, no copies), set `TRNBLAS_FP64_ON_DEVICE=1`; to stay on
+  the device at full speed, pass float32. Host-resident float64 is unchanged
+  (host torch), and with this release a forced `TRNBLAS_NATIVE_GEMM=aten|lnc`
+  no longer uploads host float64 to device aten unless
+  `TRNBLAS_FP64_ON_DEVICE=1` is set. `set_backend("nki")` and `"pytorch"`
+  are not affected. Under `TRNBLAS_REQUIRE_NKI=1` (backends `auto` and
+  `nki`), a float64 / complex128 operand on the device raises
+  `NotImplementedError` at every public op, with no host copy, ahead of
+  `TRNBLAS_FP64_ON_DEVICE`; before, the routes with no kernel (`auto`
+  GEMM-family device aten, `symm`, Level 1/2) computed it at fp32 precision
+  with no error. The `trnblas.parallel`
+  (multi-process) helpers are float32 pipelines and are not covered.
+- The GEMM / SYRK kernels take float32, bfloat16 and float16 (FP32 PSUM
+  accumulation, output in the input dtype). The DF-MP2 energy kernels take
+  float32; bfloat16 / float16 operands are upcast exactly.
+- The result dtype always matches the pytorch backend for the same inputs,
+  including bfloat16/float16 and mixed-dtype promotion. For the energy APIs
+  that is `torch.promote_types` of the operands: `nki_mp2_energy` over all
+  four, `nki_batched_pair_energy` / `nki_fused_gemm_energy` over the
+  amplitudes and `eps_vir` (the occupied energies enter as Python floats).
+  The kernels still accumulate in FP32; only the returned scalar is cast.
+- float64 orbital energies count as float64 operands: under `auto` a call
+  with float32 amplitudes and float64 `eps` runs in torch. Pass float32
+  `eps` to keep the energy step on the kernel.
+- A float64 operand mixed with another dtype (e.g. float64 @ float32) is not
+  cast; it behaves as the pytorch backend does.
+- `symm` has no NKI kernel and always computes in torch, so float64 keeps
+  float64 accuracy under every backend.
+- Integer, bool and complex operands never reach a kernel: they run in torch
+  (or raise under `TRNBLAS_REQUIRE_NKI=1`). trnblas has no complex kernels,
+  so complex128 is not cast to complex64.
 
 `trnblas.HAS_NKI` is `True` when the `nki` package (NKI 0.3.0+, Neuron
 SDK 2.29+) is importable. trnblas uses the canonical `nki.*`
@@ -65,7 +120,8 @@ See [Installation](../installation.md#two-neuron-pytorch-lineages).
 
 | Variable | Effect |
 |---|---|
-| `TRNBLAS_REQUIRE_NKI=1` | Re-raise kernel exceptions instead of falling back to `torch.matmul` — surfaces silent breakage in validation runs. |
+| `TRNBLAS_REQUIRE_NKI=1` | Re-raise kernel exceptions instead of falling back to `torch.matmul` — surfaces silent breakage in validation runs. Dtypes the kernels do not take (float64 included) raise `NotImplementedError`. |
+| `TRNBLAS_FP64_ON_DEVICE=1` | Under `auto`, keep float64 / complex128 operands that are on the `neuron` device on device aten (fp32 precision) instead of computing them on the host at float64 accuracy. See [Precision and dtypes](#precision-and-dtypes). |
 | `TRNBLAS_USE_SIMULATOR=1` | Route kernel dispatch through `nki.simulate(kernel)(numpy_args)` on CPU. Bypasses `torch_xla` + NEFF compile; used for fast correctness iteration. See [docs/developing_kernels.md](../developing_kernels.md). |
 | `TRNSCI_NKI_DISPATCH=auto\|native\|xla` | Suite-wide. Forces the native or XLA dispatch path. |
 | `TRNBLAS_BATCHED_PAIR_CHUNK_THRESHOLD=<n>` | Overrides batched-pair routing (default 4096 on XLA, 3072 on native). |

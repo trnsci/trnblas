@@ -136,11 +136,15 @@ def pair_energy(
     r, w = _rank_world(group)
     nocc = B_full.shape[0]
     chunks = occ_chunks(nocc, w)
+    dev = B_full.device
+    route = D._pair_energy_route(B_full) if D._use_nki() and r < len(chunks) else "aten"
+    if route == "sym" and B_full.dtype not in D._ENERGY_DATA_DTYPES:
+        # Float64 B under explicit set_backend("nki"): the FP32 sym kernel.
+        D._warn_fp32_cast("pair_energy")
+        B_full = B_full.to(torch.float32)
     eo_h = eps_occ.detach().cpu().to(B_full.dtype)
     ev_h = eps_vir.detach().cpu().to(B_full.dtype)
-    dev = B_full.device
     if r < len(chunks):
-        route = D._pair_energy_route(B_full) if D._use_nki() else "aten"
         fn = sym_rows if route == "sym" else aten_rows
         e = fn(B_full, eo_h, ev_h, chunks[r], dev).reshape(1).to(torch.float32)
     else:
