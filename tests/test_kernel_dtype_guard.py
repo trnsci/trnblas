@@ -111,6 +111,10 @@ def stubs(monkeypatch):
     """Native dispatch path on CPU with stub custom ops; `_native` imported fresh."""
     s = Stubs()
     monkeypatch.setitem(sys.modules, "torch_neuronx", _fake_torch_neuronx(s))
+    # Record the real state first, so teardown removes the stub-backed `_native`
+    # imported below (a later test in the session would otherwise get stub ops).
+    monkeypatch.setitem(sys.modules, "trnblas.nki._native", None)
+    monkeypatch.setattr(trnblas.nki, "_native", None, raising=False)
     monkeypatch.delitem(sys.modules, "trnblas.nki._native", raising=False)
     monkeypatch.delattr(trnblas.nki, "_native", raising=False)
     monkeypatch.setattr(dispatch, "_native_ops", None)
