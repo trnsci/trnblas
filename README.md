@@ -156,10 +156,15 @@ Runs SCF + density fitting via PySCF, feeds the integrals through trnblas, and c
 
 ## Known issues in earlier releases
 
-Silent wrong-result bugs fixed in the 2026-10-31 to 2026-11-02 releases. Upgrade to 0.10.0 or later. Details are in [CHANGELOG.md](CHANGELOG.md).
+Silent wrong-result bugs fixed in the 2026-10-31 to 2026-11-04 releases. Upgrade to 0.11.1 or later. Details are in [CHANGELOG.md](CHANGELOG.md).
 
 | Bug | Affected | Fixed in |
 |-----|----------|----------|
+| `trsm` on host operands, and the host route of `metric_inv_half` for a device-resident `J`, detached autograd on a Neuron host (TorchNeuron), so gradients silently stopped; trnsolver's `eigh_generalized` inherited it (#101) | `trsm` 0.9.0–0.11.0, `metric_inv_half` 0.8.0–0.11.0; native route under `auto` (`metric_inv_half` also under `nki`) | 0.11.1 |
+| `syrk` ignored `uplo` and symmetrized C, so a C stored in one triangle lost half its off-diagonal entries and the other triangle of a non-symmetric C leaked in (#74) | through 0.10.0, every backend | 0.11.0 |
+| Complex `asum` / `iamax` used the modulus \|x\| instead of the BLAS \|Re\| + \|Im\| (`asum` up to √2 off; `iamax` could pick another index) (#75) | through 0.10.0, every backend | 0.11.0 |
+| Mixed-dtype `gemm` / `batched_gemm` / `symm` operands returned a result in the left operand's dtype where torch raises (#90) | 0.2.0–0.10.0, NKI route | 0.11.0 |
+| float64, integer and complex operands of `nki_mp2_energy`, `nki_fused_gemm_energy` and `nki_batched_pair_energy` went into the FP32 kernels and came back as garbage | every release with these kernels through 0.10.0, NKI route | 0.11.0 |
 | BLAS letter flags (`uplo="U"`, `diag="U"`, `trans="N"`) ran the opposite branch (#73) | 0.2.0–0.9.1, every backend | 0.10.0 |
 | `gemm(transA=True)` / `transB=True` on batched (>= 3-D) operands reversed every dimension (#72) | 0.2.0–0.9.1, every backend | 0.10.0 |
 | `batched_gemm` on the NKI route ignored batch broadcasting and returned only `A[0] @ B[0]` (#84) | 0.3.0–0.9.1, NKI route | 0.10.0 |
