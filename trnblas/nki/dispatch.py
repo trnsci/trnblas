@@ -339,6 +339,7 @@ def _nki_casts_fp64(*tensors: torch.Tensor) -> bool:
 
 def _warn_fp32_cast(op: str) -> None:
     """One UserWarning per op: float64 operands ran on an FP32 kernel."""
+    _fp32_note("cast", op)
     if op in _fp32_cast_warned:
         return
     _fp32_cast_warned.add(op)
@@ -473,22 +474,70 @@ def _warn_fp64_host(op: str) -> None:
     )
 
 
-def _warn_fp32_device(op: str) -> None:
+def _warn_fp32_device(op: str, kernel: bool = False, stacklevel: int = 3) -> None:
     """One UserWarning per op (shared with `_warn_fp32_cast`): explicit `nki`,
-    an op with no NKI kernel, float64 / complex128 on the neuron device, so
-    device aten computes it at fp32 precision."""
+    float64 / complex128 on the neuron device, and device aten computes it at
+    fp32 precision. `kernel=False`: the op has no NKI kernel. `kernel=True`:
+    the op has one, but this call did not take its float32 cast (#103)."""
+    _fp32_note("device")
     if op in _fp32_cast_warned:
         return
     _fp32_cast_warned.add(op)
+    if kernel:
+        why = (
+            "this call does not take the NKI kernel's float32 cast (complex128, float64 "
+            "mixed with another dtype, or a shape or side the kernel does not cover), so its "
+            "float64 / complex128 operands on the neuron device run on device aten"
+        )
+    else:
+        why = (
+            "has no NKI kernel for this op, so float64 / complex128 operands on the neuron "
+            "device run on device aten"
+        )
     warnings.warn(
-        f"trnblas {op}: set_backend('nki') has no NKI kernel for this op, so float64 / "
-        "complex128 operands on the neuron device run on device aten; precision is reduced to "
+        f"trnblas {op}: set_backend('nki') {why}; precision is reduced to "
         "float32 (device arithmetic is fp32; the result keeps its dtype). Use "
         "set_backend('auto') for float64 accuracy on the host, or set "
         "TRNBLAS_REQUIRE_NKI=1 to raise instead.",
         UserWarning,
-        stacklevel=3,
+        stacklevel=stacklevel,
     )
+
+
+# Explicit `nki`, ops with a kernel (#103): the outermost guarded call with a
+# float64 / complex128 operand on the neuron device records what its routes
+# did, then warns (`_warn_fp32_device(kernel=True)`) unless the call took the
+# op's own float32 cast (which warned) or ran only on the host at full
+# precision. "Warn unless shown otherwise" covers every route that ends in
+# device aten (complex128, mixed dtypes, batched / 1-D `gemm`, right-side
+# `trsm`, an fp64 `C`, the size-chosen energy aten route) without listing
+# them, and a new route defaults to the warning.
+_fp32_track = threading.local()
+
+
+def _fp32_key(op: str) -> str:
+    """Dedup key shared by an op's guard and its kernel cast (`nki_gemm` -> `gemm`)."""
+    return op.removeprefix("nki_")
+
+
+def _fp32_note(kind: str, op: str | None = None) -> None:
+    """Record, for the call being tracked (if any), that a route took the
+    float32 kernel cast (`cast`, for `op`), ran only on the host at full
+    precision (`host`), or computed on device aten at fp32 precision (`device`)."""
+    rec = getattr(_fp32_track, "rec", None)
+    if rec is None:
+        return
+    if kind == "cast":
+        rec["cast"].add(op)
+    else:
+        rec[kind] = True
+
+
+def _fp32_note_device_if(*tensors) -> None:
+    """`_fp32_note("device")` when any of `tensors` is float64 / complex128 on
+    the neuron device (a route that is otherwise host-only computes on it)."""
+    if any(_fp64_device_resident(t) for t in tensors):
+        _fp32_note("device")
 
 
 def _fp64_host_guard(op: str, kernel: bool = True):
@@ -505,6 +554,9 @@ def _fp64_host_guard(op: str, kernel: bool = True):
     `trmm`): under an explicit `set_backend("nki")` its device-resident
     float64 / complex128 runs on device aten at fp32 precision, which warns
     once per op, as the kernel ops' float32 cast does (`_warn_fp32_cast`).
+    For an op with a kernel, the same warning follows a call whose
+    device-resident float64 / complex128 did not take the float32 cast
+    (`_tracked_nki_call`, #103).
     """
 
     def deco(fn):
@@ -514,13 +566,15 @@ def _fp64_host_guard(op: str, kernel: bool = True):
             if _REQUIRE_NKI and not nested and _use_nki():
                 _refuse_device_fp64(op, (args, kwargs))
             if (
-                not kernel
-                and _backend == "nki"
+                _backend == "nki"
                 and not nested
                 and _use_nki()
                 and _any_tensor((args, kwargs), _fp64_device_resident)
             ):
-                _warn_fp32_device(op)
+                if not kernel:
+                    _warn_fp32_device(op)
+                elif getattr(_fp32_track, "rec", None) is None:
+                    return _tracked_nki_call(op, fn, args, kwargs)
             if (
                 _backend != "auto"
                 or _FP64_ON_DEVICE
@@ -546,6 +600,22 @@ def _fp64_host_guard(op: str, kernel: bool = True):
         return wrapper
 
     return deco
+
+
+def _tracked_nki_call(op: str, fn, args, kwargs):
+    """`fn(*args, **kwargs)` for a kernel op under explicit `nki` with float64 /
+    complex128 on the neuron device; warns once per op afterwards unless the
+    call took its own float32 cast or stayed on the host (see `_fp32_track`)."""
+    key = _fp32_key(op)
+    rec = {"cast": set(), "host": False, "device": False}
+    _fp32_track.rec = rec
+    try:
+        out = fn(*args, **kwargs)
+    finally:
+        _fp32_track.rec = None
+    if key not in rec["cast"] and (rec["device"] or not rec["host"]):
+        _warn_fp32_device(key, kernel=True, stacklevel=4)  # the op's caller
+    return out
 
 
 def _fp64_stays_on_host(*tensors: torch.Tensor) -> bool:
@@ -1163,6 +1233,7 @@ def _trsm_on_host(
     """
     dev, dt = B.device, B.dtype
     cdt = torch.float32 if dt in (torch.bfloat16, torch.float16) else dt
+    _fp32_note("host")
     Ah = A.to(device="cpu", dtype=cdt)
     Bh = B.to(device="cpu", dtype=cdt)
     X = _trsm_torch(alpha, Ah, Bh, "left", uplo, trans, diag)
@@ -1342,6 +1413,7 @@ def _host_inv_chol_factor(J: torch.Tensor) -> torch.Tensor:
 
 
 def _device_inv_chol_factor(J: torch.Tensor) -> torch.Tensor:
+    _fp32_note_device_if(J)  # the Cholesky runs on device aten, whatever trsm does
     L = torch.linalg.cholesky(J)
     eye = torch.eye(J.shape[0], dtype=J.dtype, device=J.device)
     return nki_trsm(L, eye, uplo="lower", trans=True)
@@ -1365,6 +1437,7 @@ def nki_metric_inv_half(J: torch.Tensor) -> torch.Tensor:
             f"metric_inv_half: expected a floating point or complex tensor; got {J.dtype}"
         )
     if _metric_solve_route(J) == "host":
+        _fp32_note("host")
         X = _host_inv_chol_factor(J)
         return X.to(dtype=J.dtype).to(J.device)
     return _device_inv_chol_factor(J)

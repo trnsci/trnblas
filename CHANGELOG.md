@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Explicit `nki`, ops with a kernel: device float64 off the cast now warns
+  (#103).** Under `set_backend("nki")`, float64 / complex128 operands on the
+  `neuron` device that did not take the float32 kernel cast ran on device
+  aten at fp32 precision with no warning: complex128 (`gemm`,
+  `batched_gemm`, `syrk`, the energy APIs), float64 mixed with another dtype
+  (a float64 `C` on a float32 `gemm` / `syrk`, mixed `trsm` operands,
+  float64 amplitudes with integer or complex `eps`), batched or 1-D `gemm`
+  operands, a 1-D `nki_batched_gemm` operand, `side="right"` `trsm`, the
+  `metric_inv_half` device route (whose only warning was the inner
+  `trsm`'s, and none once `trsm` had warned), and the
+  `nki_batched_pair_energy` aten route. `trnblas.parallel.pair_energy` also
+  rounded float64 `eps` to float32 silently and did not raise for device
+  float64 under `TRNBLAS_REQUIRE_NKI=1`. Each now emits the policy's one
+  `UserWarning` per op, in the shared dedup set and with the "precision is
+  reduced to float32" wording; `parallel.pair_energy` raises under
+  `TRNBLAS_REQUIRE_NKI=1` like the other public ops. Values, routing,
+  `auto`, `pytorch`, host operands and the host-only routes (left `trsm` on
+  complex128, the `metric_inv_half` host route, which compute at full
+  precision and stay quiet) are unchanged.
+
 ## [0.11.1] — 2026-11-04
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
