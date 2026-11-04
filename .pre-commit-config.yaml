@@ -2,14 +2,14 @@
 # Install once per checkout: `pre-commit install` (pulled in by the [dev] extra).
 #
 # Hooks run on changed files by default; use `pre-commit run --all-files` to
-# sweep the whole tree. Keep in lockstep with the ruff version pinned in
-# pyproject.toml `[project.optional-dependencies].dev`.
+# sweep the whole tree. Keep the ruff rev in lockstep with the ruff pin in the CI lint job
+# and in pyproject.toml `[project.optional-dependencies].dev`.
 
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.15.10
+    rev: v0.17.3
     hooks:
-      - id: ruff
+      - id: ruff-check
         args: [--fix]
       - id: ruff-format
 
