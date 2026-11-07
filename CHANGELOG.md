@@ -30,6 +30,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ops on such tensors (for example `gemm`'s `alpha` / `beta` update of a
   result that is itself 4 GiB with 32 MiB rows) are a separate issue,
   trnsci/trnsci#145.
+- **`trnblas.parallel.df_mp2_energy`: wrong half-transform at nocc ≥ 128
+  with nbasis × naux ≥ 2²³ (#116).** With `eri_symmetric=True`, the strided
+  in-place update of the partial half-transform `part` (nocc_pad, nbasis ×
+  naux) has the same ≥ 4 GiB partition span on the device and returned wrong
+  values (rel err 0.54 on Trn2 at nbasis 64, naux 131,088, nocc 128). It now
+  updates blocks of at most 64 occupied rows there, and is one add as before
+  everywhere else. The half-transform GEMMs are covered by the fix above.
+  Affected 0.9.0–0.12.0.
 
 ## [0.12.0] — 2026-11-07
 

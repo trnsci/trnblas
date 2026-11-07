@@ -36,7 +36,7 @@ import time
 import torch
 import torch.distributed as dist
 
-from .nki.dispatch import _neuron_matmul
+from .nki.dispatch import _even_step, _is_neuron, _neuron_matmul, _out_block
 from .nki.multicore import aten_rows, occ_chunks, sym_rows
 
 
@@ -242,7 +242,16 @@ def _half_transform_part(
     CT = C_occ_pad.T.contiguous().to(dev)  # (nocc_pad, nbasis)
     M = _neuron_matmul(CT, L)  # (n_r, nocc_pad, naux), includes nu == mu
     M = M - Cr.unsqueeze(2) * diag.unsqueeze(1)
-    part.reshape(-1, nbasis, naux)[:, m0:m1, :] += M.permute(1, 0, 2)
+    # On the device, `part` (nocc_pad, nbasis * naux) can have the >= 4 GiB
+    # partition span of #112 / #116 (nocc_pad >= 128, nbasis * naux >= 2**23
+    # fp32), where this strided in-place add was wrong (rel err 0.54 on Trn2).
+    # Update it in blocks of at most 64 occupied rows there; elsewhere this is
+    # one add, as before.
+    ob = _out_block(part.shape[0], part.shape[1], part.element_size()) if _is_neuron(part) else 0
+    step = _even_step(part.shape[0], ob) if ob else part.shape[0]
+    pv, Mp = part.reshape(-1, nbasis, naux), M.permute(1, 0, 2)
+    for i0 in range(0, part.shape[0], step):
+        pv[i0 : i0 + step, m0:m1, :] += Mp[i0 : i0 + step]
     return part
 
 

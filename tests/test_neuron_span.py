@@ -232,3 +232,20 @@ class TestEntryPoints:
         )
         a, b = _r(128, 12).T, _r(128, 40, seed=1)
         torch.testing.assert_close(D._nki_gemm_lnc(a, b), _ref(a, b), rtol=1e-5, atol=1e-4)
+
+
+class TestParallelHalfTransform:
+    """#116: the symmetric half-transform's strided in-place add, blocked over occupied rows."""
+
+    def test_blocked_update_matches(self, lowered, monkeypatch):
+        import trnblas.parallel as tp
+
+        monkeypatch.setattr(tp, "_is_neuron", lambda t: True)
+        nb, naux, nocc = 8, 5, 130  # part (130, 40): 160 B rows over 130 rows, unsafe here
+        X = _r(nb, nb, naux)
+        eri = X + X.transpose(0, 1)
+        C = _r(nb, nocc, seed=1)
+        ref = (C.double().T @ eri.double().reshape(nb, nb * naux)).float()
+        part = tp._half_transform_part(C, eri, (0, nb), torch.device("cpu"), True, nb)
+        torch.testing.assert_close(part, ref, rtol=1e-5, atol=1e-4)
+        assert D._out_block(nocc, nb * naux, 4)  # the blocked branch ran
