@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.1] — 2026-11-07
+
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
+
+Headline: device matmuls with 32 MiB or longer rows (an operand's 128 partitions spanning 4 GiB) are no longer silently wrong (#112, aws-neuron-sdk#1457), and `parallel.df_mp2_energy`'s symmetric half-transform at nocc ≥ 128 is no longer wrong (#116).
+
 ### Fixed
 
 - **Device matmuls with 32 MiB or longer rows were silently wrong (#112,
