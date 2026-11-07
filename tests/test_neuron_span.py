@@ -72,9 +72,9 @@ class TestRule:
 
     def test_real_threshold_values(self):
         assert D._NEURON_SPAN_BYTES == 1 << 32
-        assert D._NEURON_BLOCK_BYTES == 1 << 31
+        assert D._NEURON_BLOCK_BYTES == (1 << 31) + (1 << 20)
         # The #112 shapes: (128, 8,389,632) fp32 is unsafe, (128, 8,388,480) is not.
-        assert D._out_block(128, 8_389_632, 4) == 63
+        assert D._out_block(128, 8_389_632, 4) == 64
         assert D._out_block(128, 8_388_480, 4) == 0
         assert D._out_block(64, 8_389_632, 4) == 0
         assert D._out_block(128, 16_777_216, 2)  # bf16 at 2**32 bytes

@@ -794,7 +794,7 @@ def _neuron_mm_lhs(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 #     not help. A host round trip of the whole tensor is bit-exact.
 # A block of whole memory rows is a contiguous view and needs no copy, so
 # `_neuron_matmul` cuts each long-row operand into row blocks spanning at most
-# 2 GiB (the measured-safe K = 64 x 32 MiB regime): it splits K (partial sums)
+# about 2 GiB (the measured-safe K = 64 x 32 MiB regime): it splits K (partial sums)
 # or M / N (concatenated results). Row blocks at offsets up to 6 GB with
 # partial sums over K measured correct (rel err 2.8e-7), and so did M blocks of
 # a long-row A. A result with the bad layout is built from blocks of its rows
@@ -802,7 +802,19 @@ def _neuron_mm_lhs(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 # untouched.
 _NEURON_SPAN_BYTES = 1 << 32
 _NEURON_PARTITIONS = 128
-_NEURON_BLOCK_BYTES = 1 << 31
+# Rows per block: a span of at most 2 GiB + 1 MiB, so 64 rows of up to
+# 32 MiB + 16 KiB (measured correct: K = 64 at 32 MiB + 4 KiB on #140, and
+# 63-row blocks here) and fewer rows for longer ones. All of them sit in
+# partitions 0-63, which the upstream analysis says are read correctly.
+_NEURON_BLOCK_BYTES = (1 << 31) + (1 << 20)
+
+
+def _even_step(total: int, step: int) -> int:
+    """A block length of at most `step` that cuts `total` into near-equal blocks.
+
+    Fewer distinct block shapes means fewer NEFF compiles: 128 rows in blocks of
+    at most 64 is 64 + 64, not 63 + 63 + 2."""
+    return -(-total // -(-total // step))
 
 
 def _span_bytes(t: torch.Tensor) -> int:
@@ -832,7 +844,7 @@ def _span_block(t: torch.Tensor) -> int:
     """0 if a 2-D `t` is a safe device matmul operand, else its rows per block.
 
     Unsafe means min(rows, 128) * row bytes >= 2**32 (see above). A block of
-    that many memory rows spans at most 2 GiB (and holds at least one row).
+    that many memory rows spans at most 2 GiB + 1 MiB (and holds at least one row).
     """
     if t.dim() != 2 or _span_bytes(t) < _NEURON_SPAN_BYTES:
         return 0
@@ -913,10 +925,12 @@ def _neuron_mm2d(a: torch.Tensor, b: torch.Tensor, mm=None) -> torch.Tensor:
     N = b.shape[1]
     ob = _out_block(M, N, a.element_size())
     if ob and ob < M:  # the result itself: blocks of output rows
+        ob = _even_step(M, ob)
         return _neuron_cat([_neuron_mm2d(a[i : i + ob], b, mm) for i in range(0, M, ob)], 0)
     ab = _span_block(a)
     if ab:
         if _row_layout(a)[0] == 0 and ab < M:  # long rows of A: split M
+            ab = _even_step(M, ab)
             return _neuron_cat([_neuron_mm2d(a[i : i + ab], b, mm) for i in range(0, M, ab)], 0)
         if _row_layout(a)[0] == 1 and ab < K:  # A = X.T, long rows of X: split K
             return _neuron_mm_ksum(a, b, ab, mm)
@@ -925,6 +939,7 @@ def _neuron_mm2d(a: torch.Tensor, b: torch.Tensor, mm=None) -> torch.Tensor:
         if _row_layout(b)[0] == 0 and bb < K:  # long rows of B: split K
             return _neuron_mm_ksum(a, b, bb, mm)
         if _row_layout(b)[0] == 1 and bb < N:  # B = Y.T, long rows of Y: split N
+            bb = _even_step(N, bb)
             return _neuron_cat([_neuron_mm2d(a, b[:, j : j + bb], mm) for j in range(0, N, bb)], 1)
     if mm is not None and not _neuron_mm_unsafe(a, b):
         return mm(a, b)
@@ -934,6 +949,7 @@ def _neuron_mm2d(a: torch.Tensor, b: torch.Tensor, mm=None) -> torch.Tensor:
 def _neuron_mm_ksum(a: torch.Tensor, b: torch.Tensor, step: int, mm=None) -> torch.Tensor:
     """Sum over K blocks of `step` of a[:, k] @ b[k], in order."""
     out = None
+    step = _even_step(a.shape[1], step)
     for k in range(0, a.shape[1], step):
         ak, bk = a[:, k : k + step], b[k : k + step]
         # The other operand's slice is small and strided: give it a dense copy.
