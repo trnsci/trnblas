@@ -137,11 +137,19 @@ def pair_energy(
     nocc = B_full.shape[0]
     chunks = occ_chunks(nocc, w)
     dev = B_full.device
+    operands = (B_full, eps_occ, eps_vir)
+    if D._REQUIRE_NKI and D._use_nki():
+        D._refuse_device_fp64("pair_energy", operands)
     route = D._pair_energy_route(B_full) if D._use_nki() and r < len(chunks) else "aten"
-    if route == "sym" and B_full.dtype not in D._ENERGY_DATA_DTYPES:
+    cast = route == "sym" and B_full.dtype not in D._ENERGY_DATA_DTYPES
+    if cast:
         # Float64 B under explicit set_backend("nki"): the FP32 sym kernel.
         D._warn_fp32_cast("pair_energy")
         B_full = B_full.to(torch.float32)
+    elif D._backend == "nki" and any(D._fp64_device_resident(t) for t in operands):
+        # Device float64 / complex128 on the aten route, or float64 eps rounded
+        # to B's float32: fp32 precision on the device (#103).
+        D._warn_fp32_device("pair_energy", kernel=True)
     eo_h = eps_occ.detach().cpu().to(B_full.dtype)
     ev_h = eps_vir.detach().cpu().to(B_full.dtype)
     if r < len(chunks):

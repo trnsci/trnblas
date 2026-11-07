@@ -645,3 +645,122 @@ class TestNativeNoKernelFloat64Warning:
         assert not [w for w in rec if "precision is reduced to float32" in str(w.message)]
         torch.testing.assert_close(got_host, ref, rtol=1e-12, atol=1e-12)
         torch.testing.assert_close(got_auto.cpu(), ref, rtol=1e-12, atol=1e-12)
+
+
+class TestNativeKernelOpOffCastFloat64Warning:
+    """Explicit `nki`, ops WITH a kernel, float64 / complex128 on the device that
+    does not take the kernel's float32 cast (#103): device aten at fp32
+    precision with one UserWarning per op; REQUIRE_NKI raises; left trsm on
+    complex128 solves on the host at full precision with no warning.
+
+    Device complex128 support in aten is not probed yet: a case the device
+    rejects is skipped with the error, which is itself the probe result.
+    """
+
+    MSG = "on the neuron device run on device aten; precision is reduced to float32"
+
+    @pytest.fixture
+    def nki_backend(self, monkeypatch):
+        old = trnblas.get_backend()
+        trnblas.set_backend("nki")
+        monkeypatch.setattr(D, "_fp32_cast_warned", set())
+        monkeypatch.setattr(D, "_fp64_host_warned", set())
+        yield
+        trnblas.set_backend(old)
+
+    @staticmethod
+    def _cases():
+        c = torch.complex128
+        L = torch.tril(_host(256, 256, seed=7).double() * 0.01) + 4 * torch.eye(256).double()
+        X = _host(512, 512, seed=8).double()
+        J = X @ X.T / 512 + torch.eye(512).double()
+        A64, B64 = _host(256, 192, seed=1).double(), _host(192, 128, seed=2).double()
+        return {
+            "gemm-c128": ("gemm", lambda A, B: trnblas.gemm(1.0, A, B), (A64.to(c), B64.to(c))),
+            "gemm-3d-f64": (
+                "gemm",
+                lambda A, B: trnblas.gemm(1.0, A, B),
+                (A64.reshape(2, 128, 192), B64.reshape(1, 192, 128)),
+            ),
+            "gemm-f32-C_f64": (
+                "gemm",
+                lambda A, B, C: trnblas.gemm(1.0, A, B, beta=1.0, C=C),
+                (A64.float(), B64.float(), _host(256, 128, seed=3).double()),
+            ),
+            "syrk-c128": ("syrk", lambda A: trnblas.syrk(1.0, A), (A64.to(c),)),
+            "trsm-right-f64": (
+                "trsm",
+                lambda A, B: trnblas.trsm(1.0, A, B, side="right", uplo="lower"),
+                (L, _host(64, 256, seed=4).double()),
+            ),
+            "metric_inv_half-device-f64": ("metric_inv_half", trnblas.metric_inv_half, (J,)),
+            "batched_pair_energy-aten-f64": (
+                "batched_pair_energy",
+                trnblas.nki.nki_batched_pair_energy,
+                (
+                    _host(8, 64, 128, seed=5).double() * 0.1,
+                    -torch.linspace(1.0, 2.0, 8).double(),
+                    torch.linspace(0.5, 1.5, 64).double(),
+                ),
+            ),
+        }
+
+    CASES = [
+        "gemm-c128",
+        "gemm-3d-f64",
+        "gemm-f32-C_f64",
+        "syrk-c128",
+        "trsm-right-f64",
+        "metric_inv_half-device-f64",
+        "batched_pair_energy-aten-f64",
+    ]
+
+    def _setup(self, monkeypatch, case):
+        if case == "metric_inv_half-device-f64":
+            monkeypatch.setenv("TRNBLAS_METRIC_SOLVE", "device")
+        if case.startswith("batched_pair_energy"):
+            monkeypatch.setenv("TRNBLAS_PAIR_ENERGY", "aten")
+
+    @pytest.mark.parametrize("case", CASES)
+    def test_device_float64_off_the_cast_warns_once(self, nki_backend, monkeypatch, case):
+        import warnings
+
+        self._setup(monkeypatch, case)
+        op, fn, args = self._cases()[case]
+        trnblas.set_backend("pytorch")
+        ref = fn(*args)  # host float64 reference
+        trnblas.set_backend("nki")
+        dev = [a.to(DEV) for a in args]
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            try:
+                outs = [fn(*dev) for _ in range(3)]
+            except RuntimeError as exc:
+                pytest.skip(f"{case}: the neuron device rejects it: {exc}")
+        msgs = [w for w in rec if f"trnblas {op}:" in str(w.message) and self.MSG in str(w.message)]
+        assert len(msgs) == 1, [str(w.message) for w in rec]
+        for got in outs:
+            assert got.device.type == "neuron" and got.dtype == ref.dtype
+            assert _rel(got.cpu(), ref) < 1e-4  # fp32 precision, as the warning says
+
+    @pytest.mark.parametrize("case", CASES)
+    def test_require_nki_raises(self, nki_backend, monkeypatch, case):
+        self._setup(monkeypatch, case)
+        monkeypatch.setattr(D, "_REQUIRE_NKI", True)
+        _, fn, args = self._cases()[case]
+        with pytest.raises(NotImplementedError, match="TRNBLAS_REQUIRE_NKI"):
+            fn(*[a.to(DEV) for a in args])
+
+    def test_left_trsm_complex128_solves_on_host_quietly(self, nki_backend):
+        import warnings
+
+        c = torch.complex128
+        L = torch.tril(_host(256, 256, seed=7).double() * 0.01) + 4 * torch.eye(256).double()
+        A, B = L.to(c), _host(256, 32, seed=9).double().to(c)
+        ref = torch.linalg.solve_triangular(A, B, upper=False)
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            got = trnblas.trsm(1.0, A.to(DEV), B.to(DEV), uplo="lower")
+        assert not [w for w in rec if "precision is reduced to float32" in str(w.message)]
+        assert got.device.type == "neuron" and got.dtype == c
+        torch.testing.assert_close(got.cpu(), ref, rtol=1e-10, atol=1e-10)

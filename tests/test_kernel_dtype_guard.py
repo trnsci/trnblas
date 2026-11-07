@@ -1087,3 +1087,373 @@ def test_forced_aten_policy_keeps_host_float64_on_host(fake_neuron, monkeypatch,
     _run(fn, args, "auto")
     # trsm takes no `lnc` policy: host operands solve on the host either way.
     assert uploads or (name, policy) == ("trsm", "lnc")
+
+
+# Explicit `nki` on an op WITH a kernel (#103): float64 / complex128 on the
+# neuron device that does not take the kernel's float32 cast (complex128,
+# float64 mixed with another dtype, a shape or side with no kernel route, an
+# fp64 `C`, the size-chosen energy aten route) runs on device aten at fp32
+# precision. It warns once per op, in the shared dedup set and wording, and
+# TRNBLAS_REQUIRE_NKI=1 raises. Routes that compute only on the host at full
+# precision (left `trsm` on complex128, the `metric_inv_half` host route) do
+# not warn.
+C128 = torch.complex128
+I64 = torch.int64
+DEVICE_ATEN_MSG = "on the neuron device run on device aten; precision is reduced to float32"
+
+
+def _device_aten_warnings(record):
+    return [w for w in record if DEVICE_ATEN_MSG in str(w.message)]
+
+
+def _right_trsm(A, B):
+    return trnblas.trsm(1.0, A, B, side="right")
+
+
+def _nki_gemm_C(A, B, C):
+    return trnblas.gemm(1.5, A, B, beta=0.5, C=C)
+
+
+def _syrk_C(A, C):
+    return trnblas.syrk(1.5, A, beta=0.5, C=C)
+
+
+def _mp2(d, e):
+    return APIS["nki_mp2_energy"][1](d, e)
+
+
+def _fused(d, e):
+    return APIS["nki_fused_gemm_energy"][1](d, e)
+
+
+def _pair(d, e):
+    return APIS["nki_batched_pair_energy"][1](d, e)
+
+
+# id -> (op in the warning, callable, args builder, extra setup)
+KERNEL_ROUTES = {
+    # complex128: `_kernel_dtypes_ok` is false and `_nki_casts_fp64` needs all-float64.
+    "gemm-c128": ("gemm", APIS["gemm"][0], lambda: APIS["gemm"][1](C128, F32), None),
+    "nki_gemm-c128": ("gemm", APIS["nki_gemm"][0], lambda: APIS["nki_gemm"][1](C128, F32), None),
+    "batched_gemm-c128": (
+        "batched_gemm",
+        APIS["batched_gemm"][0],
+        lambda: APIS["batched_gemm"][1](C128, F32),
+        None,
+    ),
+    "nki_batched_gemm-c128": (
+        "batched_gemm",
+        APIS["nki_batched_gemm"][0],
+        lambda: APIS["nki_batched_gemm"][1](C128, F32),
+        None,
+    ),
+    "syrk-c128": ("syrk", APIS["syrk"][0], lambda: APIS["syrk"][1](C128, F32), None),
+    "syrk_trans-c128": ("syrk", APIS["syrk_trans"][0], lambda: APIS["syrk"][1](C128, F32), None),
+    "nki_syrk-c128": ("syrk", APIS["nki_syrk"][0], lambda: APIS["nki_syrk"][1](C128, F32), None),
+    # Shapes with no kernel route under `nki`: batched / 1-D `gemm` operands go
+    # straight to torch.matmul, all-float64 included.
+    "gemm-3d-f64": (
+        "gemm",
+        lambda A, B: trnblas.gemm(1.0, A, B),
+        lambda: (_rand((2, 9, 7), F64), _rand((2, 7, 5), F64, 1)),
+        None,
+    ),
+    "gemm-1d-f64": (
+        "gemm",
+        lambda A, b: trnblas.gemm(1.0, A, b),
+        lambda: (_rand((9, 7), F64), _rand((7,), F64, 1)),
+        None,
+    ),
+    "nki_batched_gemm-1d-f64": (
+        "batched_gemm",
+        trnblas.nki.nki_batched_gemm,
+        lambda: (_rand((2, 9, 7), F64), _rand((7,), F64, 1)),
+        None,
+    ),
+    # float64 mixed with another dtype: an fp64 C added to the fp32 kernel result.
+    "gemm-f32-C_f64": (
+        "gemm",
+        _nki_gemm_C,
+        lambda: (_rand((9, 7), F32), _rand((7, 5), F32, 1), _rand((9, 5), F64, 2)),
+        None,
+    ),
+    "gemm-f32-C_c128": (
+        "gemm",
+        _nki_gemm_C,
+        lambda: (_rand((9, 7), F32), _rand((7, 5), F32, 1), _rand((9, 5), C128, 2)),
+        None,
+    ),
+    "syrk-f32-C_f64": ("syrk", _syrk_C, lambda: (_rand((6, 4), F32), _spd(6, F64)), None),
+    # trsm: side='right' never takes the blocked kernel route.
+    "trsm-right-f64": (
+        "trsm",
+        _right_trsm,
+        lambda: (_tri(130, F64), _rand((3, 130), F64, 1)),
+        None,
+    ),
+    "trsm-right-c128": (
+        "trsm",
+        _right_trsm,
+        lambda: (_tri(130, C128), _rand((3, 130), C128, 1)),
+        None,
+    ),
+    # trsm, float64 mixed with another dtype: `_trsm_route` -> "torch".
+    "trsm-f64-B_f32": (
+        "trsm",
+        APIS["trsm"][0],
+        lambda: (_tri(130, F64), _rand((130, 3), F32, 1)),
+        None,
+    ),
+    "nki_trsm-f32-B_c128": (
+        "trsm",
+        APIS["nki_trsm"][0],
+        lambda: (_tri(130, F32), _rand((130, 3), C128, 1)),
+        None,
+    ),
+    # metric_inv_half device route: the Cholesky runs on device aten. Before,
+    # float64 warned only as "trsm" (nothing once trsm had warned), complex128
+    # not at all.
+    "metric_inv_half-device-f64": (
+        "metric_inv_half",
+        APIS["metric_inv_half"][0],
+        lambda: APIS["metric_inv_half"][1](F64, F32),
+        None,
+    ),
+    "nki_metric_inv_half-device-c128": (
+        "metric_inv_half",
+        APIS["nki_metric_inv_half"][0],
+        lambda: APIS["nki_metric_inv_half"][1](C128, F32),
+        None,
+    ),
+    # Energy kernels: complex128, and float64 mixed with a dtype that is not
+    # float64 (`_nki_casts_fp64(*bad)` false), run the torch reference.
+    "nki_mp2_energy-c128": ("mp2_energy", APIS["nki_mp2_energy"][0], lambda: _mp2(C128, F32), None),
+    "nki_mp2_energy-eps_c128": (
+        "mp2_energy",
+        APIS["nki_mp2_energy"][0],
+        lambda: _mp2(F32, C128),
+        None,
+    ),
+    "nki_mp2_energy-f64-eps_i64": (
+        "mp2_energy",
+        APIS["nki_mp2_energy"][0],
+        lambda: _mp2(F64, I64),
+        None,
+    ),
+    "nki_fused_gemm_energy-c128": (
+        "fused_gemm_energy",
+        APIS["nki_fused_gemm_energy"][0],
+        lambda: _fused(C128, F32),
+        None,
+    ),
+    "nki_fused_gemm_energy-f64-eps_c128": (
+        "fused_gemm_energy",
+        APIS["nki_fused_gemm_energy"][0],
+        lambda: _fused(F64, C128),
+        None,
+    ),
+    "nki_batched_pair_energy-c128": (
+        "batched_pair_energy",
+        APIS["nki_batched_pair_energy"][0],
+        lambda: _pair(C128, F32),
+        None,
+    ),
+    "nki_batched_pair_energy-f64-eps_i64": (
+        "batched_pair_energy",
+        APIS["nki_batched_pair_energy"][0],
+        lambda: _pair(F64, I64),
+        None,
+    ),
+    # Device B on the native aten route (chosen by size, or forced): float64
+    # is not cast there, and float64 eps are not rounded.
+    "nki_batched_pair_energy-aten-f64": (
+        "batched_pair_energy",
+        APIS["nki_batched_pair_energy"][0],
+        lambda: _pair(F64, F32),
+        "pair_aten",
+    ),
+    "nki_batched_pair_energy-aten-eps_f64": (
+        "batched_pair_energy",
+        APIS["nki_batched_pair_energy"][0],
+        lambda: _pair(F32, F64),
+        "pair_aten",
+    ),
+    "nki_batched_pair_energy-aten-c128": (
+        "batched_pair_energy",
+        APIS["nki_batched_pair_energy"][0],
+        lambda: _pair(C128, F32),
+        "pair_device",
+    ),
+    "nki_batched_pair_energy-multicore_aten-f64": (
+        "batched_pair_energy",
+        APIS["nki_batched_pair_energy"][0],
+        lambda: _pair(F64, F32),
+        "pair_multicore_aten",
+    ),
+}
+
+
+def _route_setup(monkeypatch, setup):
+    if setup is None:
+        return
+    monkeypatch.setattr(dispatch, "_on_neuron_device", lambda *t: True)
+    if setup == "pair_aten":
+        monkeypatch.setenv("TRNBLAS_PAIR_ENERGY", "aten")
+    if setup == "pair_multicore_aten":
+        monkeypatch.setenv("TRNBLAS_PAIR_ENERGY", "aten")
+        cpu = torch.device("cpu")
+        monkeypatch.setattr(multicore, "pair_energy_devices", lambda B: [cpu, cpu])
+
+
+def _kernel_route_case(monkeypatch, case):
+    op, fn, build, setup = KERNEL_ROUTES[case]
+    _route_setup(monkeypatch, setup)
+    args = build()
+    ref, exc = _pytorch(fn, args)
+    assert exc is None, f"{case}: the pytorch backend raised {exc!r}"
+    return op, fn, args, ref
+
+
+@pytest.mark.parametrize("case", sorted(KERNEL_ROUTES))
+def test_nki_device_float64_off_the_cast_warns_once(fake_neuron, monkeypatch, case):
+    op, fn, args, ref = _kernel_route_case(monkeypatch, case)
+    dev_args = [fake_neuron.mark(a) for a in args]
+    dispatch.set_backend("nki")
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        outs = [fn(*dev_args) for _ in range(3)]
+    msgs = [w for w in _cast_warnings(rec) if f"trnblas {op}:" in str(w.message)]
+    assert len(msgs) == 1, [str(w.message) for w in rec]
+    assert msgs[0].category is UserWarning
+    assert DEVICE_ATEN_MSG in str(msgs[0].message)
+    assert msgs[0].filename == __file__  # points at the caller, not trnblas
+    assert not _host_warnings(rec)
+    assert not fake_neuron.down and not fake_neuron.up  # stays on the device
+    assert not fake_neuron.stubs.violations
+    for got in outs:
+        assert got.dtype == ref.dtype
+        if not fake_neuron.stubs.calls:  # the stub kernels return zeros
+            torch.testing.assert_close(got, ref, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parametrize("case", sorted(KERNEL_ROUTES))
+def test_nki_device_float64_off_the_cast_quiet_elsewhere(fake_neuron, monkeypatch, case):
+    """No device-aten warning for the same inputs on the host under `nki`, and
+    no fp32 warning on the device under `pytorch` or `auto` (host warning only)."""
+    _, fn, args, _ = _kernel_route_case(monkeypatch, case)
+    for backend, marked in [("nki", False), ("pytorch", True), ("auto", True)]:
+        a = [fake_neuron.mark(t) for t in args] if marked else args
+        dispatch.set_backend(backend)
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            fn(*a)
+        bad = _device_aten_warnings(rec) if backend == "nki" else _cast_warnings(rec)
+        assert not bad, (backend, marked, [str(w.message) for w in rec])
+
+
+@pytest.mark.parametrize("backend", ["auto", "nki"])
+@pytest.mark.parametrize("case", sorted(KERNEL_ROUTES))
+def test_require_nki_device_float64_off_the_cast_raises(fake_neuron, monkeypatch, backend, case):
+    op, fn, args, _ = _kernel_route_case(monkeypatch, case)
+    monkeypatch.setattr(dispatch, "_REQUIRE_NKI", True)
+    dispatch.set_backend(backend)
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        with pytest.raises(NotImplementedError, match="TRNBLAS_REQUIRE_NKI"):
+            fn(*[fake_neuron.mark(a) for a in args])
+    assert not fake_neuron.down and not fake_neuron.stubs.calls
+    assert not _cast_warnings(rec)
+
+
+def test_nki_kernel_cast_and_route_warning_share_one_entry(fake_neuron):
+    """One warning per op across routes: a complex128 gemm after a float64
+    gemm (kernel cast) does not warn again, and vice versa for trsm."""
+    calls = [_dev_case(n, d, F32)[:2] for n, d in [("gemm", F64), ("gemm", C128)]]
+    calls += [_dev_case("nki_gemm", d, F32)[:2] for d in (C128, F64)]  # same op as gemm
+    calls.append((_right_trsm, (_tri(130, F64), _rand((3, 130), F64))))
+    calls.append(_dev_case("trsm", F64, F32)[:2])
+    dispatch.set_backend("nki")
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        for fn, args in calls:
+            fn(*[fake_neuron.mark(a) for a in args])
+    msgs = [str(w.message) for w in _cast_warnings(rec)]
+    assert len(msgs) == 2, msgs
+    assert msgs[0].startswith("trnblas gemm:") and "on the FP32 NKI kernel" in msgs[0]
+    assert msgs[1].startswith("trnblas trsm:") and "device aten" in msgs[1]
+
+
+def test_nki_metric_inv_half_warns_under_its_own_name(fake_neuron):
+    """The device route's trsm cast used to be its only warning, keyed "trsm":
+    after a plain trsm warned, metric_inv_half on device float64 was silent."""
+    fn, args, _ = _dev_case("trsm", F64, F32)
+    dispatch.set_backend("nki")
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        fn(*[fake_neuron.mark(a) for a in args])
+        trnblas.metric_inv_half(fake_neuron.mark(_spd(130, F64)))
+    msgs = [str(w.message) for w in _cast_warnings(rec)]
+    assert [m.split(":")[0] for m in msgs] == ["trnblas trsm", "trnblas metric_inv_half"], msgs
+
+
+@pytest.mark.parametrize(
+    "name,d", [("trsm", C128), ("nki_trsm", C128), ("metric_inv_half", F64)], ids=str
+)
+def test_nki_device_float64_on_a_host_route_stays_quiet(fake_neuron, monkeypatch, name, d):
+    """Left trsm on complex128 and the metric_inv_half host route compute on
+    the host at full precision: no fp32 warning."""
+    monkeypatch.setattr(dispatch, "_on_neuron_device", lambda *t: True)  # metric host route
+    fn, args, ref = _dev_case(name, d, F32)
+    dispatch.set_backend("nki")
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        got = fn(*[fake_neuron.mark(a) for a in args])
+    assert not _cast_warnings(rec), [str(w.message) for w in rec]
+    assert not fake_neuron.stubs.calls
+    torch.testing.assert_close(got, ref, rtol=1e-10, atol=1e-10)
+
+
+def test_nki_mixed_float64_gemm_that_raises_does_not_warn(fake_neuron):
+    """float64 @ float32 raises as torch.matmul does; nothing ran, no warning."""
+    A, B = fake_neuron.mark(_rand((9, 7), F64)), fake_neuron.mark(_rand((7, 5), F32, 1))
+    dispatch.set_backend("nki")
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        with pytest.raises(RuntimeError):
+            trnblas.gemm(1.0, A, B)
+    assert not _cast_warnings(rec)
+
+
+# trnblas.parallel.pair_energy is not wrapped by `_fp64_host_guard` (its
+# all-reduce needs the caller's group); it applies the same rules itself.
+PARALLEL_CASES = {
+    "aten-f64": (F64, F32, "aten", True),
+    "aten-c128": (C128, F32, "aten", True),
+    "sym-eps_f64": (F32, F64, "sym", True),
+    "sym-f64": (F64, F32, "sym", False),  # the kernel cast's own warning
+}
+
+
+@pytest.mark.parametrize("case", sorted(PARALLEL_CASES))
+def test_parallel_pair_energy_device_float64_under_nki(fake_neuron, monkeypatch, case):
+    from trnblas import parallel
+
+    d, e, route, device_msg = PARALLEL_CASES[case]
+    monkeypatch.setenv("TRNBLAS_PAIR_ENERGY", route)
+    monkeypatch.setattr(dispatch, "_on_neuron_device", lambda *t: True)
+    monkeypatch.setattr(parallel, "_rank_world", lambda group: (0, 1))
+    monkeypatch.setattr(parallel.dist, "all_reduce", lambda t, group=None: t)
+    args = [fake_neuron.mark(a) for a in _pair(d, e)]
+    dispatch.set_backend("nki")
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        for _ in range(3):
+            parallel.pair_energy(*args)
+    msgs = _cast_warnings(rec)
+    assert len(msgs) == 1, [str(w.message) for w in rec]
+    assert str(msgs[0].message).startswith("trnblas pair_energy:")
+    assert ("device aten" in str(msgs[0].message)) == device_msg
+    assert msgs[0].filename == __file__
+    monkeypatch.setattr(dispatch, "_REQUIRE_NKI", True)
+    with pytest.raises(NotImplementedError, match="TRNBLAS_REQUIRE_NKI"):
+        parallel.pair_energy(*args)

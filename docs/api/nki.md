@@ -45,7 +45,7 @@ accuracy. trnblas follows the trnsci suite-wide policy (#89):
 | Mode | float64 operands |
 |---|---|
 | `set_backend("auto")` | Run in host torch at float64 accuracy. No kernel is called. float64 / complex128 operands already on the `neuron` device are copied to the host, computed there, and the result is returned on the device in float64 (one `UserWarning` per op; see below). |
-| `set_backend("nki")` | Cast to float32, run on the NKI kernel, result cast back. One `UserWarning` per op says precision is reduced to float32. Ops with no kernel (Level 1/2, `symm`, `trmm`) run in torch on the operands' device: host float64 keeps float64 accuracy with no warning, and float64 / complex128 on the `neuron` device runs on device aten at fp32 precision with the same once-per-op warning. |
+| `set_backend("nki")` | Cast to float32, run on the NKI kernel, result cast back. One `UserWarning` per op says precision is reduced to float32. Ops with no kernel (Level 1/2, `symm`, `trmm`) run in torch on the operands' device: host float64 keeps float64 accuracy with no warning, and float64 / complex128 on the `neuron` device runs on device aten at fp32 precision with the same once-per-op warning. Ops with a kernel give the same warning when device float64 / complex128 does not take the float32 cast (see below). |
 | `TRNBLAS_REQUIRE_NKI=1` | `NotImplementedError`. Takes precedence over the `nki` cast. float64 / complex128 on the `neuron` device raise at every public op, including the routes with no kernel (see below). |
 | `set_backend("pytorch")` | torch, as always. |
 
@@ -69,7 +69,26 @@ accuracy. trnblas follows the trnsci suite-wide policy (#89):
   `TRNBLAS_FP64_ON_DEVICE`; before, the routes with no kernel (`auto`
   GEMM-family device aten, `symm`, Level 1/2) computed it at fp32 precision
   with no error. The `trnblas.parallel`
-  (multi-process) helpers are float32 pipelines and are not covered.
+  (multi-process) helpers are float32 pipelines and are not covered, except
+  `parallel.pair_energy` (below).
+- **Explicit `nki`, device float64 off the cast (#103).** On an op with a
+  kernel, float64 / complex128 on the `neuron` device takes the float32
+  kernel cast only when every operand is float64 and the call has a kernel
+  route. The other calls run on device aten at fp32 precision, and the op
+  emits one `UserWarning` ("... run on device aten; precision is reduced to
+  float32"), sharing the dedup set of the cast warning (`nki_gemm` and
+  `gemm` count as one op). That covers complex128 operands (`gemm`,
+  `batched_gemm`, `syrk`, the energy APIs), float64 mixed with another
+  dtype (a float64 `C` on a float32 `gemm` / `syrk`, mixed `trsm`
+  operands, float64 amplitudes with integer or complex `eps`), shapes or
+  sides with no kernel route (batched or 1-D `gemm` operands, a 1-D operand
+  to `nki_batched_gemm`, `side="right"` `trsm`), the `metric_inv_half`
+  device route (its Cholesky runs on device aten), and the
+  `nki_batched_pair_energy` / `parallel.pair_energy` aten route.
+  `TRNBLAS_REQUIRE_NKI=1` raises for all of them, `parallel.pair_energy`
+  included. No warning where the work stays on the host at full precision:
+  left `trsm` on complex128 and the `metric_inv_half` host route. A mixed
+  call that torch refuses (float64 @ float32) still raises, with no warning.
 - The GEMM / SYRK kernels take float32, bfloat16 and float16 (FP32 PSUM
   accumulation, output in the input dtype). The DF-MP2 energy kernels take
   float32; bfloat16 / float16 operands are upcast exactly.
