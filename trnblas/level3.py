@@ -91,7 +91,7 @@ def gemm(
     runs device-resident operands as aten on the device and host operands on
     the host CPU or as upload + aten, by measured time.
     """
-    from .nki.dispatch import _neuron_mm_lhs, _use_nki, nki_gemm
+    from .nki.dispatch import _neuron_matmul, _use_nki, nki_gemm
 
     transA, transB = trans_flag(transA, "transA"), trans_flag(transB, "transB")
     # `.mT`, not `.T`: on a batched operand `.T` reverses every dimension
@@ -104,7 +104,7 @@ def gemm(
         # takes a transposed `a` as is (#79).
         result = nki_gemm(a, b)
     else:
-        result = torch.matmul(_neuron_mm_lhs(a, b), b)
+        result = _neuron_matmul(a, b)
 
     return _scale_add(result, alpha, beta, C)
 
@@ -151,7 +151,7 @@ def symm(
     Used in Fock matrix construction: F = H_core + J - K
     where J and K involve symmetric density matrix contractions.
     """
-    from .nki.dispatch import _aten_on_device, _gemm_route, _on_neuron_device
+    from .nki.dispatch import _aten_on_device, _gemm_route, _neuron_matmul, _on_neuron_device
 
     side, uplo = side_flag(side), uplo_flag(uplo)
 
@@ -160,7 +160,7 @@ def symm(
             sym = torch.triu(A) + torch.triu(A, diagonal=1).T
         else:
             sym = torch.tril(A) + torch.tril(A, diagonal=-1).T
-        return torch.matmul(sym, B) if side == "left" else torch.matmul(B, sym)
+        return _neuron_matmul(sym, B) if side == "left" else _neuron_matmul(B, sym)
 
     n = A.shape[0]
     out_numel = B.numel()
@@ -211,11 +211,15 @@ def syrk(
     symmetrised.
     """
     from .nki import nki_syrk
-    from .nki.dispatch import _symmetrize
+    from .nki.dispatch import _is_neuron, _out_block, _symmetrize
 
     trans = trans_flag(trans)
     uplo = uplo_flag(uplo)
     A_eff = A.T.contiguous() if trans else A
+    if trans and _is_neuron(A) and _out_block(*A_eff.shape, A.element_size()):
+        # #112: a device copy into that layout is itself unsafe; A^T as a view
+        # (A's own short rows) is a safe operand of the blocked product.
+        A_eff = A.T
     add = C is not None and beta != 0.0
     n = A_eff.shape[0]
     if add and C.dim() == 2 and tuple(C.shape) == (n, n):
@@ -346,7 +350,9 @@ def trmm(
 
     mat = tri.T if trans else tri
 
+    from .nki.dispatch import _neuron_matmul
+
     if side == "left":
-        return alpha * torch.matmul(mat, B)
+        return alpha * _neuron_matmul(mat, B)
     else:
-        return alpha * torch.matmul(B, mat)
+        return alpha * _neuron_matmul(B, mat)

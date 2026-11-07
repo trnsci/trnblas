@@ -732,7 +732,11 @@ def _nki_gemm_lnc(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
 
     A transposed view goes to `_gemm_lnc_tn_kernel` as its dense base (no
     copy, no transposes); anything else to `_gemm_lnc_kernel`. Falls back to
-    aten if the kernel fails (re-raises under TRNBLAS_REQUIRE_NKI=1)."""
+    aten if the kernel fails (re-raises under TRNBLAS_REQUIRE_NKI=1). Operands
+    with the #112 layout take the blocked aten route instead (`_neuron_matmul`):
+    the kernels' B-tile DMAs step by one B row as aten's do."""
+    if _neuron_mm_unsafe(A, B):
+        return _neuron_matmul(A, B)
     b = B.contiguous()
     try:
         if A.mT.is_contiguous():
@@ -742,7 +746,7 @@ def _nki_gemm_lnc(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
         if _REQUIRE_NKI:
             raise
         _warn_fallback(exc, "LNC GEMM kernel failed — falling back to aten")
-        return torch.matmul(_neuron_mm_lhs(A, B), B)
+        return _neuron_matmul(A, B)
 
 
 def _aten_on_device(fn, *tensors: torch.Tensor) -> torch.Tensor:
@@ -771,6 +775,219 @@ def _neuron_mm_lhs(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     ):
         return a.contiguous()
     return a
+
+
+# aten::mm on the native `neuron` device is also silently wrong (or aborts with
+# NRT status 1203) with a *contiguous* left operand once one operand's 128 DMA
+# partitions span 4 GiB or more. Its memory rows are the partition step, and
+# with a step of 32 MiB or more partitions 64-127 are read from 4 GiB below the
+# right address (#112, aws-neuron-sdk#1457, trnsci/trnsci#140). The rule is
+# min(rows, 128) * row_bytes >= 2**32; for B (K, N) with K >= 128 that is a row
+# of 32 MiB or more (fp32 N >= 8,388,608). Measured on Trn2 (SDK 2.33, LNC=2,
+# B uploaded above a decoy holding other data, 2026-11-07):
+#   - (96, 128) @ (128, 8,389,632): rel err 0.79, no error. bmm: the same.
+#   - (128, 8,389,632) @ (8,389,632, 64), the long rows in A: rel err 0.80.
+#   - the same B as a transposed view (short memory rows): correct.
+#   - K = 64 with the same long rows: correct (trnsci#140).
+#   - a device copy of a column slice of such a B (`B[:, :n].contiguous()`) is
+#     itself wrong (max abs err 13), so chunking B by columns on the device does
+#     not help. A host round trip of the whole tensor is bit-exact.
+# A block of whole memory rows is a contiguous view and needs no copy, so
+# `_neuron_matmul` cuts each long-row operand into row blocks spanning at most
+# about 2 GiB (the measured-safe K = 64 x 32 MiB regime): it splits K (partial sums)
+# or M / N (concatenated results). Row blocks at offsets up to 6 GB with
+# partial sums over K measured correct (rel err 2.8e-7), and so did M blocks of
+# a long-row A. A result with the bad layout is built from blocks of its rows
+# (a device `cat` along dim 0, measured correct). Every other product is left
+# untouched.
+_NEURON_SPAN_BYTES = 1 << 32
+_NEURON_PARTITIONS = 128
+# Rows per block: a span of at most 2 GiB + 1 MiB, so 64 rows of up to
+# 32 MiB + 16 KiB (measured correct: K = 64 at 32 MiB + 4 KiB on #140, and
+# 63-row blocks here) and fewer rows for longer ones. All of them sit in
+# partitions 0-63, which the upstream analysis says are read correctly.
+_NEURON_BLOCK_BYTES = (1 << 31) + (1 << 20)
+
+
+def _even_step(total: int, step: int) -> int:
+    """A block length of at most `step` that cuts `total` into near-equal blocks.
+
+    Fewer distinct block shapes means fewer NEFF compiles: 128 rows in blocks of
+    at most 64 is 64 + 64, not 63 + 63 + 2."""
+    return -(-total // -(-total // step))
+
+
+def _span_bytes(t: torch.Tensor) -> int:
+    """Bytes from the first to the last element of `t`'s view, inclusive."""
+    if t.numel() == 0:
+        return 0
+    return (
+        1 + sum((n - 1) * abs(s) for n, s in zip(t.shape, t.stride(), strict=True))
+    ) * t.element_size()
+
+
+def _row_layout(t: torch.Tensor) -> tuple[int, int, int]:
+    """(row dim, rows, row bytes) of the memory rows of a 2-D `t`.
+
+    A row-major matrix has its memory rows along dim 0, and a transposed view
+    (`X.T` of a row-major X) along dim 1. Row bytes is the row stride, or the
+    row length if that is larger, so a slice of a wider matrix counts its
+    parent's rows.
+    """
+    item = t.element_size()
+    if t.stride(1) == 1 or (t.stride(0) != 1 and t.shape[1] == 1):
+        return 0, t.shape[0], max(t.shape[1], abs(t.stride(0))) * item
+    return 1, t.shape[1], max(t.shape[0], abs(t.stride(1))) * item
+
+
+def _span_block(t: torch.Tensor) -> int:
+    """0 if a 2-D `t` is a safe device matmul operand, else its rows per block.
+
+    Unsafe means min(rows, 128) * row bytes >= 2**32 (see above). A block of
+    that many memory rows spans at most 2 GiB + 1 MiB (and holds at least one row).
+    """
+    if t.dim() != 2 or _span_bytes(t) < _NEURON_SPAN_BYTES:
+        return 0
+    _, rows, row_bytes = _row_layout(t)
+    if min(rows, _NEURON_PARTITIONS) * row_bytes < _NEURON_SPAN_BYTES:
+        return 0
+    return max(1, _NEURON_BLOCK_BYTES // row_bytes)
+
+
+def _out_block(M: int, N: int, itemsize: int) -> int:
+    """0 if a fresh row-major (M, N) result is safe, else its rows per block."""
+    row_bytes = N * itemsize
+    if min(M, _NEURON_PARTITIONS) * row_bytes < _NEURON_SPAN_BYTES:
+        return 0
+    return max(1, _NEURON_BLOCK_BYTES // row_bytes)
+
+
+def _neuron_cat(parts: list, dim: int) -> torch.Tensor:
+    """`torch.cat(parts, dim)` of 2-D device blocks, safe when the result has the bad layout.
+
+    Measured on Trn2: a device `cat` along dim 0 into a (128, 8,389,632) fp32
+    result is correct (whole-row blocks), along dim 1 it is wrong (rel err
+    0.71). So a dim-1 result with that layout is assembled on the host and
+    uploaded (an upload lands bit-exact). `_neuron_mm2d` blocks the output rows
+    first, so its dim-1 concatenations never need that.
+    """
+    if len(parts) == 1:
+        return parts[0]
+    M = sum(p.shape[0] for p in parts) if dim == 0 else parts[0].shape[0]
+    N = sum(p.shape[1] for p in parts) if dim == 1 else parts[0].shape[1]
+    if dim != 0 and _is_neuron(parts[0]) and _out_block(M, N, parts[0].element_size()):
+        return torch.cat([p.cpu() for p in parts], dim).to(parts[0].device)
+    return torch.cat(parts, dim)
+
+
+def _neuron_mm_unsafe(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """True when device `torch.matmul(a, b)` needs `_neuron_matmul`'s blocking.
+
+    Cheap and conservative: False whenever neither operand nor the result
+    spans 4 GiB, so ordinary products keep their exact aten call.
+    """
+    if a.dim() < 2 or b.dim() < 2 or not (_is_neuron(a) or _is_neuron(b)):
+        return False
+    try:
+        batch = torch.broadcast_shapes(a.shape[:-2], b.shape[:-2])
+    except RuntimeError:
+        return False  # torch.matmul raises its own error
+    out_bytes = math.prod(batch) * a.shape[-2] * b.shape[-1] * a.element_size()
+    if max(_span_bytes(a), _span_bytes(b), out_bytes) < _NEURON_SPAN_BYTES:
+        return False
+    M, N = a.shape[-2], b.shape[-1]
+    rows = math.prod(batch) * M
+    return bool(_batched_block(a) or _batched_block(b) or _out_block(rows, N, a.element_size()))
+
+
+def _batched_block(t: torch.Tensor) -> int:
+    """`_span_block` of a (batched) operand, its matrices' rows counted together.
+
+    Conservative for batches: the memory rows of all matrices count toward the
+    128 partitions, as for an elementwise op on the whole tensor.
+    """
+    if t.dim() == 2:
+        return _span_block(t)
+    if _span_bytes(t) < _NEURON_SPAN_BYTES:
+        return 0
+    _, rows, row_bytes = _row_layout(t[(0,) * (t.dim() - 2)])
+    rows *= math.prod(t.shape[:-2])
+    if min(rows, _NEURON_PARTITIONS) * row_bytes < _NEURON_SPAN_BYTES:
+        return 0
+    return max(1, _NEURON_BLOCK_BYTES // row_bytes)
+
+
+def _neuron_mm2d(a: torch.Tensor, b: torch.Tensor, mm=None) -> torch.Tensor:
+    """2-D `a @ b` on the device, cut into row blocks wherever #112 applies.
+
+    `mm` computes each safe block (default: aten, with `_neuron_mm_lhs`)."""
+    M, K = a.shape
+    N = b.shape[1]
+    ob = _out_block(M, N, a.element_size())
+    if ob and ob < M:  # the result itself: blocks of output rows
+        ob = _even_step(M, ob)
+        return _neuron_cat([_neuron_mm2d(a[i : i + ob], b, mm) for i in range(0, M, ob)], 0)
+    ab = _span_block(a)
+    if ab:
+        if _row_layout(a)[0] == 0 and ab < M:  # long rows of A: split M
+            ab = _even_step(M, ab)
+            return _neuron_cat([_neuron_mm2d(a[i : i + ab], b, mm) for i in range(0, M, ab)], 0)
+        if _row_layout(a)[0] == 1 and ab < K:  # A = X.T, long rows of X: split K
+            return _neuron_mm_ksum(a, b, ab, mm)
+    bb = _span_block(b)
+    if bb:
+        if _row_layout(b)[0] == 0 and bb < K:  # long rows of B: split K
+            return _neuron_mm_ksum(a, b, bb, mm)
+        if _row_layout(b)[0] == 1 and bb < N:  # B = Y.T, long rows of Y: split N
+            bb = _even_step(N, bb)
+            return _neuron_cat([_neuron_mm2d(a, b[:, j : j + bb], mm) for j in range(0, N, bb)], 1)
+    if mm is not None and not _neuron_mm_unsafe(a, b):
+        return mm(a, b)
+    return torch.matmul(_neuron_mm_lhs(a, b), b)
+
+
+def _neuron_mm_ksum(a: torch.Tensor, b: torch.Tensor, step: int, mm=None) -> torch.Tensor:
+    """Sum over K blocks of `step` of a[:, k] @ b[k], in order."""
+    out = None
+    step = _even_step(a.shape[1], step)
+    for k in range(0, a.shape[1], step):
+        ak, bk = a[:, k : k + step], b[k : k + step]
+        # The other operand's slice is small and strided: give it a dense copy.
+        if not _span_block(ak):
+            ak = ak.contiguous()
+        if not _span_block(bk):
+            bk = bk.contiguous()
+        part = _neuron_mm2d(ak, bk, mm)
+        out = part if out is None else out + part
+    return out
+
+
+def _neuron_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """`torch.matmul(a, b)`, correct on the `neuron` device at any size (#112).
+
+    The same call as before (with `_neuron_mm_lhs`) unless an operand or the
+    result has a partition span of 4 GiB or more; then the product is cut into
+    row blocks of the long operand (see `_NEURON_SPAN_BYTES`). Splitting K
+    changes the fp32 summation order of those products only. Batched operands
+    then run matrix by matrix. Host tensors are never affected.
+    """
+    if not _neuron_mm_unsafe(a, b):
+        return torch.matmul(_neuron_mm_lhs(a, b), b)
+    if a.dim() == 2 and b.dim() == 2:
+        return _neuron_mm2d(a, b)
+    batch = torch.broadcast_shapes(a.shape[:-2], b.shape[:-2])
+    ae = a.expand(*batch, *a.shape[-2:])
+    be = b.expand(*batch, *b.shape[-2:])
+    M, N = a.shape[-2], b.shape[-1]
+    parts = [_neuron_mm2d(ae[idx], be[idx]) for idx in np.ndindex(*batch)]
+    return _neuron_cat(parts, 0).reshape(*batch, M, N)
+
+
+def _neuron_mv(a: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """`torch.mv(a, x)`, blocked like `_neuron_matmul` when `a` is a #112 layout."""
+    if x.dim() == 1 and _neuron_mm_unsafe(a, x.unsqueeze(1)):
+        return _neuron_mm2d(a, x.unsqueeze(1))[:, 0]
+    return torch.mv(a, x)
 
 
 _AUTOTUNE_CACHE_FILE: Path = Path(
@@ -952,9 +1169,9 @@ def nki_batched_gemm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
         return torch.matmul(A, B)
     route = _gemm_route(A, B, op="batched_gemm")
     if route in ("torch", "host"):
-        return torch.matmul(A, B)
+        return _neuron_matmul(A, B)
     if route == "aten":
-        return _aten_on_device(torch.matmul, A, B)
+        return _aten_on_device(_neuron_matmul, A, B)
     out_dtype = None
     if route == "nki_fp32":
         _warn_fp32_cast("batched_gemm")
@@ -1094,8 +1311,8 @@ def nki_gemm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     if route == "lnc":
         return _nki_gemm_lnc(A, B)
     if route == "aten":
-        return _aten_on_device(lambda a, b: torch.matmul(_neuron_mm_lhs(a, b), b), A, B)
-    return torch.matmul(A, B)
+        return _aten_on_device(_neuron_matmul, A, B)
+    return _neuron_matmul(A, B)
 
 
 @_fp64_host_guard("nki_syrk")
@@ -1114,6 +1331,15 @@ def nki_syrk(A: torch.Tensor, symmetrize: bool = False) -> torch.Tensor:
     """
     M, K = A.shape
     route = _gemm_route(A, op="syrk", macs=M * M * K, nbytes=(M * K + M * M) * A.element_size())
+    if route in ("nki", "nki_fp32") and (
+        _neuron_mm_unsafe(A, A.T) or (_is_neuron(A) and _out_block(M, K, A.element_size()))
+    ):
+        # #112: the kernel reads a row-major A, which is unsafe here, and there
+        # is no blocked SYRK kernel; the blocked aten product instead.
+        if route == "nki_fp32":
+            _warn_fp32_cast("syrk")
+        r = _neuron_matmul(A, A.T)
+        return _symmetrize(r) if symmetrize else r
     if route == "nki":
         return _nki_syrk_impl(A, symmetrize=symmetrize)
     if route == "nki_fp32":
@@ -1121,14 +1347,14 @@ def nki_syrk(A: torch.Tensor, symmetrize: bool = False) -> torch.Tensor:
         return _nki_syrk_impl(A.to(torch.float32), symmetrize=symmetrize).to(A.dtype)
     if route == "aten" and A.device.type != "neuron":
         a = _upload(A)
-        r = torch.matmul(a, a.T)
+        r = _neuron_matmul(a, a.T)
         if symmetrize:
             # Symmetrise on the device, before the result comes down (#61):
             # a few aten ops there, no kernel compile, bitwise 0.5 * (C + C.T).
             return _to_host(0.5 * (r + r.T), A.device)
         r = _to_host(r, A.device)
     else:
-        r = torch.matmul(A, A.T)
+        r = _neuron_matmul(A, A.T)
     return _symmetrize(r) if symmetrize else r
 
 
@@ -1171,8 +1397,8 @@ def nki_trsm(
     try:
         if route == "aten":
             if _on_neuron_device(A, B):
-                return _nki_trsm_left(A, B, uplo, trans, diag, alpha, mm=torch.matmul)
-            X = _nki_trsm_left(_upload(A), _upload(B), uplo, trans, diag, alpha, mm=torch.matmul)
+                return _nki_trsm_left(A, B, uplo, trans, diag, alpha, mm=_neuron_matmul)
+            X = _nki_trsm_left(_upload(A), _upload(B), uplo, trans, diag, alpha, mm=_neuron_matmul)
             return _to_host(X, B.device)
         if route == "nki_fp32":
             _warn_fp32_cast("trsm")
@@ -1989,6 +2215,11 @@ def _nki_gemm_impl(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     """
     if not HAS_NKI:
         raise RuntimeError("NKI not available")
+    if _neuron_mm_unsafe(A, B):
+        # #112: the kernel's B-tile DMAs step by one B row, like aten's, and a
+        # kernel over 8M-column blocks would compile one huge NEFF per shape.
+        # The blocked aten product (validated on Trn2) instead.
+        return _neuron_matmul(A, B)
     M, K = A.shape
     _, N = B.shape
 
@@ -2035,7 +2266,7 @@ def _nki_gemm_impl(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
         if _REQUIRE_NKI:
             raise
         _warn_fallback(exc)
-        return torch.matmul(A, B)
+        return _neuron_matmul(A, B)
 
 
 def _torch_batched_pair_energy(
@@ -2773,7 +3004,7 @@ def _nki_syrk_impl(A: torch.Tensor, symmetrize: bool = False) -> torch.Tensor:
         if _REQUIRE_NKI:
             raise
         _warn_fallback(exc)
-        r = torch.matmul(A, A.T)
+        r = _neuron_matmul(A, A.T)
         return _symmetrize(r) if symmetrize else r
 
 

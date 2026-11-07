@@ -9,7 +9,7 @@ from __future__ import annotations
 import torch
 
 from ._flags import diag_flag, trans_flag, uplo_flag
-from .nki.dispatch import _fp64_host_guard
+from .nki.dispatch import _fp64_host_guard, _neuron_mv
 
 
 @_fp64_host_guard("gemv", kernel=False)
@@ -27,7 +27,7 @@ def gemv(
     """
     trans = trans_flag(trans)
     mat = A.T if trans else A
-    result = alpha * torch.mv(mat, x)
+    result = alpha * _neuron_mv(mat, x)
     if y is not None and beta != 0.0:
         result = result + beta * y
     return result

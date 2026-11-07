@@ -36,6 +36,7 @@ import time
 import torch
 import torch.distributed as dist
 
+from .nki.dispatch import _even_step, _is_neuron, _neuron_matmul, _out_block
 from .nki.multicore import aten_rows, occ_chunks, sym_rows
 
 
@@ -89,14 +90,14 @@ def gemm_row_parallel(A_rows: torch.Tensor, B: torch.Tensor, gather: bool = Fals
     """C rows = A rows @ B: A sharded along M, B replicated. No communication
     unless ``gather``, which all-gathers the full C (every rank's A_rows must
     then have the same number of rows)."""
-    C = A_rows @ B
+    C = _neuron_matmul(A_rows, B)
     return all_gather_rows(C, group) if gather else C
 
 
 def gemm_col_parallel(A: torch.Tensor, B_cols: torch.Tensor, gather: bool = False, group=None):
     """C cols = A @ B cols: B sharded along N, A replicated. With ``gather``,
     every rank gets the full C (equal shard widths)."""
-    C = A @ B_cols
+    C = _neuron_matmul(A, B_cols)
     if not gather:
         return C
     parts = all_gather_rows(C.T.contiguous(), group)  # (w * n_r, M)
@@ -109,7 +110,7 @@ def gemm_k_parallel(A_k: torch.Tensor, B_k: torch.Tensor, scatter: bool = False,
     Returns the full C on every rank (all-reduce), or with ``scatter`` this
     rank's block of C's rows (reduce-scatter; M must divide by the world size).
     """
-    P = A_k @ B_k
+    P = _neuron_matmul(A_k, B_k)
     if scatter:
         _, w = _rank_world(group)
         out = torch.empty((P.shape[0] // w, P.shape[1]), dtype=P.dtype, device=P.device)
@@ -219,7 +220,7 @@ def _half_transform_part(
     Cr = C_occ_pad[m0:m1].to(dev)  # (n_r, nocc_pad)
     if not symmetric:
         eri_r = eri_3c[m0:m1].reshape(n_r, nbasis * naux).to(dev)
-        return Cr.T.contiguous() @ eri_r
+        return _neuron_matmul(Cr.T.contiguous(), eri_r)
     p0, p1 = _tril_offset(m0), _tril_offset(m1)
     if eri_3c.dim() == 2:
         packed = eri_3c[p0:p1]
@@ -236,12 +237,21 @@ def _half_transform_part(
     L = P.index_select(0, idx.reshape(-1).to(dev)).reshape(n_r, nbasis, naux)
     diag = P.index_select(0, diag_idx)  # (n_r, naux): (mu mu|P)
     del P
-    part = Cr.T.contiguous() @ L.reshape(n_r, nbasis * naux)  # nu <= mu terms
+    part = _neuron_matmul(Cr.T.contiguous(), L.reshape(n_r, nbasis * naux))  # nu <= mu terms
     # Mirrored terms: (i mu|P) += sum_{nu < mu} C[nu, i] (mu nu|P).
     CT = C_occ_pad.T.contiguous().to(dev)  # (nocc_pad, nbasis)
-    M = torch.matmul(CT, L)  # (n_r, nocc_pad, naux), includes nu == mu
+    M = _neuron_matmul(CT, L)  # (n_r, nocc_pad, naux), includes nu == mu
     M = M - Cr.unsqueeze(2) * diag.unsqueeze(1)
-    part.reshape(-1, nbasis, naux)[:, m0:m1, :] += M.permute(1, 0, 2)
+    # On the device, `part` (nocc_pad, nbasis * naux) can have the >= 4 GiB
+    # partition span of #112 / #116 (nocc_pad >= 128, nbasis * naux >= 2**23
+    # fp32), where this strided in-place add was wrong (rel err 0.54 on Trn2).
+    # Update it in blocks of at most 64 occupied rows there; elsewhere this is
+    # one add, as before.
+    ob = _out_block(part.shape[0], part.shape[1], part.element_size()) if _is_neuron(part) else 0
+    step = _even_step(part.shape[0], ob) if ob else part.shape[0]
+    pv, Mp = part.reshape(-1, nbasis, naux), M.permute(1, 0, 2)
+    for i0 in range(0, part.shape[0], step):
+        pv[i0 : i0 + step, m0:m1, :] += Mp[i0 : i0 + step]
     return part
 
 
@@ -326,9 +336,9 @@ def df_mp2_energy(
 
     # 2b + 3 for this rank's occupied rows.
     CvT = C_vir.T.contiguous().to(dev)
-    ia_r = torch.matmul(CvT, iv_r.reshape(occ_r, nbasis, naux))  # (occ_r, nvir, naux)
+    ia_r = _neuron_matmul(CvT, iv_r.reshape(occ_r, nbasis, naux))  # (occ_r, nvir, naux)
     del iv_r
-    B_r = (ia_r.reshape(occ_r * nvir, naux) @ X).reshape(occ_r, nvir, naux)
+    B_r = _neuron_matmul(ia_r.reshape(occ_r * nvir, naux), X).reshape(occ_r, nvir, naux)
     del ia_r
     mark("local_2b_3")
 
