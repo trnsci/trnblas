@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Device matmuls with 32 MiB or longer rows were silently wrong (#112,
+  aws-neuron-sdk#1457).** On the native TorchNeuron path (Trn2, SDK 2.33),
+  a device matmul returns wrong values with no error (or aborts with NRT
+  status 1203) once an operand's 128 DMA partitions span 4 GiB or more,
+  i.e. `min(rows, 128) * row_bytes >= 2**32`. That holds for a contiguous left
+  operand as well, so the trnblas#57 guard (transposed left operand only)
+  did not cover it. Example: fp32 `(96, 128) @ (128, 8,389,632)` gave rel
+  err 0.8. Affected 0.6.0–0.12.0: `gemm`, `batched_gemm`, `symm`, `syrk`,
+  `trmm`, `gemv`, the `trsm` updates, `nki_gemm` (aten, LNC-kernel and NKI-kernel
+  routes) and `trnblas.parallel`'s GEMMs, when a device-resident (or uploaded)
+  operand or the result has fp32 rows of 32 MiB or more (bf16: 16M columns)
+  and at least 128 of them. These products are now cut into contiguous row
+  blocks of the long operand, each block spanning at most 2 GiB: K is split
+  (partial sums), or M / N (concatenated results). No operand is copied.
+  Splitting K changes the fp32 summation order of the affected products
+  only. Every other product is the same aten call as before (bitwise
+  unchanged). At those sizes the LNC and NKI GEMM kernels and the SYRK
+  kernel are not used. Host tensors are not affected. Device elementwise
+  ops on such tensors (for example `gemm`'s `alpha` / `beta` update of a
+  result that is itself 4 GiB with 32 MiB rows) are a separate issue,
+  trnsci/trnsci#145.
+
 ## [0.12.0] — 2026-11-07
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
