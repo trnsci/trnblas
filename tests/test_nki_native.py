@@ -674,7 +674,6 @@ class TestNativeKernelOpOffCastFloat64Warning:
 
     @staticmethod
     def _cases():
-        c = torch.complex128
         L = torch.tril(_host(256, 256, seed=7).double() * 0.01) + 4 * torch.eye(256).double()
         X = _host(512, 512, seed=8).double()
         J = X @ X.T / 512 + torch.eye(512).double()
