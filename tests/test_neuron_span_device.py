@@ -47,8 +47,10 @@ def _host(*shape, seed=0):
 
 
 def _rel(out, ref):
-    out = out.cpu().double()
-    ref = ref.double()
+    """||out - ref|| / ||ref|| in float64, or complex128 when either is complex
+    (`.double()` would drop the imaginary part, #113)."""
+    wide = torch.complex128 if (out.is_complex() or ref.is_complex()) else torch.float64
+    out, ref = out.cpu().to(wide), ref.cpu().to(wide)
     return ((out - ref).norm() / ref.norm()).item()
 
 
