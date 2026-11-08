@@ -2397,8 +2397,9 @@ def _batched_pair_energy_routed(
 _PAIR_ENERGY_CHOICES = ("auto", "sym", "aten", "legacy")
 _PAIR_SYM_MIN_ROW_FLOP = 3.0e9
 # SBUF bytes per partition the kernel keeps live: B[i].T and B[j].T
-# (NK * NVIR each) plus the T strip block (NA * NVIR), all fp32. trn2 has
-# 192 KiB per partition; leave room for the compiler's temporaries.
+# (NK * NVIR each) plus the T strip block (NA * NVIR), all fp32. Conservative:
+# SBUF is 192 KiB per partition on Trn1 and 224 KiB on Trn2 (about 207 KiB of
+# it allocatable by NKI); leave room for the compiler's temporaries.
 _PAIR_SYM_SBUF_BUDGET = 144 * 1024
 
 
