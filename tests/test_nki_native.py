@@ -56,7 +56,11 @@ def _host(*shape, seed=0):
 
 
 def _rel(out, ref):
-    return ((out.double() - ref.double()).norm() / ref.double().norm()).item()
+    """||out - ref|| / ||ref|| in float64, or complex128 when either is complex
+    (`.double()` would drop the imaginary part, #113)."""
+    wide = torch.complex128 if (out.is_complex() or ref.is_complex()) else torch.float64
+    out, ref = out.cpu().to(wide), ref.cpu().to(wide)
+    return ((out - ref).norm() / ref.norm()).item()
 
 
 def _pair_reference(B, eps_occ, eps_vir):
@@ -675,8 +679,12 @@ class TestNativeKernelOpOffCastFloat64Warning:
         X = _host(512, 512, seed=8).double()
         J = X @ X.T / 512 + torch.eye(512).double()
         A64, B64 = _host(256, 192, seed=1).double(), _host(192, 128, seed=2).double()
+        # Genuinely complex operands: `A64.to(c)` has a zero imaginary part, so
+        # an error in the imaginary part of the result could not show (#113).
+        Ac = torch.complex(A64, _host(256, 192, seed=11).double())
+        Bc = torch.complex(B64, _host(192, 128, seed=12).double())
         return {
-            "gemm-c128": ("gemm", lambda A, B: trnblas.gemm(1.0, A, B), (A64.to(c), B64.to(c))),
+            "gemm-c128": ("gemm", lambda A, B: trnblas.gemm(1.0, A, B), (Ac, Bc)),
             "gemm-3d-f64": (
                 "gemm",
                 lambda A, B: trnblas.gemm(1.0, A, B),
@@ -687,7 +695,7 @@ class TestNativeKernelOpOffCastFloat64Warning:
                 lambda A, B, C: trnblas.gemm(1.0, A, B, beta=1.0, C=C),
                 (A64.float(), B64.float(), _host(256, 128, seed=3).double()),
             ),
-            "syrk-c128": ("syrk", lambda A: trnblas.syrk(1.0, A), (A64.to(c),)),
+            "syrk-c128": ("syrk", lambda A: trnblas.syrk(1.0, A), (Ac,)),
             "trsm-right-f64": (
                 "trsm",
                 lambda A, B: trnblas.trsm(1.0, A, B, side="right", uplo="lower"),
@@ -756,7 +764,10 @@ class TestNativeKernelOpOffCastFloat64Warning:
 
         c = torch.complex128
         L = torch.tril(_host(256, 256, seed=7).double() * 0.01) + 4 * torch.eye(256).double()
-        A, B = L.to(c), _host(256, 32, seed=9).double().to(c)
+        Li = torch.tril(_host(256, 256, seed=13).double() * 0.01)  # complex diagonal too
+        A = torch.complex(L, Li)
+        B = torch.complex(_host(256, 32, seed=9).double(), _host(256, 32, seed=14).double())
+        assert A.dtype == B.dtype == c
         ref = torch.linalg.solve_triangular(A, B, upper=False)
         with warnings.catch_warnings(record=True) as rec:
             warnings.simplefilter("always")

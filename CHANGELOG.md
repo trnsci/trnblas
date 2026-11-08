@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Tests: the device suites' `_rel` helpers dropped the imaginary part of
+  complex results** (#113; test code only, no library change).
+  `tests/test_nki_native.py` and `tests/test_neuron_span_device.py` took
+  `.double()` of their operands, so a complex result was compared on its real
+  part only. In 0.12.0 and 0.12.1 the complex128 cases of
+  `TestNativeKernelOpOffCastFloat64Warning` (`gemm-c128`, `syrk-c128`, #106)
+  and the left complex128 `trsm` check also built their inputs as
+  `A64.to(complex128)`, with a zero imaginary part. `_rel` now compares in
+  complex128 when either side is complex, those cases use genuinely complex
+  operands, and a CPU test (`tests/test_rel_helpers.py`) covers the helpers.
+  pytest now turns torch's "Casting complex values to real discards the
+  imaginary part" warning into an error, so a recurrence fails the run.
+
 ## [0.12.1] — 2026-11-07
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.

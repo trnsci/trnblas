@@ -114,3 +114,6 @@ markers = [
     "slow: long-running tests skipped by default (run with -m slow)",
 ]
 testpaths = ["tests"]
+# A complex tensor cast to a real dtype loses its imaginary part; in a test
+# that hides errors (#113), so it fails the run.
+filterwarnings = ["error:Casting complex values to real discards the imaginary part"]
