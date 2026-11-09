@@ -95,7 +95,7 @@ def test_lnc_digest(require_nki):
     TRNBLAS_LNC_DIGEST_DIR, written per LNC and compared with the other LNC's."""
     A, B = inputs(1000, 5000, 700, seed=5)
     da, db = ozaki.split_a(A, 8), ozaki.split_b(B, 8)
-    hilo = D._ozaki_launch(da.d, da.kmajor, db.d, db.kmajor)
+    hilo = D._ozaki_launcher()(da, db, (0, da.xp), (0, da.kp), (0, db.xp))
     digest = hashlib.sha256(hilo.numpy().tobytes()).hexdigest()
     ref = ozaki.reference_from_digits(ozaki.kmajor(da.d, da.kmajor), ozaki.kmajor(db.d, db.kmajor))
     assert digest == hashlib.sha256(ref.tobytes()).hexdigest()

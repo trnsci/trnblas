@@ -782,25 +782,60 @@ def _simulate_bf16(kernel, *tensors: torch.Tensor) -> torch.Tensor:
     return torch.from_numpy(np.asarray(nki.simulate(kernel)(*arrs), dtype=np.float32))
 
 
-def _ozaki_launch(a: torch.Tensor, a_kmajor: bool, b: torch.Tensor, b_kmajor: bool):
-    """One Ozaki kernel launch from one block of host bf16 slices (`ozaki.run`).
+# Operands whose slices stay under this many bytes are uploaded once per
+# gemm_fp64 call and cut into launch blocks on the device; larger ones are
+# uploaded block by block (a device copy of a slice of a tensor with a 4 GiB
+# partition span is itself wrong, #112).
+_OZ_RESIDENT_BYTES = 1 << 31
 
-    A block that is not K-major ((k, M, Kp) slices of a row-major A, or
-    (k, N, Kp) of a transposed B) is uploaded as is and transposed on the
-    device (aten, about 500 GB/s on Trn2; on the host a transposing pass costs
-    4-5 ns per fp64 element). Returns host fp32 (2, Mp, N) (hi, lo)."""
+
+def _oz_device_block(dg, cache: dict, key: str, kk, xx) -> torch.Tensor:
+    """K-major device slices (k, kb, xb) of one operand's launch block."""
+    (k0, kb), (x0, xb) = kk, xx
+    ck = (key, k0, kb, x0, xb)
+    if ck in cache:
+        return cache[ck]
+    full = dg.d
+    if full.numel() * full.element_size() < _OZ_RESIDENT_BYTES:
+        if key not in cache:
+            cache[key] = _to_device(full.contiguous())[0][0]
+        blk = cache[key]
+        whole = (k0, kb, x0, xb) == (0, dg.kp, 0, dg.xp)
+        if dg.kmajor:
+            v = blk if whole else blk[:, k0 : k0 + kb, x0 : x0 + xb].contiguous()
+        else:  # (k, X, Kp) slices: transpose on the device (~500 GB/s)
+            v = blk[:, x0 : x0 + xb, k0 : k0 + kb].transpose(1, 2).contiguous()
+    else:
+        host = dg.block(k0, k0 + kb, x0, x0 + xb).contiguous()
+        v = _to_device(host)[0][0]
+        if not dg.kmajor:
+            v = v.transpose(1, 2).contiguous()
+    if key == "a":  # A blocks are used for one row of N blocks, then dropped
+        for old in [c for c in cache if isinstance(c, tuple) and c[0] == "a"]:
+            del cache[old]
+    cache[ck] = v
+    return v
+
+
+def _ozaki_launcher():
+    """`ozaki.run`'s launch for one gemm_fp64 call: the NKI kernel on K-major
+    device slices (uploaded once when they fit, see `_OZ_RESIDENT_BYTES`), or
+    under the simulator on host slices. Returns host fp32 (2, mb, nb)."""
     from .. import ozaki
 
-    if _use_simulator():
-        at, bt = ozaki.kmajor(a, a_kmajor), ozaki.kmajor(b, b_kmajor)
-        _check_kernel_operands("ozaki_gemm", at, bt)
-        return _simulate_bf16(_ozaki_gemm_kernel, at, bt)
-    _check_kernel_operands("ozaki_gemm", a, b)
-    (ad, bd), _ = _to_device(a.contiguous(), b.contiguous())
-    at = ad if a_kmajor else ad.transpose(1, 2).contiguous()
-    bt = bd if b_kmajor else bd.transpose(1, 2).contiguous()
-    del ad, bd
-    return _to_host(_call_kernel(_ozaki_gemm_kernel, "ozaki_gemm", at, bt), "cpu")
+    cache: dict = {}
+
+    def launch(da, db, m, kk, n):
+        if _use_simulator():
+            at, bt = ozaki.host_blocks(da, db, m, kk, n)
+            _check_kernel_operands("ozaki_gemm", at, bt)
+            return _simulate_bf16(_ozaki_gemm_kernel, at, bt)
+        _check_kernel_operands("ozaki_gemm", da.d, db.d)
+        at = _oz_device_block(da, cache, "a", kk, m)
+        bt = _oz_device_block(db, cache, "b", kk, n)
+        return _to_host(_call_kernel(_ozaki_gemm_kernel, "ozaki_gemm", at, bt), "cpu")
+
+    return launch
 
 
 def _ozaki_host_empty(shape, dtype):
@@ -820,7 +855,7 @@ def nki_gemm_fp64(A: torch.Tensor, B: torch.Tensor, slices: int) -> torch.Tensor
     if _ozaki_route() == "host" or not (torch.isfinite(A).all() and torch.isfinite(B).all()):
         return torch.matmul(A, B)
     try:
-        return ozaki.run(A, B, k, _ozaki_launch, empty=_ozaki_host_empty)
+        return ozaki.run(A, B, k, _ozaki_launcher(), empty=_ozaki_host_empty)
     except Exception as exc:
         if _REQUIRE_NKI:
             raise

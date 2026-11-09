@@ -243,11 +243,13 @@ def split_a(A: torch.Tensor, slices: int, empty=None) -> Digits:
 
 
 def split_b(B: torch.Tensor, slices: int, empty=None) -> Digits:
-    """B (K, N) by columns; as `split_a`, a transposed view splits as is."""
+    """B (K, N) by columns; as `split_a`, a transposed view splits as is. N is
+    padded to a multiple of 128 too, so B's slices can also be the kernel's
+    first operand (`run` computes C^T = B^T A^T when N is narrow)."""
     if B.mT.is_contiguous() and not B.is_contiguous():
-        d, e = split(B.mT, slices, per="row", pad=(1, TILE_K), empty=empty)
+        d, e = split(B.mT, slices, per="row", pad=(TILE_K, TILE_K), empty=empty)
         return Digits(d, e, False)
-    d, e = split(B, slices, per="col", pad=(TILE_K, 1), empty=empty)
+    d, e = split(B, slices, per="col", pad=(TILE_K, TILE_K), empty=empty)
     return Digits(d, e, True)
 
 
@@ -384,32 +386,53 @@ def combine(
 BLOCK_BYTES = 1 << 31
 
 
-def _blocks(total: int, step: int, q: int) -> list:
-    """[(start, size)] cutting [0, total) into near-equal blocks of at most
-    `step`, each a multiple of q (total itself is a multiple of q)."""
-    if total <= step:
-        return [(0, total)]
-    nb = -(-total // step)
-    size = _round_up(-(-total // nb), q)
-    return [(i, min(size, total - i)) for i in range(0, total, size)]
+def _blocks(total: int, step: int) -> list:
+    """[(start, size)] cutting [0, total) into blocks of `step` and a
+    remainder. Fixed steps (not near-equal ones) keep the set of launch
+    shapes, hence of compiled NEFFs, small across problem sizes."""
+    return [(i, min(step, total - i)) for i in range(0, total, step)]
 
 
-def plan(Mp: int, Kp: int, N: int, slices: int, limit: int = BLOCK_BYTES):
+# Below this many columns of B (and with more rows of A than columns of B),
+# `run` computes C^T = B^T A^T: the kernel's moving operand is then A, up to
+# 512 columns wide per matmul, instead of B's few columns (N = 241: 22 against
+# about 90 TFLOP/s).
+SWAP_N = 512
+
+# Largest output block per kernel launch. The compile time of the kernel grows
+# with its whole problem (M and N tiles times K: 1.4 s at 1024^3, 29 s at
+# 2048^3, 240 s at 4096^3 for k = 8, first call), so launches are capped and
+# one NEFF serves every M and N of a given (slices, K).
+LAUNCH_M = 1024
+LAUNCH_N = 1024
+
+
+def plan(
+    Mp: int,
+    Kp: int,
+    N: int,
+    slices: int,
+    limit: int = BLOCK_BYTES,
+    max_m: int = LAUNCH_M,
+    max_n: int = LAUNCH_N,
+):
     """Launch blocks (m_blocks, k_blocks, n_blocks), each [(start, size)].
 
-    Operand bytes: 2 k Kb Mb (A^T slices) and 2 k Kb Nb (B slices); result
-    8 Mb Nb. M and N blocks change nothing in the arithmetic. K blocks (only
-    when one 128-row M tile times all of K would not fit, K > ~1M at k = 8)
-    are separate (hi, lo) results summed in fp64 on the host, in order.
+    Each launch has at most max_m x max_n outputs, and its operand bytes,
+    2 k Kb Mb (A^T slices) and 2 k Kb Nb (B slices), and result bytes, 8 Mb Nb,
+    stay within `limit`. M and N blocks change nothing in the arithmetic. K
+    blocks (only when one 128-row M tile times all of K would not fit, K > ~1M
+    at k = 8) are separate (hi, lo) results summed in fp64 on the host, in
+    order.
     """
     k = check_slices(slices)
     cap = limit // (2 * k)  # elements per slice-stack operand
     Kb = Kp if Kp * 1024 <= cap else max(TILE_K, (cap // 1024) // TILE_K * TILE_K)
-    Mb = max(TILE_K, min(Mp, (cap // Kb) // TILE_K * TILE_K))
-    Nb = max(1, min(N, cap // Kb))
+    Mb = max(TILE_K, min(Mp, max_m // TILE_K * TILE_K, (cap // Kb) // TILE_K * TILE_K))
+    Nb = max(1, min(N, max_n, cap // Kb))
     if 8 * Mb * Nb > limit:
         Nb = max(1, min(Nb, limit // (8 * Mb)))
-    return _blocks(Mp, Mb, TILE_K), _blocks(Kp, Kb, TILE_K), _blocks(N, Nb, 1)
+    return _blocks(Mp, Mb), _blocks(Kp, Kb), _blocks(N, Nb)
 
 
 def run(
@@ -419,11 +442,14 @@ def run(
     launch,
     limit: int = BLOCK_BYTES,
     empty=None,
+    max_m: int = LAUNCH_M,
+    max_n: int = LAUNCH_N,
 ) -> torch.Tensor:
     """C = A @ B in fp64 by Ozaki splitting. A (M, K) and B (K, N) are finite
-    fp64 on the host. `launch(a, a_kmajor, b, b_kmajor) -> (2, Mb, Nb) fp32`
-    computes one block's (hi, lo) from its slices (the NKI kernel, or
-    `reference_from_digits`), transposing a non-K-major block first.
+    fp64 on the host. `launch(da, db, (m0, mb), (k0, kb), (n0, nb)) ->
+    (2, mb, nb) fp32` computes one block's (hi, lo) from the operands' slices
+    (`Digits`): the NKI kernel, or `reference_launch`. For narrow B
+    (N < SWAP_N < M) the launches compute blocks of C^T = B^T A^T instead.
     `empty(shape, dtype)` allocates the slices and the result."""
     k = check_slices(slices)
     M, K = A.shape
@@ -433,8 +459,11 @@ def run(
     empty = empty or _torch_empty
     da = split_a(A, k, empty)
     db = split_b(B, k, empty)
-    mbs, kbs, nbs = plan(da.xp, da.kp, N, k, limit)
     C = empty((M, N), torch.float64)
+    out = C
+    if N < SWAP_N and M > N:  # C^T = B^T A^T: B's slices are the first operand
+        da, db, M, N, out = db, da, N, M, C.mT
+    mbs, kbs, nbs = plan(da.xp, da.kp, N, k, limit, max_m, max_n)
     for m0, mb in mbs:
         mr = min(mb, M - m0)
         if mr <= 0:
@@ -442,26 +471,38 @@ def run(
         for n0, nb in nbs:
             acc = None
             for k0, kb in kbs:
-                a_blk = da.block(k0, k0 + kb, m0, m0 + mb)
-                b_blk = db.block(k0, k0 + kb, n0, n0 + nb)
-                hilo = launch(a_blk, da.kmajor, b_blk, db.kmajor)
+                hilo = launch(da, db, (m0, mb), (k0, kb), (n0, nb))
                 ea, eb = da.e[m0 : m0 + mr], db.e[n0 : n0 + nb]
-                if len(kbs) == 1:  # straight into C
-                    combine(hilo, ea, eb, k, mr, nb, out=C[m0 : m0 + mr, n0 : n0 + nb])
+                if len(kbs) == 1:  # straight into C (or C^T)
+                    combine(hilo, ea, eb, k, mr, nb, out=out[m0 : m0 + mr, n0 : n0 + nb])
                     continue
                 part = combine(hilo, ea, eb, k, mr, nb)
                 acc = part if acc is None else acc.add_(part)
             if acc is not None:
-                C[m0 : m0 + mr, n0 : n0 + nb] = acc
+                out[m0 : m0 + mr, n0 : n0 + nb] = acc
     return C
 
 
-def _reference_launch(a, a_kmajor, b, b_kmajor):
-    return torch.from_numpy(reference_from_digits(kmajor(a, a_kmajor), kmajor(b, b_kmajor)))
+def host_blocks(da: Digits, db: Digits, m, kk, n):
+    """One launch's K-major (k, kb, mb) and (k, kb, nb) slices, on the host."""
+    (m0, mb), (k0, kb), (n0, nb) = m, kk, n
+    a = kmajor(da.block(k0, k0 + kb, m0, m0 + mb), da.kmajor)
+    b = kmajor(db.block(k0, k0 + kb, n0, n0 + nb), db.kmajor)
+    return a, b
+
+
+def reference_launch(da: Digits, db: Digits, m, kk, n) -> torch.Tensor:
+    """`run`'s launch with the host reference of the kernel arithmetic."""
+    return torch.from_numpy(reference_from_digits(*host_blocks(da, db, m, kk, n)))
 
 
 def reference_gemm(
-    A: torch.Tensor, B: torch.Tensor, slices: int = DEFAULT_SLICES, limit: int = BLOCK_BYTES
+    A: torch.Tensor,
+    B: torch.Tensor,
+    slices: int = DEFAULT_SLICES,
+    limit: int = BLOCK_BYTES,
+    max_m: int = LAUNCH_M,
+    max_n: int = LAUNCH_N,
 ) -> torch.Tensor:
     """Host reference of `trnblas.gemm_fp64`: the same split, blocking and
     arithmetic as the device (`reference_from_digits`), in fp64 (M, N). For
@@ -469,4 +510,4 @@ def reference_gemm(
     k (k + 1) / 2 host fp64 GEMMs."""
     A = A.detach().to("cpu", torch.float64)
     B = B.detach().to("cpu", torch.float64)
-    return run(A, B, slices, _reference_launch, limit)
+    return run(A, B, slices, reference_launch, limit, max_m=max_m, max_n=max_n)

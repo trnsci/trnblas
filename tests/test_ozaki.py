@@ -74,7 +74,9 @@ def test_diag_groups_cover_each_tile_once(kt, d):
         assert len(groups) == (d + 1) * -(-kt // ozaki.GROUP_TILES)
     else:  # whole pairs, as many as fit
         per = ozaki.GROUP_TILES // kt
-        assert all(len(g) == per for g in groups[:-1]) and all(n == kt for g in groups for *_, n in g)
+        assert all(len(g) == per for g in groups[:-1]) and all(
+            n == kt for g in groups for *_, n in g
+        )
 
 
 def test_group_bound_is_exact_in_fp32():
@@ -108,8 +110,17 @@ def test_plan_respects_launch_limit(Mp, Kp, N, k, limit):
     assert all(sz % 128 == 0 for _, sz in mbs + kbs)
     Mb, Kb, Nb = mbs[0][1], kbs[0][1], nbs[0][1]
     assert 2 * k * Kb * Mb <= limit and 2 * k * Kb * Nb <= limit and 8 * Mb * Nb <= limit
+    assert Mb <= ozaki.LAUNCH_M and Nb <= ozaki.LAUNCH_N
     if limit == ozaki.BLOCK_BYTES and Mp * Kp * 2 * k <= limit:
-        assert len(mbs) == len(kbs) == 1
+        assert len(kbs) == 1
+    assert all(sz == Mb for _, sz in mbs[:-1]) and all(sz == Nb for _, sz in nbs[:-1])
+
+
+def test_launch_caps_are_bitwise_invariant():
+    A, B = _inputs(700, 900, 600, seed=7)
+    C = ozaki.reference_gemm(A, B, 4)
+    assert len(ozaki.plan(768, 1024, 600, 4, max_m=256, max_n=200)[0]) == 3
+    assert torch.equal(ozaki.reference_gemm(A, B, 4, max_m=256, max_n=200), C)
 
 
 # ── the kernel arithmetic on the host ───────────────────────────────────────
@@ -263,7 +274,15 @@ def test_gemm_fp64_native_route_matches_reference(native_reference, transA, tran
     C = trnblas.gemm_fp64(a, b, slices=7, transA=transA, transB=transB)
     assert torch.equal(C, ozaki.reference_gemm(A, B, 7))
     ((sa, sb, ca, cb),) = native_reference
-    assert sa == (7, 384, 256) and sb == (7, 384, 77) and ca and cb
+    # N = 77 < SWAP_N: one launch of C^T = B^T A^T, B's slices first
+    assert sa == (7, 384, 128) and sb == (7, 384, 200) and ca and cb
+
+
+def test_gemm_fp64_native_route_wide_n_not_swapped(native_reference):
+    A, B = _inputs(130, 200, 600, seed=8)
+    assert torch.equal(trnblas.gemm_fp64(A, B, slices=3), ozaki.reference_gemm(A, B, 3))
+    ((sa, sb, _, _),) = native_reference
+    assert sa == (3, 256, 256) and sb == (3, 256, 600)
 
 
 def test_gemm_fp64_native_route_nonfinite_takes_host(native_reference):

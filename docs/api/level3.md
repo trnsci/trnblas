@@ -53,10 +53,16 @@ Properties:
   sums and fp32 TwoSums whatever the tiling, so the result is bitwise the same
   at LNC=1 and LNC=2 and equals `trnblas.ozaki.reference_gemm` (the host
   reference of the kernel arithmetic) bit for bit.
-- **Memory (#112).** At k = 8 each operand's slices take 16 bytes per element
-  (2× fp64). Launches are planned (`ozaki.plan`) so that each operand and
-  result stays under 2 GiB: M and N are cut first (no change to the
-  arithmetic), K only beyond ~1M at k = 8 (fp64 partial sums on the host).
+- **Launches and memory (#112).** Each kernel launch computes at most a
+  1024 × 1024 output block (`ozaki.LAUNCH_M`, `LAUNCH_N`): the kernel's compile
+  time grows with its whole problem (240 s for one 4096³ launch at k = 8), so a
+  capped block keeps one NEFF per (slices, K, block shape) for every M and N.
+  At k = 8 each operand's slices take 16 bytes per element (2× fp64). Slices
+  under 2 GiB are uploaded once per call and cut into blocks on the device;
+  larger ones are uploaded block by block. Every launch's operands and result
+  stay under 2 GiB (`ozaki.plan`). M and N blocks do not change the
+  arithmetic; K is blocked only beyond ~1M at k = 8 (fp64 partial sums on the
+  host).
 - **Layouts.** The host splits each operand in its contiguous layout (a
   transposing pass on the host costs 4–5 ns per element); slices that are
   not K-major are transposed on the device (about 500 GB/s).
@@ -66,8 +72,8 @@ Properties:
   fp64 `A @ B`. Under `TRNBLAS_REQUIRE_NKI=1` the off-device case raises.
 - **Cost.** The host split is about 1.2 ns per element per slice on one Trn2
   host core (two vCPUs), the kernel runs at about 96–100 TFLOP/s of bf16
-  slice products on one logical core, and the first call per shape compiles
-  for tens of seconds to minutes (cached afterwards). See
+  slice products on one logical core, and the first call per launch shape
+  compiles (cached afterwards in the NEFF cache). See
   [Benchmarks](../benchmarks.md#fp64-class-gemm-gemm_fp64).
 
 `alpha` / `beta` are not taken: scale the fp64 result. Batched operands are
