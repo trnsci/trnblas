@@ -71,10 +71,15 @@ Properties:
   `set_backend("pytorch")`, and for non-finite operands, `gemm_fp64` is host
   fp64 `A @ B`. Under `TRNBLAS_REQUIRE_NKI=1` the off-device case raises.
 - **Cost.** The host split is about 1.2 ns per element per slice on one Trn2
-  host core (two vCPUs), the kernel runs at about 96–100 TFLOP/s of bf16
+  host core (two vCPUs), the kernel runs at about 87–96 TFLOP/s of bf16
   slice products on one logical core, and the first call per launch shape
-  compiles (cached afterwards in the NEFF cache). See
-  [Benchmarks](../benchmarks.md#fp64-class-gemm-gemm_fp64).
+  compiles (cached afterwards in the NEFF cache). End to end the host split
+  dominates: on one logical core `gemm_fp64` beats host fp64 on 2 vCPUs on
+  large squares (2.4× at 4096³, k = 8) but not a 12-vCPU host, and on narrow
+  products such as (3267, 8400) @ (8400, 241) it is slower than host fp64
+  (2.8× on 2 vCPUs). Use it where fp64 accuracy must come from the device
+  side of a pipeline or where the host is busy; a device-side split is the
+  next step. See [Benchmarks](../benchmarks.md#fp64-class-gemm-gemm_fp64).
 
 `alpha` / `beta` are not taken: scale the fp64 result. Batched operands are
 not supported.

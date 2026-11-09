@@ -753,6 +753,71 @@ call, nocc=16 / 256 pairs), each per-pair invocation costs ~100ms → 256 × 100
 All 10 `TestBatchedPairEnergy` tests passed on trn1 (aligned, unaligned,
 vs-fused-gemm cross-check, zero-B). Total suite: 62/62.
 
+## fp64-class GEMM (`gemm_fp64`)
+
+[`gemm_fp64`](api/level3.md) (#22), measured 2026-11-09 on Trn2
+(trn2.3xlarge, torch-neuronx 2.14, neuronx-cc 2.28, NKI 0.7) on **one logical
+core at LNC=2**, normal(0, 1) data, warm NEFF cache. Host baselines are torch
+fp64 `A @ B` on 2 pinned vCPUs (one physical core, the suite's usual host)
+and on all 12 vCPUs.
+
+- `max_cw` is max |C − C_exact| / (|A||B|) on 256 sampled rows, against an
+  independent near-correctly-rounded fp64 reference. Host fp64 itself scores
+  5e-17 to 2.4e-16.
+- `kernel` is the device kernel on resident slices: the sum of its 1024 × 1024
+  launches. `bf16 TFLOP/s` counts the k(k+1)/2 slice products; `fp64-equiv`
+  counts 2MNK.
+- `split` is the host split of A and B. `upload + rest` covers the upload,
+  the device transposes and block copies, and launch overheads.
+  `download + combine` is the (hi, lo) download and the fp64 recombine. `e2e`
+  is `gemm_fp64` from host fp64 to host fp64.
+- `bitwise` means the device (hi, lo) equals `ozaki.reference_from_digits`
+  bit for bit. It held in every run, at LNC=1 and LNC=2, with the NKI trace
+  cache on and off.
+
+| shape (M, K, N) | k (GEMMs) | max_cw | kernel ms | bf16 TFLOP/s | fp64-equiv GFLOP/s | split ms | upload + rest ms | download + combine ms | e2e ms | host fp64 2 vCPU ms | kernel / e2e vs 2 vCPU | host fp64 12 vCPU ms | e2e 12 vCPU ms | bitwise |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| (1024, 1024, 1024) | 8 (36) | 3.8e-16 | 0.86 | 89 | 2483 | 28 | 5 | 5 | 38 | 35 | 41× / 0.93× | 5 | 23 | yes |
+| (1024, 1024, 1024) | 7 (28) | 1.4e-14 | 0.68 | 89 | 3175 | 23 | 8 | 4 | 36 | 35 | 52× / 0.99× |  |  | yes |
+| (1024, 1024, 1024) | 6 (21) | 1.9e-12 | 0.52 | 87 | 4134 | 20 | 14 | 4 | 39 | 35 | 68× / 0.91× |  |  | yes |
+| (3267, 8400, 241) | 8 (36) | 2.2e-16 | 12.94 | 39 | 1023 | 492 | 42 | 11 | 559 | 197 | 15× / 0.35× | 34 | 259 | yes |
+| (3267, 8400, 241) | 7 (28) | 6.0e-15 | 10.02 | 39 | 1320 | 311 | 176 | 11 | 508 | 197 | 20× / 0.39× |  |  | yes |
+| (3267, 8400, 241) | 6 (21) | 7.7e-13 | 7.49 | 40 | 1766 | 271 | 165 | 11 | 454 | 197 | 26× / 0.43× |  |  | yes |
+| (8192, 3508, 241) | 8 (36) | 1.8e-16 | 10.99 | 49 | 1260 | 367 | 178 | 26 | 583 | 208 | 19× / 0.36× | 34 | 279 | yes |
+| (8192, 3508, 241) | 7 (28) | 8.3e-15 | 8.54 | 49 | 1621 | 312 | 178 | 27 | 525 | 208 | 24× / 0.40× |  |  | yes |
+| (8192, 3508, 241) | 6 (21) | 1.2e-12 | 6.40 | 49 | 2164 | 277 | 176 | 27 | 486 | 208 | 33× / 0.43× |  |  | yes |
+| (2048, 2048, 2048) | 8 (36) | 2.4e-16 | 6.60 | 94 | 2605 | 130 | 8 | 28 | 173 | 237 | 36× / 1.37× | 45 | 87 | yes |
+| (2048, 2048, 2048) | 7 (28) | 1.3e-14 | 5.18 | 93 | 3319 | 88 | 50 | 21 | 164 | 237 | 46× / 1.45× |  |  | yes |
+| (2048, 2048, 2048) | 6 (21) | 1.7e-12 | 3.90 | 93 | 4409 | 80 | 33 | 21 | 138 | 237 | 61× / 1.72× |  |  | yes |
+| (3072, 3072, 3072) | 8 (36) | 2.4e-16 | 22.11 | 94 | 2623 | 290 | 33 | 56 | 401 | 773 | 35× / 1.93× | 142 | 212 | yes |
+| (3072, 3072, 3072) | 7 (28) | 1.0e-14 | 17.26 | 94 | 3359 | 229 | 80 | 57 | 382 | 773 | 45× / 2.02× |  |  | yes |
+| (3072, 3072, 3072) | 6 (21) | 1.5e-12 | 13.03 | 93 | 4451 | 177 | 109 | 46 | 345 | 773 | 59× / 2.24× |  |  | yes |
+| (4096, 4096, 4096) | 8 (36) | 1.9e-16 | 51.55 | 96 | 2666 | 515 | 49 | 129 | 745 | 1820 | 35× / 2.44× | 321 | 372 | yes |
+| (4096, 4096, 4096) | 7 (28) | 9.8e-15 | 40.24 | 96 | 3416 | 356 | 199 | 99 | 694 | 1820 | 45× / 2.62× |  |  | yes |
+| (4096, 4096, 4096) | 6 (21) | 1.2e-12 | 30.43 | 95 | 4516 | 317 | 202 | 80 | 629 | 1820 | 60× / 2.89× |  |  | yes |
+
+Readings:
+
+- **Accuracy.** k = 8 gives the host fp64 BLAS level (1.8e-16 to 3.8e-16),
+  k = 7 about 1e-14, and k = 6 about 1e-12. The accuracy depends on k, not on
+  the shape: the slices are exact, and every PSUM group sums exact integers.
+- **The kernel** runs at 87–96 TFLOP/s of bf16 slice products on squares (one
+  logical core). That is 35–41× host fp64 on 2 vCPUs at k = 8, and 6.2× the
+  12-vCPU host at 4096³. On the narrow DF-MP2 shapes it reaches 39–49 TFLOP/s:
+  they run as Cᵀ = Bᵀ Aᵀ with only 2 stationary tiles, and look DMA-bound.
+  LNC=2 against LNC=1: 1.98× at 2048³ and 1.18× at (3267, 8400, 241).
+- **End to end, the host split dominates.** It costs about 11 ns per element
+  at k = 8 on one host core (2 vCPUs) and about 3–4 ns on 12. On squares,
+  `gemm_fp64` is 1.4–2.4× host fp64 on 2 vCPUs at k = 8 (2048–4096³), but
+  only 0.5–0.9× the 12-vCPU host (slower). **On the narrow DF-MP2 shapes it is 2.8× slower
+  than host fp64 on 2 vCPUs, and 7–8× slower than on 12.** A has only 2N = 482
+  flops per element there, so the split of A alone outweighs the host GEMM.
+  Moving the split to the device is the next step.
+- **First call.** One NEFF per (k, K, launch shape). Each new shape compiles
+  for a few seconds to about 30 s, plus the device-side slicing ops. An
+  uncapped single 4096³ launch took 240 s to compile, hence the 1024 × 1024
+  launch cap.
+
 ## Out of scope
 
 - **cuBLAS head-to-head at batched-pair scale:** planned once PR #44 merges

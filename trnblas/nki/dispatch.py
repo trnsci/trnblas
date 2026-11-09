@@ -3748,13 +3748,14 @@ if HAS_NKI:
                 nl.store(out[0, r : r + 128, c : c + nsizes[j]], value=hi[i][j])
                 nl.store(out[1, r : r + 128, c : c + nsizes[j]], value=lo[i][j])
 
-    def _oz_mblock(at, b, out, m0, TM, N):
-        """Every N super-tile (two 512-column PSUM sub-tiles) of one M block."""
-        NF = N // 1024
+    def _oz_mblock(at, b, out, m0, TM, c0, NP):
+        """Columns [c0, c0 + NP) of one M block: N super-tiles of two
+        512-column PSUM sub-tiles, then the tail."""
+        NF = NP // 1024
         for nb in nl.affine_range(NF):
-            _oz_tile(at, b, out, m0, TM, nb * 1024, [512, 512])
-        if N - NF * 1024:
-            _oz_tile(at, b, out, m0, TM, NF * 1024, _lnc_sizes(N - NF * 1024, 512))
+            _oz_tile(at, b, out, m0, TM, c0 + nb * 1024, [512, 512])
+        if NP - NF * 1024:
+            _oz_tile(at, b, out, m0, TM, c0 + NF * 1024, _lnc_sizes(NP - NF * 1024, 512))
 
     @nki.jit
     def _ozaki_gemm_kernel(at, b):
@@ -3765,7 +3766,9 @@ if HAS_NKI:
         hi and lo of sum_d 2^(7 (k-1-d)) sum_{s+t=d} A_s B_t, d < k.
         Gridless: at LNC=2 each program takes a contiguous half of the
         128-row M tiles (for an odd count both compute the middle tile, with
-        identical values). Every output element gets the same sequence of
+        identical values); with at most two M tiles it takes half of the
+        columns instead, so the programs do not load the same moving data.
+        Every output element gets the same sequence of
         exact group sums and fp32 TwoSums, so the result is bitwise the same
         at LNC=1 and LNC=2 and equals `ozaki.reference_from_digits`.
         """
@@ -3774,13 +3777,17 @@ if HAS_NKI:
         out = nl.ndarray((2, Mp, N), dtype=nl.float32, buffer=nl.shared_hbm)
         n_prog = nl.num_programs() if nl.program_ndim() > 0 else 1
         MT = Mp // 128
+        if n_prog > 1 and MT <= 2 and N >= 2:  # split the columns
+            NPP = (N + n_prog - 1) // n_prog
+            _oz_mblock(at, b, out, 0, MT, nl.program_id(0) * (N - NPP), NPP)
+            return out
         MPT = (MT + n_prog - 1) // n_prog
         r0 = nl.program_id(0) * ((MT - MPT) * 128) if n_prog > 1 else 0
         NB = MPT // 2
         for mb in nl.affine_range(NB):
-            _oz_mblock(at, b, out, r0 + mb * 256, 2, N)
+            _oz_mblock(at, b, out, r0 + mb * 256, 2, 0, N)
         if MPT % 2:
-            _oz_mblock(at, b, out, r0 + NB * 256, 1, N)
+            _oz_mblock(at, b, out, r0 + NB * 256, 1, 0, N)
         return out
 
     @nki.jit

@@ -86,7 +86,7 @@ since it's reused across all auxiliary basis indices P.
   the host. `slices` (default 8) is the precision knob. Double-double (fp32
   hi/lo) stays at fp32 accuracy on the device and was dropped. The host split
   (~11 ns per element at 8 slices on one host core) dominates end to end; the
-  kernel runs at ~96-100 TFLOP/s of bf16 slice products.
+  kernel runs at ~87-96 TFLOP/s of bf16 slice products on squares.
 
 - **Level 3 dominates.** Level 1/2 are included for API completeness but
   won't get NKI kernels initially. The Tensor Engine is wasted on vector ops.

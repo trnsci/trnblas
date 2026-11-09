@@ -129,6 +129,11 @@ _KERNELS = {
         lambda d: d._ozaki_gemm_kernel,
         lambda: (_bf16(1, 128, 128), _bf16(1, 128, 1)),
     ),
+    # Two M tiles: at LNC=2 the programs split the columns (narrow-N C^T launches).
+    "ozaki_gemm_col_split": (
+        lambda d: d._ozaki_gemm_kernel,
+        lambda: (_bf16(8, 66 * 128, 256), _bf16(8, 66 * 128, 1023)),
+    ),
     "ozaki_gemm_long_k": (
         lambda d: d._ozaki_gemm_kernel,
         lambda: (_bf16(3, 9000 // 128 * 128 + 128, 256), _bf16(3, 9000 // 128 * 128 + 128, 241)),
@@ -148,6 +153,7 @@ _LNC2 = {
     "ozaki_gemm",
     "ozaki_gemm_tiny",
     "ozaki_gemm_long_k",
+    "ozaki_gemm_col_split",
 }
 
 

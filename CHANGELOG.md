@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`trnblas.gemm_fp64(A, B, *, slices=8, transA=False, transB=False)`: an
+  fp64-class GEMM on the bf16 Tensor Engine by Ozaki splitting** (#22,
+  trnsci/trnsci#129). The host splits fp64 A row by row and B column by
+  column into `slices` exact 7-bit bf16 integer slices (`trnblas/ozaki.py`).
+  The new NKI kernel `_ozaki_gemm_kernel` runs the k(k+1)/2 slice products of
+  the diagonals s + t ≤ k − 1 with fp32 PSUM accumulation in groups of at most
+  4096 terms, which keeps every group sum an exact integer (same-diagonal
+  pairs share a group when K < 4096), and folds each group into a VectorE
+  TwoSum (hi, lo) pair. The host recombines in fp64. Measured on Trn2 (one
+  logical core, LNC=2, normal data, max |C − C_exact| / (|A||B|)): 2e-16 to
+  4e-16 at the default k = 8 (host fp64 BLAS level), about 1e-14 at k = 7 and
+  1e-12 at k = 6. The kernel runs at 87–96 TFLOP/s of bf16 slice products on
+  squares, 35–41× host fp64 on 2 vCPUs at k = 8. End to end the host split
+  dominates (about 11 ns per element at k = 8 on one host core, 3–4 ns on 12
+  vCPUs): 1.4–2.4× host fp64 on 2 vCPUs on squares 2048–4096³ but 0.5–0.9×
+  the 12-vCPU host, and 2.8× slower than host fp64 on 2 vCPUs on the
+  narrow DF-MP2 shapes (see docs/benchmarks.md). Results are deterministic, bitwise
+  equal at LNC=1 and LNC=2, and equal to the host reference
+  `trnblas.ozaki.reference_gemm` bit for bit. Launches are capped at
+  1024 × 1024 outputs (one NEFF per (slices, K, block), first-call compile
+  15 s instead of 240 s at 4096³) and keep every operand under 2 GiB (#112).
+  Narrow products (N < 512 < M) run as Cᵀ = Bᵀ Aᵀ. Off the native path (CPU,
+  Trn1, `set_backend("pytorch")`) and for non-finite operands, `gemm_fp64` is
+  host fp64 `A @ B`.
+
 ### Fixed
 
 - **Tests: the device suites' `_rel` helpers dropped the imaginary part of

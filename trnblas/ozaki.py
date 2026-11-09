@@ -65,9 +65,14 @@ def _round_up(n: int, m: int) -> int:
     return -(-n // m) * m
 
 
-# Elements per block of `split` / `combine`: a few fp64 buffers of this size
-# stay in L2, and numpy's per-call overhead stays small against the work.
+# Elements per block of `split` / `combine`. Measured on a Trn2 host (split of
+# 4096^2 at k = 8, ns per element): with 1-2 workers 2^15 is best (L2-resident
+# buffers, 7.3 at 2 threads on 2 physical cores); with more workers small blocks
+# thrash the GIL between numpy calls (12 threads: 38 at 2^15, 4.3 at 2^17), so
+# blocks grow to 2^17 (6 threads: 3.9). Workers are capped at _MAX_WORKERS.
 _BLOCK_ELEMS = 1 << 15
+_BLOCK_ELEMS_MANY = 1 << 17
+_MAX_WORKERS = 8
 
 
 def _torch_empty(shape, dtype):
@@ -75,7 +80,11 @@ def _torch_empty(shape, dtype):
 
 
 def _host_threads() -> int:
-    return max(1, torch.get_num_threads())
+    return max(1, min(_MAX_WORKERS, torch.get_num_threads()))
+
+
+def _block_elems() -> int:
+    return _BLOCK_ELEMS if _host_threads() <= 2 else _BLOCK_ELEMS_MANY
 
 
 def _parallel_blocks(n: int, step: int, fn) -> None:
@@ -156,7 +165,7 @@ def split(
     if Cp > C:
         digits[:, :R, C:].zero_()
     Xn = X.numpy()
-    step = max(1, _BLOCK_ELEMS // C)
+    step = max(1, _block_elems() // C)
     if per == "row":
         amax = np.empty(R)
 
@@ -375,7 +384,7 @@ def combine(
         else:
             np.copyto(v, np.ldexp(v, ea[r0:r1, None] + eb[None, :]))
 
-    _parallel_blocks(M, max(1, _BLOCK_ELEMS // N), block)
+    _parallel_blocks(M, max(1, _block_elems() // N), block)
     return res
 
 
