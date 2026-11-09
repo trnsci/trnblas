@@ -19,6 +19,71 @@ CPU/GPU.
 Batched GEMM over the leading dimension — used for DF-MP2 tensor contractions
 over auxiliary basis indices. Routed like `gemm` on the native path.
 
+## `gemm_fp64(A, B, *, slices=8, transA=False, transB=False)`
+
+fp64-class product `op(A) @ op(B)` on the bf16 Tensor Engine, by Ozaki
+splitting ([#22](https://github.com/trnsci/trnblas/issues/22)). Returns
+float64 on A's device. `slices` (k, 1–12) is the precision knob.
+
+How it works:
+
+1. **Split (host, exact).** A is split row by row and B column by column into
+   k bf16 integer slices of 7 bits each, |digit| ≤ 64, scaled by one power of
+   two per row / column (`trnblas.ozaki.split`).
+2. **Slice products (device).** The kernel (`_ozaki_gemm_kernel`) runs the
+   k(k+1)/2 pairs (s, t) with s + t ≤ k − 1 as bf16 matmuls with fp32 PSUM
+   accumulation. The pairs of one diagonal s + t share a scale, so their K
+   tiles are laid end to end and cut into PSUM groups of at most 4096 terms:
+   4096 · 64 · 64 = 2²⁴, so every group sum is an exact integer. When K < 4096,
+   one group holds several pairs.
+3. **Eviction (device).** Each group is scaled by 2^(7(k−1−d)) on its way out
+   of PSUM and folded into an SBUF fp32 TwoSum (hi, lo) pair on VectorE,
+   diagonals smallest first.
+4. **Combine (host).** C = (hi + lo) · 2^(e_i + e_j − 12 − 7(k−1)) in fp64.
+
+Properties:
+
+- **Accuracy** (max |C − C_exact| / (|A||B|), normal data, measured on Trn2):
+  about 1e-12 at k = 6 (21 slice GEMMs), 1e-14 at k = 7 (28), and
+  2e-16 to 4e-16 at k = 8 (36), the host fp64 BLAS level. The scaling is per
+  row / column, so entries far below their row or column maximum lose
+  relative precision: data spread over 10^±4 needs k = 10 for host-fp64
+  accuracy (k = 8 gives about 1e-14 there).
+- **Deterministic.** Every element is the same sequence of exact integer group
+  sums and fp32 TwoSums whatever the tiling, so the result is bitwise the same
+  at LNC=1 and LNC=2 and equals `trnblas.ozaki.reference_gemm` (the host
+  reference of the kernel arithmetic) bit for bit.
+- **Launches and memory (#112).** Each kernel launch computes at most a
+  1024 × 1024 output block (`ozaki.LAUNCH_M`, `LAUNCH_N`): the kernel's compile
+  time grows with its whole problem (240 s for one 4096³ launch at k = 8), so a
+  capped block keeps one NEFF per (slices, K, block shape) for every M and N.
+  At k = 8 each operand's slices take 16 bytes per element (2× fp64). Slices
+  under 2 GiB are uploaded once per call and cut into blocks on the device;
+  larger ones are uploaded block by block. Every launch's operands and result
+  stay under 2 GiB (`ozaki.plan`). M and N blocks do not change the
+  arithmetic; K is blocked only beyond ~1M at k = 8 (fp64 partial sums on the
+  host).
+- **Layouts.** The host splits each operand in its contiguous layout (a
+  transposing pass on the host costs 4–5 ns per element); slices that are
+  not K-major are transposed on the device (about 500 GB/s).
+- **Routes.** The kernel runs on the native TorchNeuron path (Trn2/Trn3) and
+  under `TRNBLAS_USE_SIMULATOR=1`. On CPU, on Trn1 (XLA), under
+  `set_backend("pytorch")`, and for non-finite operands, `gemm_fp64` is host
+  fp64 `A @ B`. Under `TRNBLAS_REQUIRE_NKI=1` the off-device case raises.
+- **Cost.** The host split is about 1.2 ns per element per slice on one Trn2
+  host core (two vCPUs), the kernel runs at about 87–96 TFLOP/s of bf16
+  slice products on one logical core, and the first call per launch shape
+  compiles (cached afterwards in the NEFF cache). End to end the host split
+  dominates: on one logical core `gemm_fp64` beats host fp64 on 2 vCPUs on
+  large squares (2.4× at 4096³, k = 8) but not a 12-vCPU host, and on narrow
+  products such as (3267, 8400) @ (8400, 241) it is slower than host fp64
+  (2.8× on 2 vCPUs). Use it where fp64 accuracy must come from the device
+  side of a pipeline or where the host is busy; a device-side split is the
+  next step. See [Benchmarks](../benchmarks.md#fp64-class-gemm-gemm_fp64).
+
+`alpha` / `beta` are not taken: scale the fp64 result. Batched operands are
+not supported.
+
 ## `symm(alpha, A, B, beta=0.0, C=None, side="left", uplo="upper")`
 
 Symmetric matrix-matrix multiply. No NKI kernel: torch on the operands'

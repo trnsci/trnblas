@@ -24,7 +24,8 @@ trnblas/
 │   ├── __init__.py          # Re-exports all BLAS operations
 │   ├── level1.py            # axpy, dot, nrm2, scal, asum, iamax
 │   ├── level2.py            # gemv, symv, trmv, ger
-│   ├── level3.py            # gemm, batched_gemm, symm, syrk, trsm, trmm, metric_inv_half
+│   ├── level3.py            # gemm, gemm_fp64, batched_gemm, symm, syrk, trsm, trmm, metric_inv_half
+│   ├── ozaki.py             # gemm_fp64 host half: split, schedule, plan, combine, bitwise reference
 │   ├── parallel.py          # SPMD multi-core GEMM + DF-MP2 (torchrun)
 │   └── nki/
 │       ├── __init__.py
@@ -78,9 +79,14 @@ since it's reused across all auxiliary basis indices P.
   `pair_energy_sym` kernel is 1.8× faster than aten on the DF-MP2 energy
   step (an earlier 92× figure was wrong).
 
-- **No FP64.** Trainium's Tensor Engine maxes out at FP32. For chemistry
-  workloads needing higher precision, double-double arithmetic (emulated FP64
-  from two FP32 values) is the path — not implemented yet.
+- **No FP64 arithmetic.** Trainium's Tensor Engine maxes out at FP32.
+  `gemm_fp64` (#22, `trnblas/ozaki.py` + `_ozaki_gemm_kernel`) gives an
+  fp64-class GEMM by Ozaki splitting: exact 7-bit bf16 integer slices, exact
+  fp32 PSUM groups of 4096 terms, VectorE TwoSum eviction, fp64 recombine on
+  the host. `slices` (default 8) is the precision knob. Double-double (fp32
+  hi/lo) stays at fp32 accuracy on the device and was dropped. The host split
+  (~11 ns per element at 8 slices on one host core) dominates end to end; the
+  kernel runs at ~87-96 TFLOP/s of bf16 slice products on squares.
 
 - **Level 3 dominates.** Level 1/2 are included for API completeness but
   won't get NKI kernels initially. The Tensor Engine is wasted on vector ops.

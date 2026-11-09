@@ -20,6 +20,7 @@ import torch
 
 import trnblas
 import trnblas.nki
+from trnblas import ozaki
 from trnblas.nki import dispatch
 
 _REAL_FIND_SPEC = importlib.util.find_spec
@@ -35,6 +36,7 @@ EXPECTED_OPS = GEMM_OPS | {
     "batched_pair",
     "j_batched",
     "pair_energy_sym",
+    "ozaki_gemm",
 }
 
 
@@ -451,6 +453,7 @@ def native_stub(monkeypatch):
         "_fused_gemm_energy_kernel",
         "_batched_pair_kernel",
         "_j_batched_kernel",
+        "_ozaki_gemm_kernel",
     ):
         monkeypatch.setattr(dispatch, name, sentinel(name), raising=False)
     monkeypatch.setattr(
@@ -484,6 +487,9 @@ def native_stub(monkeypatch):
     )
     ops["pair_energy_sym"] = rec(
         "pair_energy_sym", lambda bi, Bw, eoi, eow, vc, vr: torch.zeros(pair, Bw.shape[0])
+    )
+    ops["ozaki_gemm"] = rec(
+        "ozaki_gemm", lambda at, b: torch.from_numpy(ozaki.reference_from_digits(at, b))
     )
     assert set(ops) == EXPECTED_OPS
     monkeypatch.setattr(dispatch, "_native_ops", ops)
@@ -530,6 +536,13 @@ class TestHostWrappersOnNativePath:
         out = dispatch.nki_syrk(A)
         assert native_stub == ["syrk"]
         torch.testing.assert_close(out, A @ A.T)
+
+    def test_gemm_fp64_uses_ozaki_op(self, native_stub):
+        A = torch.randn(130, 300, dtype=torch.float64)
+        B = torch.randn(300, 70, dtype=torch.float64)
+        out = trnblas.gemm_fp64(A, B)
+        assert native_stub == ["ozaki_gemm"]
+        assert torch.equal(out, ozaki.reference_gemm(A, B))
 
     def test_trsm_rides_gemm_op(self, native_stub):
         n = 256
@@ -701,6 +714,7 @@ class TestLazyRegistration:
         assert fake("pair_energy_sym")(
             meta(256, 128), meta(4, 256, 128), meta(1, 1), meta(1, 4), meta(128, 1), meta(1, 128)
         ).shape == (128, 4)
+        assert fake("ozaki_gemm")(meta(8, 256, 384), meta(8, 256, 241)).shape == (2, 384, 241)
         assert fake("j_batched")(
             meta(128, 256), meta(4, 128, 256), meta(1, 1), meta(1, 4), meta(128, 1), meta(1, 128)
         ).shape == (128, 4)

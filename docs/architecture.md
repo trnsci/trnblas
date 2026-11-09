@@ -63,12 +63,17 @@ since it's reused across all auxiliary basis indices `P`.
   dispatch with a single `@nki.jit` call (small shape) or chunked i-loop
   (medium/large). Warm: **3.6× faster than torch at small shape, 5.2× at
   medium shape.** (trn1, XLA path.)
-- **No FP64.** Trainium's Tensor Engine maxes out at FP32.
-  **Decision (2026-04-18):** FP32 is sufficient — both gate cases are well
-  below 1 µHartree.
-  [#10](https://github.com/trnsci/trnblas/issues/10) closed "not needed";
-  [#22](https://github.com/trnsci/trnblas/issues/22) (double-double) deferred
-  indefinitely. See [Precision envelope](#precision-envelope) below.
+- **No FP64 arithmetic; fp64-class GEMM by Ozaki splitting.** Trainium's
+  Tensor Engine maxes out at FP32. For DF-MP2 energies FP32 is sufficient
+  (decision 2026-04-18, both gate cases well below 1 µHartree; see
+  [Precision envelope](#precision-envelope) below). For the consumers that do
+  need fp64 (SCF polish, GP refinement, trnsci/trnsci#129),
+  [`gemm_fp64`](api/level3.md#gemm_fp64a-b-slices8-transafalse-transbfalse)
+  (#22) splits fp64 operands into exact 7-bit bf16 integer slices, sums slice
+  products in exact fp32 PSUM groups of 4096 terms, and folds the groups into a
+  VectorE TwoSum pair. It reaches host fp64 BLAS accuracy at 8 slices and is
+  bitwise LNC-invariant. Double-double (fp32 hi/lo pairs) was measured on
+  Trn2 and stays at fp32 accuracy, so it was dropped.
 - **Level 1/2 are PyTorch-only.** The Tensor Engine is wasted on vector ops;
   Level 3 is where NKI acceleration pays off. Not planned to change.
 
