@@ -81,6 +81,21 @@ class TestToHost:
         assert t.dtype == torch.float64 and t.is_contiguous()
         assert native_host_cache == [(1024, 1024)]
 
+    def test_host_empty_without_pinning_falls_back(self, native_host_cache, monkeypatch):
+        # A torch build with no accelerator to pin for raises on
+        # pin_memory=True (e.g. "Found no NVIDIA driver" on Linux CI).
+        real_empty = torch.empty
+
+        def no_pin(*args, pin_memory=False, **kw):
+            if pin_memory:
+                raise RuntimeError("Found no NVIDIA driver on your system")
+            return real_empty(*args, **kw)
+
+        monkeypatch.setattr(D.torch, "empty", no_pin)
+        t = D._host_empty((1024, 1024), torch.float64, "cpu")
+        assert t.shape == (1024, 1024) and t.dtype == torch.float64
+        assert t.device.type == "cpu" and not t.is_pinned()
+
 
 class TestScaleAdd:
     @pytest.mark.parametrize("alpha", [1.0, 0.5, -2.0])

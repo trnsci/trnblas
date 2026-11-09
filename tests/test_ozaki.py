@@ -257,8 +257,16 @@ def test_gemm_fp64_off_device_is_host_fp64(host_route, backend):
         assert torch.equal(
             trnblas.gemm_fp64(A.float(), B.float()), A.float().double() @ B.float().double()
         )
-        assert torch.equal(trnblas.gemm_fp64(A.T.contiguous(), B, transA=True), A @ B)
-        assert torch.equal(trnblas.gemm_fp64(A, B.T.contiguous(), transB="T"), A @ B)
+        # op(X) is a transposed view, and a BLAS may sum a transposed operand
+        # in another order (MKL on Linux does; Accelerate happens not to), so
+        # the bitwise reference is the same host matmul on the same views.
+        At, Bt = A.T.contiguous(), B.T.contiguous()
+        out = trnblas.gemm_fp64(At, B, transA=True)
+        assert torch.equal(out, At.mT @ B)
+        torch.testing.assert_close(out, A @ B, rtol=1e-12, atol=1e-12)
+        out = trnblas.gemm_fp64(A, Bt, transB="T")
+        assert torch.equal(out, A @ Bt.mT)
+        torch.testing.assert_close(out, A @ B, rtol=1e-12, atol=1e-12)
     finally:
         trnblas.set_backend(prev)
 

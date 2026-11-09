@@ -2078,7 +2078,13 @@ def _host_empty(shape, dtype: torch.dtype, device) -> torch.Tensor:
     shape = tuple(shape)
     nbytes = math.prod(shape) * torch.empty((), dtype=dtype).element_size()
     if _use_host_cache(device, nbytes):
-        return torch.empty(shape, dtype=dtype, pin_memory=True)
+        # Without an accelerator to pin for (a CPU-only or a CUDA torch build
+        # on a host with no GPU, e.g. Linux CI) pinning raises; fall back to
+        # pageable memory, as `multicore._stage_to_host` does.
+        try:
+            return torch.empty(shape, dtype=dtype, pin_memory=True)
+        except RuntimeError:
+            pass
     return torch.empty(shape, dtype=dtype, device=device)
 
 

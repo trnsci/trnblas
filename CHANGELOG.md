@@ -81,6 +81,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   operands, and a CPU test (`tests/test_rel_helpers.py`) covers the helpers.
   pytest now turns torch's "Casting complex values to real discards the
   imaginary part" warning into an error, so a recurrence fails the run.
+- **Host results on the native path no longer need pinnable memory** (#61
+  follow-up). `_host_empty` asked for `pin_memory=True` whenever the native
+  path returned a large CPU result, which raises on a torch build with no
+  accelerator to pin for (e.g. "Found no NVIDIA driver" with a CUDA build on
+  a GPU-less Linux host). It now falls back to pageable memory when pinning
+  raises, as `multicore._stage_to_host` already did. Where pinning works
+  (Trn2) the behaviour is unchanged.
 
 ## [0.12.1] — 2026-11-07
 
