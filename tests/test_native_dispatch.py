@@ -17,6 +17,7 @@ import warnings
 
 import pytest
 import torch
+from _ozaki_ref import DEVICE_SPLIT_KERNELS, device_split_ops
 
 import trnblas
 import trnblas.nki
@@ -37,6 +38,10 @@ EXPECTED_OPS = GEMM_OPS | {
     "j_batched",
     "pair_energy_sym",
     "ozaki_gemm",
+    "ozaki_emax",
+    "ozaki_emax_col",
+    "ozaki_split",
+    "ozaki_split_col",
 }
 
 
@@ -454,6 +459,7 @@ def native_stub(monkeypatch):
         "_batched_pair_kernel",
         "_j_batched_kernel",
         "_ozaki_gemm_kernel",
+        *DEVICE_SPLIT_KERNELS,
     ):
         monkeypatch.setattr(dispatch, name, sentinel(name), raising=False)
     monkeypatch.setattr(
@@ -491,6 +497,8 @@ def native_stub(monkeypatch):
     ops["ozaki_gemm"] = rec(
         "ozaki_gemm", lambda at, b: torch.from_numpy(ozaki.reference_from_digits(at, b))
     )
+    for name, fn in device_split_ops().items():
+        ops[name] = rec(name, fn)
     assert set(ops) == EXPECTED_OPS
     monkeypatch.setattr(dispatch, "_native_ops", ops)
     return calls
@@ -541,7 +549,9 @@ class TestHostWrappersOnNativePath:
         A = torch.randn(130, 300, dtype=torch.float64)
         B = torch.randn(300, 70, dtype=torch.float64)
         out = trnblas.gemm_fp64(A, B)
-        assert native_stub == ["ozaki_gemm"]
+        # A split per row and B per column on the device (#123), then the GEMM
+        split = ["ozaki_emax", "ozaki_split", "ozaki_emax_col", "ozaki_split_col"]
+        assert native_stub == [*split, "ozaki_gemm"]
         assert torch.equal(out, ozaki.reference_gemm(A, B))
 
     def test_trsm_rides_gemm_op(self, native_stub):
@@ -715,6 +725,10 @@ class TestLazyRegistration:
             meta(256, 128), meta(4, 256, 128), meta(1, 1), meta(1, 4), meta(128, 1), meta(1, 128)
         ).shape == (128, 4)
         assert fake("ozaki_gemm")(meta(8, 256, 384), meta(8, 256, 241)).shape == (2, 384, 241)
+        assert fake("ozaki_emax")(meta(300, 482)).shape == (300, 1)
+        assert fake("ozaki_emax_col")(meta(300, 482)).shape == (1, 241)
+        assert fake("ozaki_split")(meta(300, 482), meta(384, 8)).shape == (8, 384, 256)
+        assert fake("ozaki_split_col")(meta(300, 482), meta(8, 256)).shape == (8, 384, 256)
         assert fake("j_batched")(
             meta(128, 256), meta(4, 128, 256), meta(1, 1), meta(1, 4), meta(128, 1), meta(1, 128)
         ).shape == (128, 4)

@@ -144,8 +144,11 @@ def gemm_fp64(
 ) -> torch.Tensor:
     """fp64-class matrix product op(A) @ op(B) on the bf16 Tensor Engine (#22).
 
-    Ozaki splitting: the host splits A row by row and B column by column into
-    `slices` (k) bf16 integer slices of 7 bits, exactly. On the device each
+    Ozaki splitting: A is split row by row and B column by column into
+    `slices` (k) bf16 integer slices of 7 bits, exactly. The split runs on the
+    device from the operands' raw fp64 bits (#123; the host split, the same
+    digits, covers the rest: TRNBLAS_OZAKI_DEVICE_SPLIT=0, operands of 2 GiB
+    and more, a subnormal row / column maximum). On the device each
     diagonal s + t <= k - 1 of slice pairs runs as bf16 matmuls with exact fp32
     PSUM accumulation, in groups of at most 4096 terms (same-diagonal pairs
     concatenated along K), and each group is folded into a VectorE TwoSum

@@ -89,6 +89,48 @@ def ozaki_gemm(at: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return _d._ozaki_gemm_kernel(at, b)
 
 
+@nki_op(
+    "trnblas::ozaki_emax",
+    mutates_args={},
+    fake_fn=lambda xw: xw.new_empty((xw.shape[0], 1), dtype=torch.float32),
+)
+def ozaki_emax(xw: torch.Tensor) -> torch.Tensor:
+    return _d._ozaki_emax_kernel(xw)
+
+
+def _ozaki_split_fake(xw, rcs):
+    rp = -(-xw.shape[0] // 128) * 128
+    cp = -(-(xw.shape[1] // 2) // 128) * 128
+    return xw.new_empty((rcs.shape[1], rp, cp), dtype=torch.bfloat16)
+
+
+@nki_op("trnblas::ozaki_split", mutates_args={}, fake_fn=_ozaki_split_fake)
+def ozaki_split(xw: torch.Tensor, rcs: torch.Tensor) -> torch.Tensor:
+    # Gridless: at LNC=2 the two programs split the row tiles by program_id.
+    return _d._ozaki_split_kernel(xw, rcs)
+
+
+@nki_op(
+    "trnblas::ozaki_emax_col",
+    mutates_args={},
+    fake_fn=lambda xw: xw.new_empty((1, xw.shape[1] // 2), dtype=torch.float32),
+)
+def ozaki_emax_col(xw: torch.Tensor) -> torch.Tensor:
+    return _d._ozaki_emax_col_kernel(xw)
+
+
+def _ozaki_split_col_fake(xw, rcs):
+    rp = -(-xw.shape[0] // 128) * 128
+    cp = -(-(xw.shape[1] // 2) // 128) * 128
+    return xw.new_empty((rcs.shape[0], rp, cp), dtype=torch.bfloat16)
+
+
+@nki_op("trnblas::ozaki_split_col", mutates_args={}, fake_fn=_ozaki_split_col_fake)
+def ozaki_split_col(xw: torch.Tensor, rcs: torch.Tensor) -> torch.Tensor:
+    # Gridless: at LNC=2 the two programs split the column tiles by program_id.
+    return _d._ozaki_split_col_kernel(xw, rcs)
+
+
 # ── SYRK ─────────────────────────────────────────────────────────────────────
 
 
@@ -210,6 +252,10 @@ OPS = {
     "j_batched": j_batched,
     "pair_energy_sym": pair_energy_sym,
     "ozaki_gemm": ozaki_gemm,
+    "ozaki_emax": ozaki_emax,
+    "ozaki_split": ozaki_split,
+    "ozaki_emax_col": ozaki_emax_col,
+    "ozaki_split_col": ozaki_split_col,
 }
 
 

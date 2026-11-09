@@ -25,7 +25,7 @@ trnblas/
 │   ├── level1.py            # axpy, dot, nrm2, scal, asum, iamax
 │   ├── level2.py            # gemv, symv, trmv, ger
 │   ├── level3.py            # gemm, gemm_fp64, batched_gemm, symm, syrk, trsm, trmm, metric_inv_half
-│   ├── ozaki.py             # gemm_fp64 host half: split, schedule, plan, combine, bitwise reference
+│   ├── ozaki.py             # gemm_fp64 host half: split (+ device-split twin), schedule, plan, combine, bitwise reference
 │   ├── parallel.py          # SPMD multi-core GEMM + DF-MP2 (torchrun)
 │   └── nki/
 │       ├── __init__.py
@@ -84,9 +84,12 @@ since it's reused across all auxiliary basis indices P.
   fp64-class GEMM by Ozaki splitting: exact 7-bit bf16 integer slices, exact
   fp32 PSUM groups of 4096 terms, VectorE TwoSum eviction, fp64 recombine on
   the host. `slices` (default 8) is the precision knob. Double-double (fp32
-  hi/lo) stays at fp32 accuracy on the device and was dropped. The host split
-  (~11 ns per element at 8 slices on one host core) dominates end to end; the
-  kernel runs at ~87-96 TFLOP/s of bf16 slice products on squares.
+  hi/lo) stays at fp32 accuracy on the device and was dropped. The split runs
+  on the device from the raw fp64 bits (#123: `_ozaki_emax*_kernel`,
+  `_ozaki_split*_kernel`, bitvec ops + exact fp32 only; CPU twin
+  `ozaki.split_from_bits`), ~0.55 ns per element, against ~11 ns for the host
+  split on one host core; the kernel runs at ~87-96 TFLOP/s of bf16 slice
+  products on squares.
 
 - **Level 3 dominates.** Level 1/2 are included for API completeness but
   won't get NKI kernels initially. The Tensor Engine is wasted on vector ops.

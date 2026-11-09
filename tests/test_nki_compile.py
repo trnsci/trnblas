@@ -30,6 +30,10 @@ def _f32(*shape):
     return np.zeros(shape, dtype=np.float32)
 
 
+def _i32(*shape):
+    return np.zeros(shape, dtype=np.int32)
+
+
 def _bf16(*shape):
     import ml_dtypes
 
@@ -138,6 +142,25 @@ _KERNELS = {
         lambda d: d._ozaki_gemm_kernel,
         lambda: (_bf16(3, 9000 // 128 * 128 + 128, 256), _bf16(3, 9000 // 128 * 128 + 128, 241)),
     ),
+    # Device split (#123): full and partial row tiles (odd count: the LNC
+    # halves share the middle one) and column tiles, k = 8 (3 chunks, no
+    # rest field) and k = 3, 12 (rest fields); a single partial tile.
+    "ozaki_emax": (lambda d: d._ozaki_emax_kernel, lambda: (_i32(3 * 128 + 5, 2 * 2100),)),
+    "ozaki_emax_col": (lambda d: d._ozaki_emax_col_kernel, lambda: (_i32(300, 2 * 1100),)),
+    "ozaki_split": (
+        lambda d: d._ozaki_split_kernel,
+        lambda: (_i32(3 * 128 + 5, 2 * 1100), _f32(4 * 128, 8)),
+    ),
+    "ozaki_split_k3": (lambda d: d._ozaki_split_kernel, lambda: (_i32(130, 2 * 600), _f32(256, 3))),
+    "ozaki_split_tiny": (lambda d: d._ozaki_split_kernel, lambda: (_i32(1, 2), _f32(128, 1))),
+    "ozaki_split_col": (
+        lambda d: d._ozaki_split_col_kernel,
+        lambda: (_i32(300, 2 * 1100), _f32(12, 1152)),
+    ),
+    "ozaki_split_col_narrow": (
+        lambda d: d._ozaki_split_col_kernel,
+        lambda: (_i32(8400, 2 * 241), _f32(8, 256)),
+    ),
 }
 
 # Native-only kernels that split work across the cores of an LNC=2 logical
@@ -154,6 +177,13 @@ _LNC2 = {
     "ozaki_gemm_tiny",
     "ozaki_gemm_long_k",
     "ozaki_gemm_col_split",
+    "ozaki_emax",
+    "ozaki_emax_col",
+    "ozaki_split",
+    "ozaki_split_k3",
+    "ozaki_split_tiny",
+    "ozaki_split_col",
+    "ozaki_split_col_narrow",
 }
 
 
