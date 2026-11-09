@@ -76,6 +76,19 @@ def gemm_lnc_tn(at: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return _d._gemm_lnc_tn_kernel(at, b)
 
 
+# ── fp64-class Ozaki GEMM (#22) ──────────────────────────────────────────────
+
+
+@nki_op(
+    "trnblas::ozaki_gemm",
+    mutates_args={},
+    fake_fn=lambda at, b: at.new_empty((2, at.shape[2], b.shape[2]), dtype=torch.float32),
+)
+def ozaki_gemm(at: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    # Gridless: at LNC=2 the two programs split the M tiles by program_id.
+    return _d._ozaki_gemm_kernel(at, b)
+
+
 # ── SYRK ─────────────────────────────────────────────────────────────────────
 
 
@@ -196,6 +209,7 @@ OPS = {
     "batched_pair": batched_pair,
     "j_batched": j_batched,
     "pair_energy_sym": pair_energy_sym,
+    "ozaki_gemm": ozaki_gemm,
 }
 
 

@@ -18,7 +18,7 @@ from .level1 import asum, axpy, dot, iamax, nrm2, scal
 from .level2 import gemv, ger, symv, trmv
 
 # Level 3 — Matrix-matrix operations
-from .level3 import batched_gemm, gemm, metric_inv_half, symm, syrk, trmm, trsm
+from .level3 import batched_gemm, gemm, gemm_fp64, metric_inv_half, symm, syrk, trmm, trsm
 
 # Backend control
 from .nki import (
@@ -46,6 +46,7 @@ __all__ = [
     "ger",
     # Level 3
     "gemm",
+    "gemm_fp64",
     "batched_gemm",
     "symm",
     "syrk",

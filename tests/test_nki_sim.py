@@ -174,3 +174,44 @@ class TestFusedGemmEnergySimulator:
     def test_two_k_tiles(self):
         """NAUX=256: two TILE_K strips in the GEMM k-loop."""
         self._run(nvir=128, naux=256)
+
+
+class TestOzakiSimulator:
+    """The Ozaki fp64-class GEMM kernel (#22) under nki.simulate equals the
+    host reference of its arithmetic bit for bit, and is fp64-accurate."""
+
+    @pytest.mark.parametrize(
+        "M,K,N,k",
+        [
+            (130, 300, 241, 3),
+            (384, 4200, 64, 2),
+            (256, 128, 1100, 2),
+            (200, 1000, 300, 8),
+            (1, 5, 1, 1),
+        ],
+    )
+    def test_matches_reference_bitwise(self, M, K, N, k):
+        import numpy as np
+
+        from trnblas import ozaki
+        from trnblas.nki import dispatch
+
+        g = torch.Generator().manual_seed(0)
+        A = torch.randn(M, K, generator=g, dtype=torch.float64)
+        B = torch.randn(K, N, generator=g, dtype=torch.float64)
+        da, db = ozaki.split_a(A, k), ozaki.split_b(B, k)
+        at, bt = ozaki.kmajor(da.d, da.kmajor), ozaki.kmajor(db.d, db.kmajor)
+        got = dispatch._simulate_bf16(dispatch._ozaki_gemm_kernel, at, bt).numpy()
+        ref = ozaki.reference_from_digits(at, bt)
+        assert np.array_equal(got.view(np.int32), ref.view(np.int32))
+
+    def test_gemm_fp64_end_to_end(self):
+        from trnblas import gemm_fp64, ozaki
+
+        g = torch.Generator().manual_seed(1)
+        A = torch.randn(150, 500, generator=g, dtype=torch.float64)
+        B = torch.randn(500, 90, generator=g, dtype=torch.float64)
+        C = gemm_fp64(A, B, slices=8)
+        assert torch.equal(C, ozaki.reference_gemm(A, B, 8))
+        err = ((C - A @ B).abs() / (A.abs() @ B.abs())).max().item()
+        assert err < 2e-15

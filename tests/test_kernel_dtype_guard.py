@@ -51,6 +51,7 @@ ALLOWED = {
     "batched_pair": FP32,
     "j_batched": FP32,
     "pair_energy_sym": FP32,
+    "ozaki_gemm": frozenset({BF16}),  # integer slices only (#22)
 }
 
 # Raw kernel attribute on `dispatch` for each op (XLA / simulator paths).
@@ -1457,3 +1458,22 @@ def test_parallel_pair_energy_device_float64_under_nki(fake_neuron, monkeypatch,
     monkeypatch.setattr(dispatch, "_REQUIRE_NKI", True)
     with pytest.raises(NotImplementedError, match="TRNBLAS_REQUIRE_NKI"):
         parallel.pair_energy(*args)
+
+
+@pytest.mark.parametrize("d", ALL_DTYPES, ids=str)
+@pytest.mark.parametrize("backend", ["nki", "auto"])
+def test_gemm_fp64_reaches_only_bf16_slices(stubs, monkeypatch, backend, d):
+    """gemm_fp64 (#22): every float dtype becomes bf16 integer slices before
+    the kernel; integer, bool and complex operands raise TypeError first."""
+    # The op is the recorded stub; the raw kernel object is only a handle key.
+    monkeypatch.setattr(dispatch, "_ozaki_gemm_kernel", object(), raising=False)
+    A, B = _rand((40, 70), d), _rand((70, 30), d)
+    trnblas.set_backend(backend)
+    if not d.is_floating_point:
+        with pytest.raises(TypeError):
+            trnblas.gemm_fp64(A, B)
+        assert not stubs.calls
+        return
+    out = trnblas.gemm_fp64(A, B)
+    assert out.dtype == F64 and out.shape == (40, 30)
+    assert stubs.calls == ["ozaki_gemm"] and not stubs.violations

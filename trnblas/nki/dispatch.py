@@ -749,6 +749,85 @@ def _nki_gemm_lnc(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
         return _neuron_matmul(A, B)
 
 
+# ── fp64-class Ozaki GEMM (#22) ──────────────────────────────────────────────
+# `trnblas.gemm_fp64`: the host splits fp64 A and B into bf16 integer slices
+# (`trnblas/ozaki.py`), `_ozaki_gemm_kernel` runs the slice products with
+# exact PSUM groups and a VectorE TwoSum, and the host recombines in fp64.
+# The kernel runs on the native path (Trn2/Trn3) and under the simulator;
+# everywhere else (CPU, Trn1/XLA, set_backend("pytorch")) gemm_fp64 is host
+# fp64 BLAS.
+
+
+def _ozaki_route() -> str:
+    """ "kernel" (NKI Ozaki kernel) or "host" (host fp64 matmul) for gemm_fp64."""
+    if not _use_nki():
+        return "host"
+    if _use_simulator():
+        return "kernel"
+    if _get_dispatch_path() == "native":
+        return "kernel"
+    if _REQUIRE_NKI:
+        raise RuntimeError(
+            "trnblas gemm_fp64: the Ozaki kernel needs the native TorchNeuron path "
+            "(Trn2/Trn3) or TRNBLAS_USE_SIMULATOR=1; unset TRNBLAS_REQUIRE_NKI for host fp64"
+        )
+    return "host"
+
+
+def _simulate_bf16(kernel, *tensors: torch.Tensor) -> torch.Tensor:
+    """`nki.simulate(kernel)` on bf16 torch tensors (via ml_dtypes), result as torch."""
+    import ml_dtypes
+
+    arrs = [t.contiguous().view(torch.int16).numpy().view(ml_dtypes.bfloat16) for t in tensors]
+    return torch.from_numpy(np.asarray(nki.simulate(kernel)(*arrs), dtype=np.float32))
+
+
+def _ozaki_launch(a: torch.Tensor, a_kmajor: bool, b: torch.Tensor, b_kmajor: bool):
+    """One Ozaki kernel launch from one block of host bf16 slices (`ozaki.run`).
+
+    A block that is not K-major ((k, M, Kp) slices of a row-major A, or
+    (k, N, Kp) of a transposed B) is uploaded as is and transposed on the
+    device (aten, about 500 GB/s on Trn2; on the host a transposing pass costs
+    4-5 ns per fp64 element). Returns host fp32 (2, Mp, N) (hi, lo)."""
+    from .. import ozaki
+
+    if _use_simulator():
+        at, bt = ozaki.kmajor(a, a_kmajor), ozaki.kmajor(b, b_kmajor)
+        _check_kernel_operands("ozaki_gemm", at, bt)
+        return _simulate_bf16(_ozaki_gemm_kernel, at, bt)
+    _check_kernel_operands("ozaki_gemm", a, b)
+    (ad, bd), _ = _to_device(a.contiguous(), b.contiguous())
+    at = ad if a_kmajor else ad.transpose(1, 2).contiguous()
+    bt = bd if b_kmajor else bd.transpose(1, 2).contiguous()
+    del ad, bd
+    return _to_host(_call_kernel(_ozaki_gemm_kernel, "ozaki_gemm", at, bt), "cpu")
+
+
+def _ozaki_host_empty(shape, dtype):
+    """Host buffers of gemm_fp64 (slices, result): on the native path the
+    caching pinned allocator (already faulted in, faster uploads, #61); a
+    fresh allocation would page-fault on every write (~4 ns per fp64 element)."""
+    return _host_empty(shape, dtype, "cpu")
+
+
+def nki_gemm_fp64(A: torch.Tensor, B: torch.Tensor, slices: int) -> torch.Tensor:
+    """fp64 (M, N) = A @ B for 2-D host fp64 A (M, K), B (K, N): the Ozaki
+    kernel on the native path, else host fp64 matmul (see `_ozaki_route`).
+    Non-finite operands take host fp64 (the slices cannot represent them)."""
+    from .. import ozaki
+
+    k = ozaki.check_slices(slices)
+    if _ozaki_route() == "host" or not (torch.isfinite(A).all() and torch.isfinite(B).all()):
+        return torch.matmul(A, B)
+    try:
+        return ozaki.run(A, B, k, _ozaki_launch, empty=_ozaki_host_empty)
+    except Exception as exc:
+        if _REQUIRE_NKI:
+            raise
+        _warn_fallback(exc, "Ozaki fp64 GEMM kernel failed — falling back to host fp64")
+        return torch.matmul(A, B)
+
+
 def _aten_on_device(fn, *tensors: torch.Tensor) -> torch.Tensor:
     """`fn(*tensors)` as aten on the `neuron` device; the result is returned on
     the device of the first input (host results come down through `_to_host`)."""
@@ -1036,6 +1115,7 @@ _KERNEL_DTYPES: dict[str, frozenset] = {
     "batched_pair": _FP32_KERNEL_DTYPES,
     "j_batched": _FP32_KERNEL_DTYPES,
     "pair_energy_sym": _FP32_KERNEL_DTYPES,
+    "ozaki_gemm": frozenset({torch.bfloat16}),  # integer slices, #22
 }
 
 
@@ -3516,6 +3596,157 @@ if HAS_NKI:
         c0 = nl.program_id(0) * (N - NPP) if split == "n" else 0
         _lnc_region_t(at, b, c, r0, MP, c0, NPP)
         return c
+
+    # ---------------------------------------------------------------------------
+    # fp64-class Ozaki GEMM (#22): bf16 integer slices, exact PSUM groups,
+    # VectorE TwoSum eviction. Host half and schedule: trnblas/ozaki.py.
+    # Helpers take only static Python sizes plus symbolic offsets.
+    # ---------------------------------------------------------------------------
+
+    def _oz_evict(ps, hi, lo, scale, TM, nsizes):
+        """Evict one PSUM group: p = group * scale (exact: an integer times a
+        power of two), then (hi, lo) += p by Knuth TwoSum, in place. The op
+        order is that of `ozaki._two_sum32` (the bitwise reference)."""
+        f32 = nl.float32
+        for i in range(TM):
+            for j in range(len(nsizes)):
+                shape = (128, nsizes[j])
+                p = nl.ndarray(shape, dtype=f32, buffer=nl.sbuf)
+                s = nl.ndarray(shape, dtype=f32, buffer=nl.sbuf)
+                bb = nl.ndarray(shape, dtype=f32, buffer=nl.sbuf)
+                t = nl.ndarray(shape, dtype=f32, buffer=nl.sbuf)
+                e1 = nl.ndarray(shape, dtype=f32, buffer=nl.sbuf)
+                e2 = nl.ndarray(shape, dtype=f32, buffer=nl.sbuf)
+                h, w = hi[i][j], lo[i][j]
+                nisa.tensor_scalar(dst=p, data=ps[i][j], op0=nl.multiply, operand0=scale)
+                nisa.tensor_tensor(dst=s, data1=h, data2=p, op=nl.add)
+                nisa.tensor_tensor(dst=bb, data1=s, data2=h, op=nl.subtract)
+                nisa.tensor_tensor(dst=t, data1=s, data2=bb, op=nl.subtract)
+                nisa.tensor_tensor(dst=e1, data1=h, data2=t, op=nl.subtract)
+                nisa.tensor_tensor(dst=e2, data1=p, data2=bb, op=nl.subtract)
+                nisa.tensor_tensor(dst=t, data1=e1, data2=e2, op=nl.add)
+                nisa.tensor_tensor(dst=w, data1=w, data2=t, op=nl.add)
+                nisa.tensor_copy(src=s, dst=h)
+
+    def _oz_psum(TM, nsizes):
+        return [
+            [nl.zeros((128, ns), dtype=nl.float32, buffer=nl.psum) for ns in nsizes]
+            for _ in range(TM)
+        ]
+
+    def _oz_mm(at, b, ps, s, t, k0, m0, TM, n0, nsizes):
+        """One K tile (rows k0 .. k0 + 127) of slice pair (s, t) into PSUM."""
+        W = sum(nsizes)
+        a_t = nl.load(at[s, k0 : k0 + 128, m0 : m0 + 128 * TM])
+        b_t = nl.load(b[t, k0 : k0 + 128, n0 : n0 + W])
+        off = 0
+        for j in range(len(nsizes)):
+            for i in range(TM):
+                nisa.nc_matmul(
+                    dst=ps[i][j],
+                    stationary=a_t[0:128, i * 128 : (i + 1) * 128],
+                    moving=b_t[0:128, off : off + nsizes[j]],
+                    accumulate=True,
+                )
+            off += nsizes[j]
+
+    def _oz_tile(at, b, out, m0, TM, n0, nsizes):
+        """TM M tiles (128 rows each) x N sub-tiles `nsizes` (each <= 512) of
+        the (hi, lo) output, from row m0 and column n0.
+
+        Diagonals d = k-1 .. 0 (smallest first, static); within a diagonal
+        the PSUM groups of `ozaki.diag_groups` run as runtime loops, so the
+        traced code is O(k), not O(groups). With KT >= 32 K tiles, each pair
+        (s, t) = (j, d - j) is its own run of 32-tile groups plus a remainder;
+        with KT < 32, a group holds 32 // KT whole pairs. Each group's integer
+        sum is exact in PSUM and is evicted by `_oz_evict`."""
+        k = at.shape[0]
+        KT = at.shape[1] // 128
+        NS = len(nsizes)
+        noff = [sum(nsizes[:j]) for j in range(NS)]
+        hi = [
+            [nl.zeros((128, ns), dtype=nl.float32, buffer=nl.sbuf) for ns in nsizes]
+            for _ in range(TM)
+        ]
+        lo = [
+            [nl.zeros((128, ns), dtype=nl.float32, buffer=nl.sbuf) for ns in nsizes]
+            for _ in range(TM)
+        ]
+        for d in range(k - 1, -1, -1):
+            scale = float(2 ** (7 * (k - 1 - d)))
+            if KT >= 32:
+                G = KT // 32
+                R = KT - G * 32
+                for jp in nl.sequential_range(d + 1):
+                    for g in nl.sequential_range(G):
+                        ps = _oz_psum(TM, nsizes)
+                        for kk in nl.affine_range(32):
+                            _oz_mm(at, b, ps, jp, d - jp, (g * 32 + kk) * 128, m0, TM, n0, nsizes)
+                        _oz_evict(ps, hi, lo, scale, TM, nsizes)
+                    if R:
+                        ps = _oz_psum(TM, nsizes)
+                        for kk in nl.affine_range(R):
+                            _oz_mm(at, b, ps, jp, d - jp, (G * 32 + kk) * 128, m0, TM, n0, nsizes)
+                        _oz_evict(ps, hi, lo, scale, TM, nsizes)
+            else:
+                P = 32 // KT
+                NG = (d + 1) // P
+                RP = d + 1 - NG * P
+                for g in nl.sequential_range(NG):
+                    ps = _oz_psum(TM, nsizes)
+                    for jj in nl.affine_range(P):
+                        for kk in nl.affine_range(KT):
+                            jp = g * P + jj
+                            _oz_mm(at, b, ps, jp, d - jp, kk * 128, m0, TM, n0, nsizes)
+                    _oz_evict(ps, hi, lo, scale, TM, nsizes)
+                if RP:
+                    ps = _oz_psum(TM, nsizes)
+                    for jj in nl.affine_range(RP):
+                        for kk in nl.affine_range(KT):
+                            jp = NG * P + jj
+                            _oz_mm(at, b, ps, jp, d - jp, kk * 128, m0, TM, n0, nsizes)
+                    _oz_evict(ps, hi, lo, scale, TM, nsizes)
+        for i in range(TM):
+            r = m0 + i * 128
+            for j in range(NS):
+                c = n0 + noff[j]
+                nl.store(out[0, r : r + 128, c : c + nsizes[j]], value=hi[i][j])
+                nl.store(out[1, r : r + 128, c : c + nsizes[j]], value=lo[i][j])
+
+    def _oz_mblock(at, b, out, m0, TM, N):
+        """Every N super-tile (two 512-column PSUM sub-tiles) of one M block."""
+        NF = N // 1024
+        for nb in nl.affine_range(NF):
+            _oz_tile(at, b, out, m0, TM, nb * 1024, [512, 512])
+        if N - NF * 1024:
+            _oz_tile(at, b, out, m0, TM, NF * 1024, _lnc_sizes(N - NF * 1024, 512))
+
+    @nki.jit
+    def _ozaki_gemm_kernel(at, b):
+        """fp64-class GEMM from bf16 integer slices (#22, `trnblas.gemm_fp64`).
+
+        `at` (k, Kp, Mp) holds A^T's k slices and `b` (k, Kp, N) B's, with
+        Kp and Mp multiples of 128 (`ozaki.split`). Returns (2, Mp, N) fp32:
+        hi and lo of sum_d 2^(7 (k-1-d)) sum_{s+t=d} A_s B_t, d < k.
+        Gridless: at LNC=2 each program takes a contiguous half of the
+        128-row M tiles (for an odd count both compute the middle tile, with
+        identical values). Every output element gets the same sequence of
+        exact group sums and fp32 TwoSums, so the result is bitwise the same
+        at LNC=1 and LNC=2 and equals `ozaki.reference_from_digits`.
+        """
+        Mp = at.shape[2]
+        N = b.shape[2]
+        out = nl.ndarray((2, Mp, N), dtype=nl.float32, buffer=nl.shared_hbm)
+        n_prog = nl.num_programs() if nl.program_ndim() > 0 else 1
+        MT = Mp // 128
+        MPT = (MT + n_prog - 1) // n_prog
+        r0 = nl.program_id(0) * ((MT - MPT) * 128) if n_prog > 1 else 0
+        NB = MPT // 2
+        for mb in nl.affine_range(NB):
+            _oz_mblock(at, b, out, r0 + mb * 256, 2, N)
+        if MPT % 2:
+            _oz_mblock(at, b, out, r0 + NB * 256, 1, N)
+        return out
 
     @nki.jit
     def _mp2_energy_kernel(T_flat, eps_occ_chunk, eps_occ_full, eps_vir_col, eps_vir_row):

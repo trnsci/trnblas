@@ -18,7 +18,7 @@ Part of the trnsci scientific computing suite ([github.com/trnsci](https://githu
 trnblas follows the [trnsci 5-phase roadmap](https://trnsci.dev/roadmap/). Active work is tracked in phase-labeled GitHub issues:
 
 - **[Phase 1 — correctness](https://github.com/trnsci/trnblas/issues/21)**: **complete as of v0.4.0** (GEMM, SYRK, MP2 energy reduction kernels hardware-validated on trn1; end-to-end DF-MP2 validated against PySCF at nanohartree tolerance).
-- **[Phase 2 — precision](https://github.com/trnsci/trnblas/issues/22)** (deferred): double-double FP64 GEMM for chemistry workloads. FP32 measured sufficient for DF-MP2 through glycine/cc-pVDZ and H₂O/cc-pVTZ (see [Precision envelope](docs/architecture.md#precision-envelope)). Unblocks [trnsolver#27](https://github.com/trnsci/trnsolver/issues/27) and [trntensor#28](https://github.com/trnsci/trntensor/issues/28).
+- **[Phase 2 — precision](https://github.com/trnsci/trnblas/issues/22)**: `trnblas.gemm_fp64`, an fp64-class GEMM on the bf16 Tensor Engine by Ozaki splitting (exact integer slices, exact PSUM groups, VectorE TwoSum). At the default 8 slices it matches host fp64 BLAS accuracy and is bitwise LNC-invariant (see [Level 3](docs/api/level3.md)). Double-double was measured and dropped (it stays at fp32 accuracy). FP32 remains sufficient for DF-MP2 energies through glycine/cc-pVDZ and H₂O/cc-pVTZ (see [Precision envelope](docs/architecture.md#precision-envelope)). Unblocks [trnsolver#27](https://github.com/trnsci/trnsolver/issues/27) and [trntensor#28](https://github.com/trnsci/trntensor/issues/28).
 - **[Phase 3 — perf](https://github.com/trnsci/trnblas/issues/23)**: **complete** (tile autotuner, fused DF-MP2 pair-energy kernels, NEFF cache reuse). On Trn2 the native path adds measured `auto` routing (v0.9.0) and the fused `pair_energy_sym` kernel, 1.8× faster than aten on the energy step at 96/672/2304.
 - **[Phase 4 — multi-chip](https://github.com/trnsci/trnblas/issues/24)**: **complete as of v0.9.0** for one Trn2 chip: [`trnblas.parallel`](docs/api/parallel.md) SPMD GEMM and DF-MP2 across NeuronCores (2.5–2.9× on 4 cores).
 - **[Phase 5 — generation](https://github.com/trnsci/trnblas/issues/25)**: trn2 FP16-accumulate GEMM path.
@@ -152,7 +152,7 @@ Runs SCF + density fitting via PySCF, feeds the integrals through trnblas, and c
 - [x] Native TorchNeuron dispatch (Trn2/Trn3) with measured `auto` routing
 - [x] Multi-core DF-MP2 and GEMM (`trnblas.parallel`)
 - [x] Benchmarks vs cuBLAS
-- [ ] Double-double FP64 emulation
+- [x] fp64-class GEMM (`gemm_fp64`, Ozaki splitting; double-double measured and dropped)
 
 ## Known issues in earlier releases
 

@@ -30,6 +30,12 @@ def _f32(*shape):
     return np.zeros(shape, dtype=np.float32)
 
 
+def _bf16(*shape):
+    import ml_dtypes
+
+    return np.zeros(shape, dtype=ml_dtypes.bfloat16)
+
+
 def _eps_vir(nvir):
     # Non-zero so the reciprocal in the energy kernels is traced on real values.
     return np.full((nvir, 1), -1.0, np.float32), np.full((1, nvir), -1.0, np.float32)
@@ -112,6 +118,21 @@ _KERNELS = {
     "batched_pair": (lambda d: d._batched_pair_kernel, _batched_pair_inputs),
     "j_batched": (lambda d: d._j_batched_kernel, _j_batched_inputs),
     "pair_energy_sym": (lambda d: d._pair_energy_sym_kernel, _pair_sym_inputs),
+    # Ozaki fp64-class GEMM (#22): an odd M-tile count (the LNC halves share
+    # the middle tile), N super-tiles plus a tail, K groups that span pairs
+    # (KT = 33), k = 8; a single tile; and K across several 4096-term groups.
+    "ozaki_gemm": (
+        lambda d: d._ozaki_gemm_kernel,
+        lambda: (_bf16(8, 33 * 128, 384), _bf16(8, 33 * 128, 1300)),
+    ),
+    "ozaki_gemm_tiny": (
+        lambda d: d._ozaki_gemm_kernel,
+        lambda: (_bf16(1, 128, 128), _bf16(1, 128, 1)),
+    ),
+    "ozaki_gemm_long_k": (
+        lambda d: d._ozaki_gemm_kernel,
+        lambda: (_bf16(3, 9000 // 128 * 128 + 128, 256), _bf16(3, 9000 // 128 * 128 + 128, 241)),
+    ),
 }
 
 # Native-only kernels that split work across the cores of an LNC=2 logical
@@ -124,6 +145,9 @@ _LNC2 = {
     "gemm_lnc_tn",
     "gemm_lnc_tn_small_m",
     "gemm_lnc_tiny",
+    "ozaki_gemm",
+    "ozaki_gemm_tiny",
+    "ozaki_gemm_long_k",
 }
 
 

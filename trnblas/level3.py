@@ -134,6 +134,62 @@ def batched_gemm(
     return _scale_add(nki_batched_gemm(a, b), alpha, beta, C)
 
 
+def gemm_fp64(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    *,
+    slices: int = 8,
+    transA: bool = False,
+    transB: bool = False,
+) -> torch.Tensor:
+    """fp64-class matrix product op(A) @ op(B) on the bf16 Tensor Engine (#22).
+
+    Ozaki splitting: the host splits A row by row and B column by column into
+    `slices` (k) bf16 integer slices of 7 bits, exactly. On the device each
+    diagonal s + t <= k - 1 of slice pairs runs as bf16 matmuls with exact fp32
+    PSUM accumulation, in groups of at most 4096 terms (same-diagonal pairs
+    concatenated along K), and each group is folded into a VectorE TwoSum
+    (hi, lo) pair. The host recombines in fp64 with the power-of-two scales.
+
+    `slices` is the precision knob: k (k + 1) / 2 slice GEMMs. Measured on
+    Trn2 (max |C - C_exact| / (|A| |B|), normal data): about 1e-12 at k = 6,
+    1e-14 at k = 7, 2e-16 to 3e-16 at k = 8 (the default; host fp64 BLAS
+    level). Scaling is per row of A and column of B, so entries far below
+    their row / column maximum lose relative precision: data spread over
+    10^+-4 needs k = 10 for host-fp64 accuracy. 1 <= slices <= 12.
+
+    The result is deterministic: every element is a fixed sequence of exact
+    integer group sums and fp32 TwoSums, so it does not depend on the tiling or
+    the LNC setting, and equals `trnblas.ozaki.reference_gemm` bit for bit.
+
+    A (M, K) and B (K, N) are 2-D real tensors of any float dtype (computed as
+    fp64); op() transposes when transA / transB. Returns float64 (M, N) on A's
+    device. The kernel runs on the native TorchNeuron path (Trn2/Trn3);
+    elsewhere, under set_backend("pytorch"), and for non-finite operands the
+    result is host fp64 `A @ B`. For alpha / beta, scale the fp64 result.
+    """
+    from .nki.dispatch import nki_gemm_fp64
+    from .ozaki import check_slices
+
+    slices = check_slices(slices)
+    transA, transB = trans_flag(transA, "transA"), trans_flag(transB, "transB")
+    for name, X in (("A", A), ("B", B)):
+        if not isinstance(X, torch.Tensor) or X.dim() != 2:
+            raise ValueError(f"gemm_fp64: {name} must be a 2-D tensor")
+        if not X.is_floating_point():
+            raise TypeError(f"gemm_fp64: {name} must be a real floating tensor, got {X.dtype}")
+    a = A.mT if transA else A
+    b = B.mT if transB else B
+    if a.shape[1] != b.shape[0]:
+        raise ValueError(
+            f"gemm_fp64: inner dimensions differ: op(A) {tuple(a.shape)}, op(B) {tuple(b.shape)}"
+        )
+    device = A.device
+    a = a.detach().to("cpu", torch.float64)
+    b = b.detach().to("cpu", torch.float64)
+    return nki_gemm_fp64(a, b, slices).to(device)
+
+
 @_fp64_host_guard("symm", kernel=False)
 def symm(
     alpha: float,
