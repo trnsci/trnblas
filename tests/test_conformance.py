@@ -101,7 +101,7 @@ def conformance_backend(request):
 # tests/conftest.py groups xfailed / XPASS by category from the reason prefix.
 DEVICE_KNOWN = {
     "complex128-fp32": (
-        "trnsci/trnblas#103",
+        "trnsci/trnblas#130",
         "device complex128 computes at fp32 precision (fp64 tolerance), and complex "
         "mv / triu / tril are unsupported on device",
     ),

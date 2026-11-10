@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only, no library change). On `--backend nki` with a non-CPU
   `--conformance-device`, `tests/test_conformance.py` marks the known platform
   failures `xfail(strict=False)` at run time, by rule, one tracking issue per
-  category: complex128 at fp32 precision (#103), complex64 `mv` / `triu` /
+  category: complex128 at fp32 precision (#130), complex64 `mv` / `triu` /
   `tril` unsupported on device (#127), float64 `syrk` checked at fp64
   tolerance under explicit `nki` (#100), and the stride-0 `to_dev()` harness
   limit (#128). A new failure is then the only red, and a category that starts
