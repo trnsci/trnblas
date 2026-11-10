@@ -91,6 +91,105 @@ def conformance_backend(request):
     _CFG.update(backend="pytorch", device=torch.device("cpu"))
 
 
+# ------------------------------------------------- device-known categories
+# Device conformance runs (``--backend nki --conformance-device neuron``) hit
+# known platform limits. Each category has one tracking issue. Matching cases
+# are marked ``xfail(strict=False)`` at run time, and only on such runs (the
+# trnsolver#146 pattern, trnsci/trnsci#35), so a NEW failure is the only red
+# and a category that starts passing shows as XPASS: a signal, not a failure.
+# CPU CI still runs every case, and it must pass. The terminal summary in
+# tests/conftest.py groups xfailed / XPASS by category from the reason prefix.
+DEVICE_KNOWN = {
+    "complex128-fp32": (
+        "trnsci/trnblas#103",
+        "device complex128 computes at fp32 precision (fp64 tolerance), and complex "
+        "mv / triu / tril are unsupported on device",
+    ),
+    "complex64-unsupported": (
+        "trnsci/trnblas#127",
+        "complex aten.mv / triu / tril are unsupported on the neuron device",
+    ),
+    "fp64-tolerance-syrk": (
+        "trnsci/trnblas#100",
+        "explicit nki casts float64 syrk to fp32, but the test checks fp64 tolerance",
+    ),
+    "stride0-harness": (
+        "trnsci/trnblas#128",
+        "test harness: copy_ into a stride-0 device tensor raises",
+    ),
+}
+
+# complex64 ops that reach complex mv / triu / tril (or a complex reduction)
+# in device aten. gemm / syrk / ger / axpy / scal compute correctly.
+_C64_UNSUPPORTED = {
+    "test_gemv",
+    "test_symv",
+    "test_trmv",
+    "test_symm",
+    "test_triangular",
+    "test_iamax",
+    "test_asum_complex_blas",
+    "test_iamax_complex_blas",
+}
+_C64_UNSUPPORTED_LEVEL1 = {"dot", "nrm2", "asum"}
+
+
+def _empty_output(name, p):
+    """True when the case's output has no elements (it passes on any device)."""
+    trans = p.get("trans") in (True, "T")
+    if name == "test_level1":
+        return p["op"] in ("axpy", "scal") and 0 in p["shape"]
+    if name == "test_gemv":
+        m, n = p["mn"]
+        return (n if trans else m) == 0
+    if name in ("test_symv", "test_trmv"):
+        return p["n"] == 0
+    if name in ("test_ger", "test_symm", "test_triangular"):
+        return 0 in p["mn"]
+    if name == "test_gemm":
+        m, _, n = p["mkn"]
+        return m == 0 or n == 0
+    if name == "test_batched":
+        return p["case"] == "batch0"
+    if name == "test_syrk":
+        n, k = p["nk"]
+        return (k if trans else n) == 0
+    return False
+
+
+def _device_known_category(node):
+    """The DEVICE_KNOWN category a conformance case falls in on a device run, or None."""
+    name = getattr(node, "originalname", node.name)
+    cs = getattr(node, "callspec", None)
+    p = cs.params if cs is not None else {}
+    if name in ("test_syrk_opposite_triangle_deprecated", "test_syrk_no_warning"):
+        return "fp64-tolerance-syrk"
+    if name == "test_level1_stride0" or (
+        name == "test_batched_layouts" and p.get("kind") == "stride0"
+    ):
+        return "stride0-harness"
+    dtype = p.get("dtype")
+    if dtype not in (C64, C128) or _empty_output(name, p):
+        return None
+    if dtype == C128:
+        return "complex128-fp32"
+    if name in _C64_UNSUPPORTED or (name == "test_level1" and p["op"] in _C64_UNSUPPORTED_LEVEL1):
+        return "complex64-unsupported"
+    return None
+
+
+@pytest.fixture(autouse=True)
+def _device_known_xfail(request, conformance_backend):
+    if _CFG["backend"] != "nki" or _CFG["device"].type == "cpu":
+        return
+    cat = _device_known_category(request.node)
+    if cat is not None:
+        issue, what = DEVICE_KNOWN[cat]
+        request.applymarker(
+            pytest.mark.xfail(strict=False, reason=f"[device-known:{cat}] {issue}: {what}")
+        )
+
+
 # ---------------------------------------------------------------- inputs
 def _gen(seed):
     return torch.Generator().manual_seed(seed)
