@@ -845,6 +845,116 @@ def _ozaki_host_empty(shape, dtype):
     return _host_empty(shape, dtype, "cpu")
 
 
+# ── Device split (#123) ──────────────────────────────────────────────────────
+# The host split costs ~11 ns per element at k = 8 on one host core, which
+# made gemm_fp64 slower than host fp64 on narrow products. On the kernel
+# route each operand is instead uploaded as its raw fp64 bits (8 bytes per
+# element, a plain copy) and split on the device by `_ozaki_emax_kernel` and
+# `_ozaki_split_kernel` into the same digits. TRNBLAS_OZAKI_DEVICE_SPLIT=0
+# keeps the host split. An operand whose raw bits or digit stack would pass
+# `_OZ_RESIDENT_BYTES`, or with a row (of A) / column (of B) whose largest
+# element is subnormal, is split on the host.
+
+_OZ_DEVICE_SPLIT = os.environ.get("TRNBLAS_OZAKI_DEVICE_SPLIT", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
+
+
+class _OzNonFinite(Exception):
+    """A gemm_fp64 operand has inf / nan (seen by the device split)."""
+
+
+def _oz_simulate(kernel, *arrays: np.ndarray) -> np.ndarray:
+    return np.asarray(nki.simulate(kernel)(*arrays))
+
+
+def _oz_device_split(X: torch.Tensor, k: int, per: str):
+    """`ozaki.split(X, k, per, pad=(128, 128))` on the device: digits
+    (k, Rp, Cp) bf16 in X's layout (a device tensor; a host one under the
+    simulator) and the exponents, from X's raw bits. X is a contiguous host
+    fp64 (R, C) matrix. Returns None when X must take the host split (size,
+    or a subnormal row / column maximum, whose exponent comes from its bit
+    length); raises `_OzNonFinite` for inf / nan."""
+    from .. import ozaki
+
+    R, C = X.shape
+    Rp, Cp = ozaki._round_up(R, 128), ozaki._round_up(C, 128)
+    if 8 * R * C >= _OZ_RESIDENT_BYTES or 2 * k * Rp * Cp >= _OZ_RESIDENT_BYTES:
+        return None
+    rows = per == "row"
+    emax_k, emax_op = (
+        (_ozaki_emax_kernel, "ozaki_emax") if rows else (_ozaki_emax_col_kernel, "ozaki_emax_col")
+    )
+    split_k, split_op = (
+        (_ozaki_split_kernel, "ozaki_split")
+        if rows
+        else (_ozaki_split_col_kernel, "ozaki_split_col")
+    )
+    bits = X.view(torch.int32)  # (R, 2C): a view of the raw bits, no copy
+    sim = _use_simulator()
+    if sim:
+        xw = bits.numpy()
+        emax = _oz_simulate(emax_k, xw).reshape(-1)
+    else:
+        xw = _to_device(bits)[0][0]
+        emax = _to_host(_call_kernel(emax_k, emax_op, xw), "cpu").reshape(-1).numpy()
+    if (emax >= 2047).any():
+        raise _OzNonFinite()
+    zero = np.nonzero(emax == 0)[0]
+    if len(zero):
+        idx = torch.from_numpy(zero)
+        if bool((X[idx] if rows else X[:, idx]).ne(0).any()):
+            return None  # subnormal maximum: its exponent is the host's job
+    e = np.where(emax > 0, emax.astype(np.int64) - 1022, 0)
+    n, npad = (R, Rp) if rows else (C, Cp)
+    rc = torch.full((npad, k), 1003.0, dtype=torch.float32)
+    rc[:n, 0] = torch.from_numpy((1003 + e).astype(np.float32))
+    if not rows:
+        rc = rc.mT.contiguous()  # (k, Cp): row 0 is broadcast down the partitions
+    if sim:
+        out = _oz_simulate(split_k, xw, rc.numpy())
+        d = torch.from_numpy(np.ascontiguousarray(out).view(np.int16)).view(torch.bfloat16)
+    else:
+        d = _call_kernel(split_k, split_op, xw, _to_device(rc)[0][0])
+    return d, e
+
+
+def _ozaki_split_ab(device_split: bool):
+    """`ozaki.run`'s splitter: `ozaki.split_a` / `split_b`, with each
+    `ozaki.split` call on the device where it applies (same digits, same
+    layouts), else on the host after a finiteness check (the device split's
+    inf / nan check is then missing)."""
+    from .. import ozaki
+
+    def split_ab(A, B, k, empty):
+        if not device_split:
+            return ozaki.split_a(A, k, empty), ozaki.split_b(B, k, empty)
+
+        def one(X, per, kmajor):
+            got = _oz_device_split(X, k, per)
+            if got is None:
+                if not bool(torch.isfinite(X).all()):
+                    raise _OzNonFinite()
+                got = ozaki.split(X, k, per=per, pad=(ozaki.TILE_K, ozaki.TILE_K), empty=empty)
+            return ozaki.Digits(got[0], got[1], kmajor)
+
+        # the layouts of split_a / split_b: a transposed view splits as is
+        if A.mT.is_contiguous() and not A.is_contiguous():
+            da = one(A.mT, "col", True)
+        else:
+            da = one(A.contiguous(), "row", False)
+        if B.mT.is_contiguous() and not B.is_contiguous():
+            db = one(B.mT, "row", False)
+        else:
+            db = one(B.contiguous(), "col", True)
+        return da, db
+
+    return split_ab
+
+
 def nki_gemm_fp64(A: torch.Tensor, B: torch.Tensor, slices: int) -> torch.Tensor:
     """fp64 (M, N) = A @ B for 2-D host fp64 A (M, K), B (K, N): the Ozaki
     kernel on the native path, else host fp64 matmul (see `_ozaki_route`).
@@ -852,10 +962,17 @@ def nki_gemm_fp64(A: torch.Tensor, B: torch.Tensor, slices: int) -> torch.Tensor
     from .. import ozaki
 
     k = ozaki.check_slices(slices)
-    if _ozaki_route() == "host" or not (torch.isfinite(A).all() and torch.isfinite(B).all()):
+    if _ozaki_route() == "host":
+        return torch.matmul(A, B)
+    dev = _OZ_DEVICE_SPLIT
+    if not dev and not (torch.isfinite(A).all() and torch.isfinite(B).all()):
         return torch.matmul(A, B)
     try:
-        return ozaki.run(A, B, k, _ozaki_launcher(), empty=_ozaki_host_empty)
+        return ozaki.run(
+            A, B, k, _ozaki_launcher(), empty=_ozaki_host_empty, split_ab=_ozaki_split_ab(dev)
+        )
+    except _OzNonFinite:
+        return torch.matmul(A, B)
     except Exception as exc:
         if _REQUIRE_NKI:
             raise
@@ -1151,6 +1268,10 @@ _KERNEL_DTYPES: dict[str, frozenset] = {
     "j_batched": _FP32_KERNEL_DTYPES,
     "pair_energy_sym": _FP32_KERNEL_DTYPES,
     "ozaki_gemm": frozenset({torch.bfloat16}),  # integer slices, #22
+    "ozaki_emax": frozenset({torch.int32}),  # raw fp64 bits, #123
+    "ozaki_split": frozenset({torch.int32, torch.float32}),  # raw bits + exponent constants
+    "ozaki_emax_col": frozenset({torch.int32}),
+    "ozaki_split_col": frozenset({torch.int32, torch.float32}),
 }
 
 
@@ -3794,6 +3915,442 @@ if HAS_NKI:
             _oz_mblock(at, b, out, r0 + mb * 256, 2, 0, N)
         if MPT % 2:
             _oz_mblock(at, b, out, r0 + NB * 256, 1, 0, N)
+        return out
+
+    # ---------------------------------------------------------------------------
+    # Device split of gemm_fp64 (#123). The fp64 operand arrives as its raw
+    # bits (an int32 pair per element, a plain copy) and the digits of
+    # `ozaki.split(per="row")` come out bit for bit from bitvec ops and exact
+    # fp32 arithmetic only: device float64 arithmetic is fp32, so the host's
+    # fp64 rint chain cannot run here. Algorithm (CPU twin:
+    # `ozaki.split_rows_from_bits`):
+    # - |x| 2^(20 - e) = P1 + P2 + P3, three fp32 pieces with disjoint bits
+    #   (24, 23 and 6 mantissa bits), built from the bit fields and an
+    #   exponent of 2^max(E - 1003 - e, -70) (an element that small has all-zero
+    #   digits);
+    # - Q_j = floor(|x| 2^(20 - e + 21 j)) mod 2^21, the 21-bit chunks of the
+    #   fixed-point value, from the exact chain y -> 2^21 (y - floor(y)) on
+    #   each piece (floor from the fp32 -> uint32 cast, corrected); the 7-bit
+    #   fields F_s (F_0 = floor(|x| 2^(6 - e))) by shifts;
+    # - digit_s = F_s + r_s - 128 r_(s-1), where r_s is the round-half-even
+    #   carry of level s: R_s = F_s + r_s = rint(F_s + G_(s+1) / 256) with
+    #   G_s = 2 F_s + [anything below level s is nonzero] (one more field
+    #   and a sticky bit at the bottom), and rint by the fp32 1.5 * 2^23 trick.
+    # ---------------------------------------------------------------------------
+
+    _OZS_CW = 512  # fp64 columns per tile
+    _OZS_EW = 2048  # fp64 columns per tile of the exponent pass
+
+    def _ozs_tile(xw, r0, n, c0, cw, W):
+        """(128, 2 W) uint32 bits of rows r0 .. r0 + n - 1 and fp64 columns
+        c0 .. c0 + cw - 1 of `xw`; rows from n and columns from cw are zero."""
+        if n == 128 and cw == W:
+            return nl.load(xw[r0 : r0 + 128, 2 * c0 : 2 * c0 + 2 * W]).view(nl.uint32)
+        t = nl.ndarray((128, 2 * W), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.memset(dst=t, value=0)
+        part = nl.load(xw[r0 : r0 + n, 2 * c0 : 2 * c0 + 2 * cw])
+        nisa.tensor_copy(dst=t[0:n, 0 : 2 * cw], src=part)
+        return t.view(nl.uint32)
+
+    def _ozs_emax_rows(xw, out, r0, n):
+        """out[r0 : r0 + n, 0] = max biased exponent of each row (fp32)."""
+        C = xw.shape[1] // 2
+        W = _OZS_EW
+        CF = C // W
+        acc = nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.memset(dst=acc, value=0.0)
+        if CF:
+            for c in nl.sequential_range(CF):
+                _ozs_emax_acc(_ozs_tile(xw, r0, n, c * W, W, W), acc, W)
+        if C - CF * W:
+            _ozs_emax_acc(_ozs_tile(xw, r0, n, CF * W, C - CF * W, W), acc, W)
+        nl.store(out[r0 : r0 + n, 0:1], value=acc[0:n, 0:1])
+
+    def _ozs_emax_acc(t, acc, W):
+        E = nl.ndarray((128, W), dtype=nl.uint32, buffer=nl.sbuf)
+        nisa.tensor_scalar(
+            dst=E,
+            data=t[:, 1 : 2 * W : 2],
+            op0=nl.right_shift,
+            operand0=20,
+            op1=nl.bitwise_and,
+            operand1=0x7FF,
+        )
+        m = nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_reduce(dst=m, op=nl.maximum, data=E, axis=1, keepdims=True)
+        nisa.tensor_tensor(dst=acc, data1=acc, data2=m, op=nl.maximum)
+
+    def _ozs_range(n, T):
+        """This program's share of [0, n) in tiles of T: (first, count) of the
+        full tiles, split in contiguous halves between programs (an odd middle
+        tile computed by both, identically), plus (start, size) of the partial
+        tail, which every program computes (identical writes)."""
+        n_prog = nl.num_programs() if nl.program_ndim() > 0 else 1
+        NT = n // T
+        per = (NT + n_prog - 1) // n_prog
+        x0 = nl.program_id(0) * ((NT - per) * T) if n_prog > 1 else 0
+        return x0, per, NT * T, n - NT * T
+
+    @nki.jit
+    def _ozaki_emax_kernel(xw):
+        """Row maxima of the biased fp64 exponent field (#123): `xw` (R, 2C)
+        int32 is the bit pattern of an fp64 (R, C) matrix; returns (R, 1) fp32.
+        0 means the row is zero or subnormal, 2047 that it has inf / nan."""
+        R = xw.shape[0]
+        out = nl.ndarray((R, 1), dtype=nl.float32, buffer=nl.shared_hbm)
+        r0, MPT, rt, tail = _ozs_range(R, 128)
+        if MPT:
+            for i in nl.affine_range(MPT):
+                _ozs_emax_rows(xw, out, r0 + i * 128, 128)
+        if tail:
+            _ozs_emax_rows(xw, out, rt, tail)
+        return out
+
+    def _ozs_f(W):
+        return nl.ndarray((128, W), dtype=nl.float32, buffer=nl.sbuf)
+
+    def _ozs_u(W):
+        return nl.ndarray((128, W), dtype=nl.uint32, buffer=nl.sbuf)
+
+    def _ozs_split_tile(t, rc, out, r0, c0, ws, k, W):
+        """Digits of one (128, W) tile of fp64 bits `t` into
+        out[:, r0 : r0 + 128, c0 : c0 + ws]; `rc` = 1003 + e, (128, 1) per
+        row or (128, W) per column."""
+        f, u = _ozs_f, _ozs_u
+        lo = t[:, 0 : 2 * W : 2]
+        hi = t[:, 1 : 2 * W : 2]
+        E = u(W)
+        nisa.tensor_scalar(
+            dst=E, data=hi, op0=nl.right_shift, operand0=20, op1=nl.bitwise_and, operand1=0x7FF
+        )
+        X = f(W)  # exponent of P1: max(E, 1) - 1003 - e
+        if rc.shape[1] == 1:
+            nisa.tensor_scalar(
+                dst=X, data=E, op0=nl.maximum, operand0=1.0, op1=nl.subtract, operand1=rc
+            )
+        else:
+            nisa.scalar_tensor_tensor(
+                dst=X, data=E, op0=nl.maximum, operand0=1.0, op1=nl.subtract, operand1=rc
+            )
+        b1 = u(W)  # biased fp32 exponent, clamped: 2^-70 and below give zero digits
+        nisa.tensor_scalar(
+            dst=b1, data=X, op0=nl.maximum, operand0=-70.0, op1=nl.add, operand1=127.0
+        )
+        s1 = u(W)
+        nisa.tensor_scalar(dst=s1, data=b1, op0=nl.left_shift, operand0=23)
+        z = f(W)  # zero / subnormal: no implicit bit
+        nisa.tensor_scalar(dst=z, data=E, op0=nl.equal, operand0=0.0)
+        a1 = u(W)
+        nisa.tensor_scalar(
+            dst=a1, data=hi, op0=nl.bitwise_and, operand0=0xFFFFF, op1=nl.left_shift, operand1=3
+        )
+        a2 = u(W)
+        nisa.tensor_scalar(
+            dst=a2, data=lo, op0=nl.right_shift, operand0=29, op1=nl.bitwise_or, operand1=0x3F800000
+        )
+        m1 = u(W)  # 1.(top 23 fraction bits)
+        nisa.tensor_tensor(dst=m1, data1=a1, data2=a2, op=nl.bitwise_or)
+        a3 = u(W)
+        nisa.tensor_scalar(
+            dst=a3, data=lo, op0=nl.left_shift, operand0=3, op1=nl.right_shift, operand1=9
+        )
+        m2 = u(W)  # 1.(next 23)
+        nisa.tensor_scalar(dst=m2, data=a3, op0=nl.bitwise_or, operand0=0x3F800000)
+        a4 = u(W)
+        nisa.tensor_scalar(
+            dst=a4, data=lo, op0=nl.bitwise_and, operand0=0x3F, op1=nl.left_shift, operand1=17
+        )
+        m3 = u(W)  # 1.(last 6)
+        nisa.tensor_scalar(dst=m3, data=a4, op0=nl.bitwise_or, operand0=0x3F800000)
+        S1 = s1.view(nl.float32)
+        q1 = f(W)
+        nisa.scalar_tensor_tensor(
+            dst=q1, data=z, op0=nl.multiply, operand0=-1.0, op1=nl.add, operand1=m1.view(nl.float32)
+        )
+        P1 = f(W)
+        nisa.tensor_tensor(dst=P1, data1=q1, data2=S1, op=nl.multiply)
+        q2 = f(W)
+        nisa.tensor_scalar(
+            dst=q2,
+            data=m2.view(nl.float32),
+            op0=nl.subtract,
+            operand0=1.0,
+            op1=nl.multiply,
+            operand1=2.0**-23,
+        )
+        P2 = f(W)
+        nisa.tensor_tensor(dst=P2, data1=q2, data2=S1, op=nl.multiply)
+        q3 = f(W)
+        nisa.tensor_scalar(
+            dst=q3,
+            data=m3.view(nl.float32),
+            op0=nl.subtract,
+            operand0=1.0,
+            op1=nl.multiply,
+            operand1=2.0**-46,
+        )
+        P3 = f(W)
+        nisa.tensor_tensor(dst=P3, data1=q3, data2=S1, op=nl.multiply)
+        # 21-bit chunks of floor(|x| 2^(20 - e + 21 j)), j = 0 .. nch - 1:
+        # per piece, t (the piece, then 2^21 times the previous fraction) is
+        # cast to uint32 (c), d = t - c, and floor(t) = c - [d < 0],
+        # frac(t) = d + [d < 0]: right whether the cast rounds to nearest (as
+        # the simulator does) or toward zero; every t is in [0, 2^21). The
+        # pieces' bits are disjoint, so a chunk is the OR of theirs.
+        nch = (k + 3) // 3
+        fr = [None, None, None]
+        Q = []
+        for j in range(nch):
+            fl = []
+            for i, P in enumerate((P1, P2, P3)):
+                c = u(W)
+                dl = f(W)
+                if j == 0:
+                    nisa.tensor_copy(dst=c, src=P)
+                    nisa.scalar_tensor_tensor(
+                        dst=dl, data=c, op0=nl.multiply, operand0=-1.0, op1=nl.add, operand1=P
+                    )
+                else:
+                    nisa.tensor_scalar(dst=c, data=fr[i], op0=nl.multiply, operand0=2.0**21)
+                    nisa.scalar_tensor_tensor(
+                        dst=dl,
+                        data=fr[i],
+                        op0=nl.multiply,
+                        operand0=2.0**21,
+                        op1=nl.subtract,
+                        operand1=c,
+                    )
+                a = u(W)
+                nisa.scalar_tensor_tensor(
+                    dst=a,
+                    data=dl,
+                    op0=nl.less,
+                    operand0=0.0,
+                    op1=nl.subtract,
+                    operand1=c,
+                    reverse1=True,
+                )
+                b = f(W)
+                nisa.scalar_tensor_tensor(
+                    dst=b, data=dl, op0=nl.less, operand0=0.0, op1=nl.add, operand1=dl
+                )
+                fl.append(a)
+                fr[i] = b
+            q = u(W)
+            nisa.tensor_tensor(dst=q, data1=fl[0], data2=fl[1], op=nl.bitwise_or)
+            nisa.tensor_tensor(dst=q, data1=q, data2=fl[2], op=nl.bitwise_or)
+            Q.append(q)
+        frs = f(W)  # > 0 iff a piece has bits below the last chunk
+        nisa.tensor_tensor(dst=frs, data1=fr[0], data2=fr[1], op=nl.add)
+        nisa.tensor_tensor(dst=frs, data1=frs, data2=fr[2], op=nl.add)
+        F = []
+        for s in range(k + 1):
+            sh = 14 - 7 * (s % 3)
+            g = u(W)
+            if sh:
+                nisa.tensor_scalar(
+                    dst=g,
+                    data=Q[s // 3],
+                    op0=nl.right_shift,
+                    operand0=sh,
+                    op1=nl.bitwise_and,
+                    operand1=127,
+                )
+            else:
+                nisa.tensor_scalar(dst=g, data=Q[s // 3], op0=nl.bitwise_and, operand0=127)
+            gf = f(W)
+            nisa.tensor_copy(dst=gf, src=g)
+            F.append(gf)
+        low = 14 - 7 * (k % 3)
+        nz = f(W)  # anything below field k nonzero
+        if low:
+            rest = u(W)
+            nisa.tensor_scalar(
+                dst=rest, data=Q[k // 3], op0=nl.bitwise_and, operand0=(1 << low) - 1
+            )
+            restf = f(W)
+            nisa.tensor_copy(dst=restf, src=rest)
+            nisa.tensor_tensor(dst=restf, data1=restf, data2=frs, op=nl.maximum)
+            nisa.tensor_scalar(dst=nz, data=restf, op0=nl.greater, operand0=0.0)
+        else:
+            nisa.tensor_scalar(dst=nz, data=frs, op0=nl.greater, operand0=0.0)
+        G = f(W)
+        nisa.scalar_tensor_tensor(
+            dst=G, data=F[k], op0=nl.multiply, operand0=2.0, op1=nl.add, operand1=nz
+        )
+        Rr = [None] * k
+        for s in range(k - 1, -1, -1):
+            v = f(W)
+            nisa.scalar_tensor_tensor(
+                dst=v, data=G, op0=nl.multiply, operand0=1.0 / 256, op1=nl.add, operand1=F[s]
+            )
+            rv = f(W)  # rint (round half even), exact below 2^22
+            nisa.tensor_scalar(
+                dst=rv,
+                data=v,
+                op0=nl.add,
+                operand0=12582912.0,
+                op1=nl.subtract,
+                operand1=12582912.0,
+            )
+            Rr[s] = rv
+            if s:
+                mn = f(W)
+                nisa.tensor_scalar(dst=mn, data=G, op0=nl.minimum, operand0=1.0)
+                G2 = f(W)
+                nisa.scalar_tensor_tensor(
+                    dst=G2, data=F[s], op0=nl.multiply, operand0=2.0, op1=nl.add, operand1=mn
+                )
+                G = G2
+        sb = u(W)
+        nisa.tensor_scalar(dst=sb, data=hi, op0=nl.right_shift, operand0=31)
+        sg = f(W)  # +1 / -1
+        nisa.tensor_scalar(
+            dst=sg, data=sb, op0=nl.multiply, operand0=-2.0, op1=nl.add, operand1=1.0
+        )
+        for s in range(k):
+            d = nl.ndarray((128, W), dtype=nl.bfloat16, buffer=nl.sbuf)
+            if s:
+                r = f(W)
+                nisa.tensor_tensor(dst=r, data1=Rr[s - 1], data2=F[s - 1], op=nl.subtract)
+                dd = f(W)
+                nisa.scalar_tensor_tensor(
+                    dst=dd, data=r, op0=nl.multiply, operand0=-128.0, op1=nl.add, operand1=Rr[s]
+                )
+                nisa.tensor_tensor(dst=d, data1=dd, data2=sg, op=nl.multiply)
+            else:
+                nisa.tensor_tensor(dst=d, data1=Rr[0], data2=sg, op=nl.multiply)
+            nl.store(out[s, r0 : r0 + 128, c0 : c0 + ws], value=d[:, 0:ws])
+
+    def _ozs_split_rows(xw, rcs, out, r0, n, k):
+        """All column tiles of the 128-row tile from r0 (n real rows)."""
+        C = xw.shape[1] // 2
+        Cp = out.shape[2]
+        W = _OZS_CW
+        CF = C // W
+        rc = nl.load(rcs[r0 : r0 + 128, 0:1])
+        if CF:
+            for c in nl.affine_range(CF):
+                _ozs_split_tile(_ozs_tile(xw, r0, n, c * W, W, W), rc, out, r0, c * W, W, k, W)
+        if Cp - CF * W:
+            t = _ozs_tile(xw, r0, n, CF * W, C - CF * W, W)
+            _ozs_split_tile(t, rc, out, r0, CF * W, Cp - CF * W, k, W)
+
+    @nki.jit
+    def _ozaki_split_kernel(xw, rcs):
+        """Device split of `trnblas.gemm_fp64` (#123): the digits of
+        `ozaki.split(X, k, per="row", pad=(128, 128))` from the raw bits.
+
+        `xw` (R, 2C) int32 is the bit pattern of a finite fp64 (R, C) matrix;
+        `rcs` (Rp, k) fp32 holds 1003 + e_i in column 0 (e_i the row exponent,
+        from `_ozaki_emax_kernel`; Rp = R rounded up to 128, padding rows any
+        moderate value), and its width is the slice count k. Returns
+        (k, Rp, Cp) bf16 digits, Cp = C rounded up to 128, zero-padded. Every
+        element is computed independently, so the tiling and the LNC split
+        (row tiles by program_id) cannot change a bit."""
+        R = xw.shape[0]
+        C = xw.shape[1] // 2
+        k = rcs.shape[1]
+        Rp = ((R + 127) // 128) * 128
+        Cp = ((C + 127) // 128) * 128
+        out = nl.ndarray((k, Rp, Cp), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+        r0, MPT, rt, tail = _ozs_range(R, 128)
+        if MPT:
+            for i in nl.affine_range(MPT):
+                _ozs_split_rows(xw, rcs, out, r0 + i * 128, 128, k)
+        if tail:
+            _ozs_split_rows(xw, rcs, out, rt, tail, k)
+        return out
+
+    def _ozs_emax_cols(xw, out, c0, cw, W):
+        """out[0, c0 : c0 + cw] = max biased exponent of each column (fp32)."""
+        R = xw.shape[0]
+        RT = R // 128
+        acc = nl.ndarray((128, W), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.memset(dst=acc, value=0.0)
+        if RT:
+            for r in nl.sequential_range(RT):
+                _ozs_emax_max(_ozs_tile(xw, r * 128, 128, c0, cw, W), acc, W)
+        if R - RT * 128:
+            _ozs_emax_max(_ozs_tile(xw, RT * 128, R - RT * 128, c0, cw, W), acc, W)
+        m = nl.ndarray((1, W), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_partition_reduce(dst=m, op=nl.maximum, data=acc)
+        nl.store(out[0:1, c0 : c0 + cw], value=m[0:1, 0:cw])
+
+    def _ozs_emax_max(t, acc, W):
+        E = nl.ndarray((128, W), dtype=nl.uint32, buffer=nl.sbuf)
+        nisa.tensor_scalar(
+            dst=E,
+            data=t[:, 1 : 2 * W : 2],
+            op0=nl.right_shift,
+            operand0=20,
+            op1=nl.bitwise_and,
+            operand1=0x7FF,
+        )
+        nisa.tensor_tensor(dst=acc, data1=acc, data2=E, op=nl.maximum)
+
+    def _ozs_col_width(C):
+        """Column tile width of the per-column kernels: 512, or C rounded up
+        to 128 for a narrower matrix (B of a DF-MP2 product, N = 241)."""
+        return min(_OZS_CW, ((C + 127) // 128) * 128)
+
+    @nki.jit
+    def _ozaki_emax_col_kernel(xw):
+        """Column maxima of the biased fp64 exponent field (#123): `xw`
+        (R, 2C) int32 is the bit pattern of an fp64 (R, C) matrix; returns
+        (1, C) fp32 (0: zero or subnormal column, 2047: inf / nan)."""
+        C = xw.shape[1] // 2
+        W = _ozs_col_width(C)
+        out = nl.ndarray((1, C), dtype=nl.float32, buffer=nl.shared_hbm)
+        c0, NCT, ct, tail = _ozs_range(C, W)
+        if NCT:
+            for c in nl.affine_range(NCT):
+                _ozs_emax_cols(xw, out, c0 + c * W, W, W)
+        if tail:
+            _ozs_emax_cols(xw, out, ct, tail, W)
+        return out
+
+    def _ozs_split_cols(xw, rcs, out, c0, cw, ws, k, W, rows):
+        """The W-column tile from c0 (cw real columns, ws stored), for the row
+        tiles `rows` = (first row, full tiles, tail start, tail rows)."""
+        r0, RTn, rt, tail = rows
+        rc = nl.ndarray((128, W), dtype=nl.float32, buffer=nl.sbuf)
+        if ws < W:
+            nisa.memset(dst=rc, value=1003.0)
+        nisa.dma_copy(dst=rc[:, 0:ws], src=rcs[0:1, c0 : c0 + ws].broadcast(0, 128))
+        if RTn:
+            for r in nl.affine_range(RTn):
+                rr = r0 + r * 128
+                _ozs_split_tile(_ozs_tile(xw, rr, 128, c0, cw, W), rc, out, rr, c0, ws, k, W)
+        if tail:
+            _ozs_split_tile(_ozs_tile(xw, rt, tail, c0, cw, W), rc, out, rt, c0, ws, k, W)
+
+    @nki.jit
+    def _ozaki_split_col_kernel(xw, rcs):
+        """`_ozaki_split_kernel` per column: the digits of
+        `ozaki.split(X, k, per="col", pad=(128, 128))`, in X's layout (so B's
+        are K-major as the GEMM kernel takes them). `rcs` (k, Cp) fp32 holds
+        1003 + e_j in row 0 (padding columns any moderate value). At LNC=2
+        the programs split the column tiles, or the row tiles when there is
+        only one column tile."""
+        R = xw.shape[0]
+        C = xw.shape[1] // 2
+        k = rcs.shape[0]
+        W = _ozs_col_width(C)
+        Rp = ((R + 127) // 128) * 128
+        Cp = ((C + 127) // 128) * 128
+        out = nl.ndarray((k, Rp, Cp), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+        if C <= W:
+            _ozs_split_cols(xw, rcs, out, 0, C, Cp, k, W, _ozs_range(R, 128))
+            return out
+        RT = R // 128
+        rows = (0, RT, RT * 128, R - RT * 128)
+        c0, NCT, ct, tail = _ozs_range(C, W)
+        if NCT:
+            for c in nl.affine_range(NCT):
+                _ozs_split_cols(xw, rcs, out, c0 + c * W, W, W, k, W, rows)
+        if tail:
+            _ozs_split_cols(xw, rcs, out, ct, tail, Cp - ct, k, W, rows)
         return out
 
     @nki.jit

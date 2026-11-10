@@ -66,3 +66,58 @@ def inputs(M, K, N, dist="normal", seed=0):
         A = rng.standard_normal((M, K)) * 10.0 ** rng.uniform(-4, 4, (M, K))
         B = rng.standard_normal((K, N)) * 10.0 ** rng.uniform(-4, 4, (K, N))
     return torch.from_numpy(A), torch.from_numpy(B)
+
+
+def device_split_ops() -> dict:
+    """CPU stand-ins for the device-split ops of gemm_fp64 (#123), built on
+    `ozaki.split_from_bits` (the kernels' arithmetic op for op), for tests
+    that run the native route on the host."""
+    from trnblas import ozaki
+
+    def x_of(xw):
+        return xw.contiguous().view(torch.float64).numpy()
+
+    def exp_field(X):
+        return ((X.view(np.uint64) >> np.uint64(52)) & np.uint64(0x7FF)).astype(np.float32)
+
+    def pad(D, k, rp, cp):
+        out = torch.zeros((k, rp, cp), dtype=torch.bfloat16)
+        out[:, : D.shape[1], : D.shape[2]] = torch.from_numpy(D)
+        return out
+
+    def emax(xw):
+        return torch.from_numpy(exp_field(x_of(xw)).max(axis=1, initial=0)[:, None])
+
+    def emax_col(xw):
+        return torch.from_numpy(exp_field(x_of(xw)).max(axis=0, initial=0)[None, :])
+
+    def split(xw, rcs):
+        X = x_of(xw)
+        k = rcs.shape[1]
+        D, e = ozaki.split_from_bits(X, k)
+        assert np.array_equal(rcs[: X.shape[0], 0].numpy(), (1003 + e).astype(np.float32))
+        rp, cp = (ozaki._round_up(n, 128) for n in X.shape)
+        return pad(D, k, rp, cp)
+
+    def split_col(xw, rcs):
+        X = x_of(xw)
+        k = rcs.shape[0]
+        D, e = ozaki.split_from_bits(np.ascontiguousarray(X.T), k)
+        assert np.array_equal(rcs[0, : X.shape[1]].numpy(), (1003 + e).astype(np.float32))
+        rp, cp = (ozaki._round_up(n, 128) for n in X.shape)
+        return pad(np.ascontiguousarray(D.transpose(0, 2, 1)), k, rp, cp)
+
+    return {
+        "ozaki_emax": emax,
+        "ozaki_emax_col": emax_col,
+        "ozaki_split": split,
+        "ozaki_split_col": split_col,
+    }
+
+
+DEVICE_SPLIT_KERNELS = (
+    "_ozaki_emax_kernel",
+    "_ozaki_emax_col_kernel",
+    "_ozaki_split_kernel",
+    "_ozaki_split_col_kernel",
+)

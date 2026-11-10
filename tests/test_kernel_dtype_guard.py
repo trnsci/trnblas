@@ -28,6 +28,7 @@ import warnings
 
 import pytest
 import torch
+from _ozaki_ref import DEVICE_SPLIT_KERNELS
 
 import trnblas
 import trnblas.nki
@@ -52,6 +53,11 @@ ALLOWED = {
     "j_batched": FP32,
     "pair_energy_sym": FP32,
     "ozaki_gemm": frozenset({BF16}),  # integer slices only (#22)
+    # device split (#123): raw fp64 bits as int32, fp32 exponent constants
+    "ozaki_emax": frozenset({torch.int32}),
+    "ozaki_emax_col": frozenset({torch.int32}),
+    "ozaki_split": frozenset({torch.int32, F32}),
+    "ozaki_split_col": frozenset({torch.int32, F32}),
 }
 
 # Raw kernel attribute on `dispatch` for each op (XLA / simulator paths).
@@ -495,6 +501,8 @@ def test_boundary_refuses_unsupported_dtypes(stubs, monkeypatch, d):
     x = _rand((4, 4), d)
     ops = dispatch._get_native_ops()
     for op_name, op in ops.items():
+        if d in ALLOWED[op_name]:  # the device-split ops take raw bits as int32 (#123)
+            continue
         n_args = len(
             stubs.fakes[op_name].__code__.co_varnames[: stubs.fakes[op_name].__code__.co_argcount]
         )
@@ -1466,7 +1474,8 @@ def test_gemm_fp64_reaches_only_bf16_slices(stubs, monkeypatch, backend, d):
     """gemm_fp64 (#22): every float dtype becomes bf16 integer slices before
     the kernel; integer, bool and complex operands raise TypeError first."""
     # The op is the recorded stub; the raw kernel object is only a handle key.
-    monkeypatch.setattr(dispatch, "_ozaki_gemm_kernel", object(), raising=False)
+    for name in ("_ozaki_gemm_kernel", *DEVICE_SPLIT_KERNELS):
+        monkeypatch.setattr(dispatch, name, object(), raising=False)
     A, B = _rand((40, 70), d), _rand((70, 30), d)
     trnblas.set_backend(backend)
     if not d.is_floating_point:
@@ -1476,4 +1485,6 @@ def test_gemm_fp64_reaches_only_bf16_slices(stubs, monkeypatch, backend, d):
         return
     out = trnblas.gemm_fp64(A, B)
     assert out.dtype == F64 and out.shape == (40, 30)
-    assert stubs.calls == ["ozaki_gemm"] and not stubs.violations
+    # The stub exponent passes return zeros, which reads as subnormal row and
+    # column maxima, so both operands then take the host split.
+    assert stubs.calls == ["ozaki_emax", "ozaki_emax_col", "ozaki_gemm"] and not stubs.violations

@@ -27,9 +27,21 @@ float64 on A's device. `slices` (k, 1–12) is the precision knob.
 
 How it works:
 
-1. **Split (host, exact).** A is split row by row and B column by column into
-   k bf16 integer slices of 7 bits each, |digit| ≤ 64, scaled by one power of
-   two per row / column (`trnblas.ozaki.split`).
+1. **Split (device, exact).** A is split row by row and B column by column
+   into k bf16 integer slices of 7 bits each, |digit| ≤ 64, scaled by one
+   power of two per row / column (the digits of `trnblas.ozaki.split`). Each
+   operand is uploaded as its raw fp64 bits (8 bytes per element, a plain
+   copy) and split on the device (#123) by `_ozaki_emax_kernel` (row
+   exponents; `_ozaki_emax_col_kernel` for columns) and `_ozaki_split_kernel`
+   (`_ozaki_split_col_kernel`), in the operand's own layout. Device float64
+   arithmetic is fp32, so the kernels use only bitvec ops and exact fp32
+   arithmetic: three disjoint fp32 pieces of |x| · 2^(20 − e) from the bit
+   fields, an exact floor chain to 21-bit fixed-point chunks, the 7-bit
+   fields by shifts, and the balanced digits with their round-half-even
+   carries (`trnblas.ozaki.split_from_bits` is the same arithmetic on the
+   host, op for op). The digits equal the host split's (as values: a zero
+   digit can be −0 on one side and +0 on the other, which no product or
+   PSUM sum can see), so the result is bitwise the same either way.
 2. **Slice products (device).** The kernel (`_ozaki_gemm_kernel`) runs the
    k(k+1)/2 pairs (s, t) with s + t ≤ k − 1 as bf16 matmuls with fp32 PSUM
    accumulation. The pairs of one diagonal s + t share a scale, so their K
@@ -63,23 +75,37 @@ Properties:
   stay under 2 GiB (`ozaki.plan`). M and N blocks do not change the
   arithmetic; K is blocked only beyond ~1M at k = 8 (fp64 partial sums on the
   host).
-- **Layouts.** The host splits each operand in its contiguous layout (a
-  transposing pass on the host costs 4–5 ns per element); slices that are
-  not K-major are transposed on the device (about 500 GB/s).
+- **Layouts.** Each operand is split in its contiguous layout (per row for
+  a row-major A or Bᵀ, per column for Aᵀ or a row-major B, as the host split
+  does); slices that are not K-major are transposed on the device (about
+  500 GB/s). The raw fp64 bits are never transposed on the device: a device
+  `permute(...).contiguous()` of int32 bit patterns did not preserve them.
+- **Host split fallback.** The host split (`trnblas.ozaki.split`, same
+  digits) runs under `TRNBLAS_OZAKI_DEVICE_SPLIT=0`, for an operand whose raw
+  bits or digit stack reach 2 GiB (#112), and for an operand with a row of A
+  (column of B) whose largest element is subnormal: its exponent comes from
+  the bit length, which the device route leaves to the host.
 - **Routes.** The kernel runs on the native TorchNeuron path (Trn2/Trn3) and
   under `TRNBLAS_USE_SIMULATOR=1`. On CPU, on Trn1 (XLA), under
-  `set_backend("pytorch")`, and for non-finite operands, `gemm_fp64` is host
-  fp64 `A @ B`. Under `TRNBLAS_REQUIRE_NKI=1` the off-device case raises.
-- **Cost.** The host split is about 1.2 ns per element per slice on one Trn2
-  host core (two vCPUs), the kernel runs at about 87–96 TFLOP/s of bf16
-  slice products on one logical core, and the first call per launch shape
-  compiles (cached afterwards in the NEFF cache). End to end the host split
-  dominates: on one logical core `gemm_fp64` beats host fp64 on 2 vCPUs on
-  large squares (2.4× at 4096³, k = 8) but not a 12-vCPU host, and on narrow
-  products such as (3267, 8400) @ (8400, 241) it is slower than host fp64
-  (2.8× on 2 vCPUs). Use it where fp64 accuracy must come from the device
-  side of a pipeline or where the host is busy; a device-side split is the
-  next step. See [Benchmarks](../benchmarks.md#fp64-class-gemm-gemm_fp64).
+  `set_backend("pytorch")`, and for non-finite operands (found from the
+  device exponent maxima), `gemm_fp64` is host fp64 `A @ B`. Under
+  `TRNBLAS_REQUIRE_NKI=1` the off-device case raises.
+- **Cost** (one logical core at LNC=2):
+  - The device split costs about 0.55 ns per element, after an 8-byte
+    upload per element. The host split costs about 11 ns per element at
+    k = 8 on one Trn2 host core (two vCPUs).
+  - The kernel runs at about 87–96 TFLOP/s of bf16 slice products.
+  - The first call per operand and launch shape compiles; the NEFFs are
+    cached afterwards.
+
+  End to end at k = 8:
+  - Against host fp64 on 2 vCPUs: 3.0× on (3267, 8400) @ (8400, 241), 2.6×
+    on (8192, 3508) @ (3508, 241), and 10.1× at 4096³.
+  - Against a 12-vCPU host: 1.5–2.2× from 2048³ up, and about 2× slower on
+    the narrow DF-MP2 shapes. There, the upload and the split of A already
+    take as long as the 12-vCPU host GEMM.
+
+  See [Benchmarks](../benchmarks.md#device-split-123).
 
 `alpha` / `beta` are not taken: scale the fp64 result. Batched operands are
 not supported.

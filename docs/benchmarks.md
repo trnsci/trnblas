@@ -812,11 +812,82 @@ Readings:
   only 0.5–0.9× the 12-vCPU host (slower). **On the narrow DF-MP2 shapes it is 2.8× slower
   than host fp64 on 2 vCPUs, and 7–8× slower than on 12.** A has only 2N = 482
   flops per element there, so the split of A alone outweighs the host GEMM.
-  Moving the split to the device is the next step.
+  The device split (#123, next section) removes this.
 - **First call.** One NEFF per (k, K, launch shape). Each new shape compiles
   for a few seconds to about 30 s, plus the device-side slicing ops. An
   uncapped single 4096³ launch took 240 s to compile, hence the 1024 × 1024
   launch cap.
+
+### Device split (#123)
+
+The same runs with the split on the device, measured 2026-11-09 on the same
+box (one logical core at LNC=2, normal data, warm NEFF cache). The data is the
+same as in the table above (seed 0), so `max_cw` and `kernel` carry over: every
+result was bitwise equal to the host-split route, and the device digits were
+checked against `ozaki.split` in each run.
+
+- `device split A + B` is the raw-bit upload of A and B (8 bytes per element)
+  plus the four split kernels (exponent maxima, digits). `ns / element`
+  counts the kernels only.
+- `e2e, host split` is the same build with `TRNBLAS_OZAKI_DEVICE_SPLIT=0`,
+  measured in the same process.
+- Host baselines are torch fp64 `A @ B` on 2 pinned vCPUs. The 12-vCPU host
+  baseline and the 12-vCPU column (`gemm_fp64` with 12 host threads, k = 8)
+  were measured in a whole-chip slice with the host otherwise quiet.
+
+| shape (M, K, N) | k (GEMMs) | max_cw | device split A + B ms (raw upload; kernels) | ns / element | kernel ms | **e2e ms** | e2e, host split ms | host fp64 2 vCPU ms | **e2e vs 2 vCPU** | host fp64 12 vCPU ms | e2e, 12 vCPU host ms | e2e vs 12 vCPU | bitwise |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| (1024, 1024, 1024) | 8 (36) | 3.8e-16 | 3.0 (1.4; 1.6) | 0.76 | 0.86 | **8.9** | 40 | 29 | **3.23×** | 5 | 10 | 0.54× | yes |
+| (1024, 1024, 1024) | 7 (28) | 1.4e-14 | 3.0 (1.4; 1.5) | 0.73 | 0.68 | **8.5** | 36 | 29 | **3.40×** | 5 |  |  | yes |
+| (1024, 1024, 1024) | 6 (21) | 1.9e-12 | 3.0 (1.4; 1.5) | 0.72 | 0.52 | **8.4** | 34 | 29 | **3.44×** | 5 |  |  | yes |
+| (3267, 8400, 241) | 8 (36) | 2.2e-16 | 36.2 (17.9; 18.3) | 0.62 | 12.94 | **65.5** | 562 | 198 | **3.03×** | 35 | 68 | 0.51× | yes |
+| (3267, 8400, 241) | 7 (28) | 6.0e-15 | 35.4 (17.9; 17.5) | 0.59 | 10.02 | **60.3** | 511 | 198 | **3.29×** | 35 |  |  | yes |
+| (3267, 8400, 241) | 6 (21) | 7.7e-13 | 34.2 (17.9; 16.3) | 0.55 | 7.49 | **57.2** | 475 | 198 | **3.46×** | 35 |  |  | yes |
+| (8192, 3508, 241) | 8 (36) | 1.8e-16 | 34.7 (18.0; 16.7) | 0.56 | 10.99 | **78.4** | 587 | 206 | **2.63×** | 35 | 79 | 0.44× | yes |
+| (8192, 3508, 241) | 7 (28) | 8.3e-15 | 33.9 (18.0; 15.8) | 0.53 | 8.54 | **74.9** | 547 | 206 | **2.76×** | 35 |  |  | yes |
+| (8192, 3508, 241) | 6 (21) | 1.2e-12 | 32.9 (18.0; 14.9) | 0.50 | 6.4 | **70.3** | 492 | 206 | **2.94×** | 35 |  |  | yes |
+| (2048, 2048, 2048) | 8 (36) | 2.4e-16 | 10.0 (5.1; 4.9) | 0.59 | 6.6 | **39.0** | 185 | 235 | **6.02×** | 46 | 30 | 1.53× | yes |
+| (2048, 2048, 2048) | 7 (28) | 1.3e-14 | 9.8 (5.1; 4.7) | 0.56 | 5.18 | **37.4** | 164 | 235 | **6.29×** | 46 |  |  | yes |
+| (2048, 2048, 2048) | 6 (21) | 1.7e-12 | 9.6 (5.1; 4.5) | 0.53 | 3.9 | **33.9** | 147 | 235 | **6.93×** | 46 |  |  | yes |
+| (3072, 3072, 3072) | 8 (36) | 2.4e-16 | 21.9 (11.4; 10.5) | 0.56 | 22.11 | **93.1** | 397 | 774 | **8.31×** | 147 | 75 | 1.95× | yes |
+| (3072, 3072, 3072) | 7 (28) | 1.0e-14 | 21.4 (11.4; 10.0) | 0.53 | 17.26 | **86.7** | 385 | 774 | **8.92×** | 147 |  |  | yes |
+| (3072, 3072, 3072) | 6 (21) | 1.5e-12 | 20.8 (11.4; 9.4) | 0.50 | 13.03 | **83.5** | 353 | 774 | **9.26×** | 147 |  |  | yes |
+| (4096, 4096, 4096) | 8 (36) | 1.9e-16 | 38.4 (20.2; 18.2) | 0.54 | 51.55 | **180.8** | 739 | 1829 | **10.12×** | 331 | 154 | 2.15× | yes |
+| (4096, 4096, 4096) | 7 (28) | 9.8e-15 | 37.5 (20.2; 17.4) | 0.52 | 40.24 | **166.7** | 684 | 1829 | **10.97×** | 331 |  |  | yes |
+| (4096, 4096, 4096) | 6 (21) | 1.2e-12 | 36.5 (20.2; 16.3) | 0.49 | 30.43 | **157.0** | 629 | 1829 | **11.65×** | 331 |  |  | yes |
+
+Readings:
+
+- **The split is about 20× cheaper on the device.** It costs 0.50 to 0.62 ns
+  per element on one logical core (1.8× slower at LNC=1), against about 11 ns
+  for the host split on one host core. It is VectorE-bound: about 136
+  VectorE instructions per element at k = 8, using bitvec ops and exact fp32
+  arithmetic only. At about one element per cycle per lane on each of the two
+  physical cores, that matches the measured rate.
+- **`gemm_fp64` now beats host fp64 on 2 vCPUs at every shape.**
+  - DF-MP2 shapes: 2.6 to 3.5× (they were 2.3 to 2.8× slower).
+  - Squares from 2048³ up: 6 to 12×, 10.1× at 4096³ for k = 8. At 1024³:
+    3.2 to 3.4×.
+  - Against the 12-vCPU host it is 1.5 to 2.2× faster on squares from 2048³
+    up, and still about 2× slower on the DF-MP2 shapes.
+- **Why the narrow shapes stop at about 2× the 12-vCPU host.** At
+  (3267, 8400, 241) the e2e of about 65 ms is made of:
+  - the raw upload of A, 18 ms at about 12.5 GB/s;
+  - the split of A, 16 ms;
+  - the GEMM kernel, 13 ms;
+  - the device transposes of A's digits, 4 ms;
+  - the host combine into Cᵀ and the download, about 7 ms.
+
+  The upload plus the split alone, about 34 ms, already equal the 12-vCPU
+  host GEMM, and eager uploads do not overlap kernels: an upload queued behind
+  a 16 ms split kernel took 24 ms. Beating 12 host vCPUs on these shapes needs
+  more than one logical core, or operands that stay resident across calls.
+- **Squares.** The host combine (fp64 (hi + lo) times the scales, about 4 ns
+  per element on 2 vCPUs, 66 ms at 4096³) is now the largest host cost. It is
+  the next candidate to move.
+- **First call.** Each split kernel compiles per operand shape: 4 s at 2048²,
+  16 s at 4096², and 34 s for the 3267 × 8400 operand. NEFFs are cached
+  afterwards.
 
 ## Out of scope
 

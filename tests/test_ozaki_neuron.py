@@ -7,6 +7,8 @@ fp32 TwoSums, so the result must not depend on the LNC split. Run the suite
 at LNC=2 (default) and at LNC=1 (`NEURON_LOGICAL_NC_CONFIG=1`); both runs
 must equal the host reference bit for bit, and with TRNBLAS_LNC_DIGEST_DIR
 set the second run also compares its digests with the first run's directly.
+The device split (#123) is checked the same way: its digits are those of
+`ozaki.split`, bit for bit, at any LNC.
 """
 
 from __future__ import annotations
@@ -15,6 +17,7 @@ import hashlib
 import os
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 from _ozaki_ref import inputs, max_cw
@@ -108,6 +111,72 @@ def test_lnc_digest(require_nki):
     other = Path(out) / f"ozaki_lnc{'1' if lnc == '2' else '2'}.sha256"
     if other.exists():
         assert other.read_text() == digest
+
+
+def _digest_check(name: str, digest: str) -> None:
+    out = os.environ.get("TRNBLAS_LNC_DIGEST_DIR")
+    if not out:
+        return
+    lnc = os.environ.get("NEURON_LOGICAL_NC_CONFIG", "2")
+    Path(out).mkdir(parents=True, exist_ok=True)
+    (Path(out) / f"{name}_lnc{lnc}.sha256").write_text(digest)
+    other = Path(out) / f"{name}_lnc{'1' if lnc == '2' else '2'}.sha256"
+    if other.exists():
+        assert other.read_text() == digest
+
+
+def _split_inputs(kind, shape, per, seed):
+    rng = np.random.default_rng(seed)
+    if kind == "normal":
+        return rng.standard_normal(shape)
+    if kind == "wide":
+        return rng.standard_normal(shape) * 10.0 ** rng.uniform(-30, 30, shape)
+    if kind == "ties":  # half-way cases on the k = 8 digit grid of a row max ~ 1
+        T = rng.integers(-(2**20), 2**20, shape).astype(np.float64)
+        T += rng.choice([0.0, 0.5, -0.5, 0.25], shape)
+        T *= 2.0**-63
+        T[:, 0] = T[0, :] = 1.0 - 2.0**-52
+        return T
+    bits = rng.integers(0, 2**63, shape, dtype=np.uint64)  # every exponent and sign
+    sub = (slice(None), slice(1, None, 3)) if per == "row" else (slice(1, None, 3), slice(None))
+    bits[sub] &= ~np.uint64(0x7FF0000000000000)  # subnormal / zero elements
+    X = bits.view(np.float64).copy()
+    X[~np.isfinite(X)] = 1.0
+    X[::2] *= -1
+    return X
+
+
+@pytest.mark.parametrize(
+    "kind,shape,k",
+    [
+        ("normal", (515, 3000), 8),
+        ("wide", (300, 700), 3),
+        ("bits", (256, 1100), 12),
+        ("ties", (200, 640), 8),
+    ],
+)
+@pytest.mark.parametrize("per", ["row", "col"])
+def test_device_split_digits_are_the_host_split(require_nki, kind, shape, k, per):
+    """The device split (#123) gives `ozaki.split`'s digits and exponents bit
+    for bit, per row and per column, at any LNC."""
+    X = torch.from_numpy(_split_inputs(kind, shape, per, seed=k))
+    d, e = D._oz_device_split(X, k, per)
+    ref, e_ref = ozaki.split(X, k, per=per, pad=(ozaki.TILE_K, ozaki.TILE_K))
+    got = d.cpu()
+    assert np.array_equal(got.float().numpy(), ref.float().numpy())
+    assert np.array_equal(e, e_ref)
+    _digest_check(
+        f"ozaki_split_{kind}_{per}", hashlib.sha256(got.view(torch.int16).numpy()).hexdigest()
+    )
+
+
+def test_device_split_falls_back(require_nki):
+    A, B = inputs(130, 300, 70, seed=7)
+    A[4] = 1e-310  # a subnormal row maximum: the host splits A
+    assert torch.equal(trnblas.gemm_fp64(A, B, slices=5), ozaki.reference_gemm(A, B, 5))
+    B[3, 3] = float("inf")  # inf / nan: host fp64
+    C = trnblas.gemm_fp64(A, B)
+    assert torch.equal(C.isnan(), (A @ B).isnan())
 
 
 def test_device_resident_operands(require_nki):

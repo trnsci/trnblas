@@ -9,7 +9,9 @@ as long as no partial sum exceeds 2^24. This module holds the host half of
 - `split`: fp64 -> `slices` bf16 integer slices ("digits") of b = 7 bits per
   row of A / column of B, plus one power-of-two exponent per row / column.
   Exact: the slices times their scales sum to the input up to a truncation
-  below 2^-(6 + 7 (slices - 1)) of the row / column maximum.
+  below 2^-(6 + 7 (slices - 1)) of the row / column maximum. On the device
+  route the same digits come from the device split (#123);
+  `split_from_bits` is its arithmetic on the host.
 - `diag_groups`: the static accumulation schedule the kernel unrolls. For each
   diagonal d = s + t of slice pairs (s of A, t of B, d <= slices - 1), the
   slice products share one scale, so their K tiles are concatenated and cut
@@ -215,6 +217,71 @@ def split(
 
     _parallel_blocks(R, step, block)
     return digits, e
+
+
+def split_from_bits(X: np.ndarray, slices: int) -> tuple[np.ndarray, np.ndarray]:
+    """The device split's algorithm (`_ozaki_split_kernel`, #123) on the host,
+    op for op in float32 and uint32: digits of a per-row split from the raw
+    fp64 bits of X (R, C), as float32 (k, R, C), and the row exponents (R,).
+
+    It equals `split(X, slices, per="row")` bit for bit (as values; a zero
+    digit may differ in sign, which no product or sum can see), except for a
+    row whose largest element is subnormal (device exponent field 0): there
+    `e` comes from the bit length, which the device route leaves to the host.
+    Non-finite X is not representable. For tests and documentation; the
+    host split (`split`) is faster on the host.
+    """
+    k = check_slices(slices)
+    f32 = np.float32
+    X = np.ascontiguousarray(X, dtype=np.float64)
+    R, C = X.shape
+    w = X.view(np.uint32).reshape(R, C, 2)
+    lo, hi = w[..., 0], w[..., 1]
+
+    def as_f32(u):
+        return np.asarray(u, dtype=np.uint32).view(np.float32)
+
+    E = (hi >> 20) & 0x7FF
+    emax = E.max(axis=1) if C else np.zeros(R, dtype=np.uint32)
+    e = np.where(emax > 0, emax.astype(np.int64) - 1022, 0)
+    # |x| 2^(20 - e) = P1 + P2 + P3 (disjoint bits); exponent clamped at -70
+    Xe = np.maximum(E, 1).astype(f32) - (1003 + e).astype(f32)[:, None]
+    S1 = as_f32((np.maximum(Xe, f32(-70)) + f32(127)).astype(np.uint32) << 23)
+    z = (E == 0).astype(f32)
+    m1 = as_f32(((hi & 0xFFFFF) << 3) | (lo >> 29) | 0x3F800000)
+    m2 = as_f32(((lo << 3) >> 9) | 0x3F800000)
+    m3 = as_f32(((lo & 0x3F) << 17) | 0x3F800000)
+    y = [
+        (m1 - z) * S1,
+        ((m2 - f32(1)) * f32(2.0**-23)) * S1,
+        ((m3 - f32(1)) * f32(2.0**-46)) * S1,
+    ]
+    Q = []  # 21-bit chunks of floor(|x| 2^(20 - e + 21 j))
+    fr = y
+    for j in range((k + 3) // 3):
+        t = fr if j == 0 else [v * f32(2.0**21) for v in fr]
+        c = [np.rint(v) for v in t]  # the device's fp32 -> uint32 cast
+        dl = [v - ci for v, ci in zip(t, c, strict=True)]
+        fl = [(ci - (di < 0)).astype(np.uint32) for ci, di in zip(c, dl, strict=True)]
+        fr = [di + (di < 0).astype(f32) for di in dl]
+        Q.append(fl[0] | fl[1] | fl[2])  # disjoint bits
+    frac = (fr[0] + fr[1]) + fr[2]
+    F = [((Q[s // 3] >> (14 - 7 * (s % 3))) & 127).astype(f32) for s in range(k + 1)]
+    low = 14 - 7 * (k % 3)
+    rest = (Q[k // 3] & ((1 << low) - 1)).astype(f32) if low else np.zeros_like(frac)
+    G = f32(2) * F[k] + (np.maximum(rest, frac) > 0).astype(f32)
+    Rr = [None] * k  # F_s + carry_s, rounded half to even
+    for s in range(k - 1, -1, -1):
+        v = G * f32(1 / 256) + F[s]
+        Rr[s] = (v + f32(12582912.0)) - f32(12582912.0)
+        if s:
+            G = F[s] * f32(2) + np.minimum(G, f32(1))
+    sg = (hi >> 31).astype(f32) * f32(-2) + f32(1)
+    D = np.empty((k, R, C), dtype=f32)
+    D[0] = Rr[0] * sg
+    for s in range(1, k):
+        D[s] = ((Rr[s - 1] - F[s - 1]) * f32(-128) + Rr[s]) * sg
+    return D, e
 
 
 class Digits:
@@ -453,21 +520,27 @@ def run(
     empty=None,
     max_m: int = LAUNCH_M,
     max_n: int = LAUNCH_N,
+    split_ab=None,
 ) -> torch.Tensor:
     """C = A @ B in fp64 by Ozaki splitting. A (M, K) and B (K, N) are finite
     fp64 on the host. `launch(da, db, (m0, mb), (k0, kb), (n0, nb)) ->
     (2, mb, nb) fp32` computes one block's (hi, lo) from the operands' slices
     (`Digits`): the NKI kernel, or `reference_launch`. For narrow B
     (N < SWAP_N < M) the launches compute blocks of C^T = B^T A^T instead.
-    `empty(shape, dtype)` allocates the slices and the result."""
+    `empty(shape, dtype)` allocates the slices and the result.
+    `split_ab(A, B, slices, empty) -> (Digits, Digits)` makes the slices
+    (default: `split_a` and `split_b` on the host; the device route splits
+    on the device, #123, with the same digits)."""
     k = check_slices(slices)
     M, K = A.shape
     N = B.shape[1]
     if M == 0 or N == 0 or K == 0:
         return torch.zeros((M, N), dtype=torch.float64)
     empty = empty or _torch_empty
-    da = split_a(A, k, empty)
-    db = split_b(B, k, empty)
+    if split_ab is None:
+        da, db = split_a(A, k, empty), split_b(B, k, empty)
+    else:
+        da, db = split_ab(A, B, k, empty)
     C = empty((M, N), torch.float64)
     out = C
     if N < SWAP_N and M > N:  # C^T = B^T A^T: B's slices are the first operand

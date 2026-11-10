@@ -11,6 +11,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 import torch
+from _ozaki_ref import DEVICE_SPLIT_KERNELS, device_split_ops
 from _ozaki_ref import inputs as _inputs
 from _ozaki_ref import max_cw as _max_cw
 
@@ -51,6 +52,55 @@ def test_split_extreme_and_zero_rows():
         got = np.ldexp(rec[r], e[r] - 6)
         assert (np.abs(got - X[r].numpy()) <= np.ldexp(1.0, e[r] - 56)).all(), r
     assert not D[:, 3].any() and e[3] == 0
+
+
+def _bit_patterns(rng, shape):
+    """Finite fp64 from random bit patterns: every exponent, sign and
+    mantissa, with a third of the columns subnormal or zero."""
+    bits = rng.integers(0, 2**63, shape, dtype=np.uint64)
+    bits[:, ::3] &= ~np.uint64(0x7FF0000000000000)
+    X = bits.view(np.float64).copy()
+    X[~np.isfinite(X)] = 1.0
+    X[::2] *= -1
+    return X
+
+
+def _ties(rng, k):
+    """Values on the digit grid of a row maximum just under 1, many of them
+    exactly half-way: every round-half-even branch of the digit chain."""
+    T = rng.integers(-(2**20), 2**20, (40, 300)).astype(np.float64)
+    T += rng.choice([0.0, 0.5, -0.5, 0.25], T.shape)
+    T *= 2.0 ** (-7 * (k - 1) - 14)
+    T[:, 0] = 1.0 - 2.0**-52
+    return T
+
+
+@pytest.mark.parametrize("k", range(1, 13))
+def test_split_from_bits_equals_split(k):
+    """The device split's arithmetic (#123), op for op on the host: the same
+    digits and exponents as `split`, from the raw bits, for every k."""
+    rng = np.random.default_rng(k)
+    cases = [
+        rng.standard_normal((50, 300)),
+        rng.standard_normal((30, 129)) * 10.0 ** rng.uniform(-40, 40, (30, 129)),
+        rng.standard_normal((8, 70)) * 1e300,
+        rng.standard_normal((8, 70)) * 1e-300,
+        _bit_patterns(rng, (40, 200)),
+        _ties(rng, k),
+        np.array([[0.0, -0.0, 0.0], [-0.0, 0.0, 0.0]]),
+    ]
+    for X in cases:
+        d, e = ozaki.split(torch.from_numpy(X), k, per="row", pad=(1, 1))
+        D, e2 = ozaki.split_from_bits(X, k)
+        assert np.array_equal(D, d.float().numpy()) and np.array_equal(e2, e)
+
+
+def test_split_from_bits_subnormal_row_maximum_differs():
+    """A row whose maximum is subnormal: the exponent field is 0, so the
+    device route leaves it to the host split (see `_oz_device_split`)."""
+    X = np.full((1, 4), 1e-310)
+    assert ozaki.split_from_bits(X, 4)[1][0] == 0
+    assert ozaki.split(torch.from_numpy(X), 4, per="row")[1][0] != 0
 
 
 @pytest.mark.parametrize("bad", [0, 13, 2.0, True, "8"])
@@ -255,10 +305,15 @@ def test_gemm_fp64_rejects_bad_slices():
 @pytest.fixture
 def native_reference(monkeypatch):
     """Native path on CPU: the `ozaki_gemm` op is the host reference of the
-    kernel, so gemm_fp64 runs its whole device route (split, uploads,
-    on-device transposes, blocks, combine) and must match reference_gemm
-    bit for bit."""
-    calls = []
+    kernel and the device-split ops are their CPU twins, so gemm_fp64 runs
+    its whole device route (raw-bit uploads, device split, on-device
+    transposes, blocks, combine) and must match reference_gemm bit for bit.
+    The list records the `ozaki_gemm` launches; `.split` the split ops."""
+
+    class Calls(list):
+        split: list
+
+    calls = Calls()
 
     def op(at, b):
         calls.append((tuple(at.shape), tuple(b.shape), at.is_contiguous(), b.is_contiguous()))
@@ -269,8 +324,20 @@ def native_reference(monkeypatch):
     monkeypatch.setattr(dispatch, "_USE_SIMULATOR", False)
     monkeypatch.setattr(dispatch, "_dispatch_path", "native")
     monkeypatch.setattr(dispatch, "_NEURON_DEVICE", "cpu")
-    monkeypatch.setattr(dispatch, "_native_ops", {"ozaki_gemm": op})
-    monkeypatch.setattr(dispatch, "_ozaki_gemm_kernel", object(), raising=False)
+    split_calls: list = []
+    ops = {"ozaki_gemm": op}
+    for name, fn in device_split_ops().items():
+
+        def rec(*a, _n=name, _f=fn):
+            split_calls.append(_n)
+            return _f(*a)
+
+        ops[name] = rec
+    monkeypatch.setattr(dispatch, "_native_ops", ops)
+    for name in ("_ozaki_gemm_kernel", *DEVICE_SPLIT_KERNELS):
+        monkeypatch.setattr(dispatch, name, object(), raising=False)
+    monkeypatch.setattr(dispatch, "_OZ_DEVICE_SPLIT", True)
+    calls.split = split_calls
     return calls
 
 
@@ -309,3 +376,63 @@ def test_gemm_fp64_native_route_empty(native_reference):
         torch.zeros(2, 4, dtype=torch.float64),
     )
     assert not native_reference
+
+
+# ── device split route (#123) ────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "transA,transB", [(False, False), (True, False), (False, True), (True, True)]
+)
+def test_device_split_route_splits_in_place(native_reference, transA, transB):
+    """Each operand is split on the device in its own layout: per row for a
+    row-major A or B^T, per column for A^T or a row-major B (the layouts of
+    `split_a` / `split_b`, so the launches see the same K-major slices)."""
+    A, B = _inputs(150, 260, 140, seed=11)
+    a = A.T.contiguous() if transA else A
+    b = B.T.contiguous() if transB else B
+    C = trnblas.gemm_fp64(a, b, slices=5, transA=transA, transB=transB)
+    assert torch.equal(C, ozaki.reference_gemm(A, B, 5))
+    want_a = ["ozaki_emax_col", "ozaki_split_col"] if transA else ["ozaki_emax", "ozaki_split"]
+    want_b = ["ozaki_emax", "ozaki_split"] if transB else ["ozaki_emax_col", "ozaki_split_col"]
+    assert native_reference.split == want_a + want_b
+
+
+def test_device_split_route_wide_range_and_ties(native_reference):
+    rng = np.random.default_rng(12)
+    A = torch.from_numpy(_ties(rng, 8)[:, :256])
+    B = torch.from_numpy(rng.standard_normal((256, 90)) * 10.0 ** rng.uniform(-8, 8, (256, 90)))
+    assert torch.equal(trnblas.gemm_fp64(A, B), ozaki.reference_gemm(A, B, 8))
+
+
+def test_device_split_subnormal_maximum_takes_host_split(native_reference):
+    A, B = _inputs(40, 60, 30, seed=13)
+    A[7] = 1e-310  # a row whose maximum is subnormal
+    C = trnblas.gemm_fp64(A, B, slices=6)
+    assert torch.equal(C, ozaki.reference_gemm(A, B, 6))
+    # A: exponent pass only (host split); B: the full device split
+    assert native_reference.split == ["ozaki_emax", "ozaki_emax_col", "ozaki_split_col"]
+
+
+def test_device_split_nonfinite_found_on_device(native_reference):
+    A, B = _inputs(40, 60, 30, seed=14)
+    B[5, 6] = float("-inf")
+    C = trnblas.gemm_fp64(A, B)
+    assert torch.equal(torch.isnan(C), torch.isnan(A @ B)) and torch.equal(
+        C.isinf(), (A @ B).isinf()
+    )
+    assert not native_reference and native_reference.split[-1] == "ozaki_emax_col"
+
+
+def test_device_split_off_uses_host_split(native_reference, monkeypatch):
+    monkeypatch.setattr(dispatch, "_OZ_DEVICE_SPLIT", False)
+    A, B = _inputs(40, 60, 30, seed=15)
+    assert torch.equal(trnblas.gemm_fp64(A, B, slices=4), ozaki.reference_gemm(A, B, 4))
+    assert not native_reference.split and native_reference
+
+
+def test_device_split_oversize_operand_takes_host_split(native_reference, monkeypatch):
+    monkeypatch.setattr(dispatch, "_OZ_RESIDENT_BYTES", 8 * 40 * 60 + 1)
+    A, B = _inputs(40, 60, 30, seed=16)
+    assert torch.equal(trnblas.gemm_fp64(A, B, slices=3), ozaki.reference_gemm(A, B, 3))
+    assert "ozaki_split" not in native_reference.split

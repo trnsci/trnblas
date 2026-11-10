@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`gemm_fp64` splits its operands on the device** (#123, refs #22,
+  trnsci/trnsci#129). Each fp64 operand is uploaded as its raw bits (8 bytes
+  per element, a plain copy) and split by four new NKI kernels:
+  `_ozaki_emax_kernel` / `_ozaki_emax_col_kernel` compute the row (column)
+  maxima of the exponent field, and `_ozaki_split_kernel` /
+  `_ozaki_split_col_kernel` produce the digits of `ozaki.split`. Device
+  float64 arithmetic is fp32, so the kernels use only VectorE bitvec ops and
+  exact fp32 arithmetic:
+  - three disjoint fp32 pieces of |x| · 2^(20 − e), built from the bit fields;
+  - an exact floor chain to 21-bit fixed-point chunks, with the floor taken
+    from the fp32 → uint32 cast and corrected, so it holds whichever way the
+    cast rounds;
+  - the 7-bit fields by shifts, then the balanced digits with their
+    round-half-even carries.
+
+  The new `trnblas.ozaki.split_from_bits` is the same arithmetic on the host.
+  On Trn2 the digits equal the host split's (as values) per row and per
+  column, for every k tested, on random fp64 bit patterns and on half-way
+  ties. `gemm_fp64` stays bitwise equal to `ozaki.reference_gemm`, at LNC=1
+  and LNC=2. The split costs about 0.55 ns per element on one logical core,
+  against about 11 ns on one host core.
+
+  End to end at k = 8 (one logical core at LNC=2, host fp64 on 2 vCPUs):
+  - (3267, 8400, 241): 68 ms against 207 ms for host fp64, 3.0× faster (it
+    was 2.8× slower with the host split);
+  - (8192, 3508, 241): 2.7× faster;
+  - 4096³: 10.3× faster.
+
+  The host split still runs under `TRNBLAS_OZAKI_DEVICE_SPLIT=0`, for
+  operands of 2 GiB or more, and for a row or column whose maximum is
+  subnormal. inf and nan are found from the device exponent maxima and take
+  host fp64, as before. See docs/benchmarks.md.
+
 - **`trnblas.gemm_fp64(A, B, *, slices=8, transA=False, transB=False)`: an
   fp64-class GEMM on the bf16 Tensor Engine by Ozaki splitting** (#22,
   trnsci/trnsci#129). The host splits fp64 A row by row and B column by

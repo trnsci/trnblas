@@ -215,3 +215,73 @@ class TestOzakiSimulator:
         assert torch.equal(C, ozaki.reference_gemm(A, B, 8))
         err = ((C - A @ B).abs() / (A.abs() @ B.abs())).max().item()
         assert err < 2e-15
+
+
+class TestOzakiDeviceSplitSim:
+    """The device split kernels (#123) under nki.simulate: the digits and
+    exponents of `ozaki.split`, bit for bit, per row and per column."""
+
+    @staticmethod
+    def _data(kind, shape, per, seed):
+        import numpy as np
+
+        rng = np.random.default_rng(seed)
+        if kind == "normal":
+            return rng.standard_normal(shape)
+        if kind == "wide":
+            return rng.standard_normal(shape) * 10.0 ** rng.uniform(-30, 30, shape)
+        bits = rng.integers(0, 2**63, shape, dtype=np.uint64)
+        sub = (slice(None), slice(1, None, 3)) if per == "row" else (slice(1, None, 3), slice(None))
+        bits[sub] &= ~np.uint64(0x7FF0000000000000)  # subnormal / zero elements
+        X = bits.view(np.float64).copy()
+        X[~np.isfinite(X)] = 1.0
+        X[::2] *= -1
+        return X
+
+    @pytest.mark.parametrize(
+        "kind,shape,k,per",
+        [
+            ("normal", (130, 600), 8, "row"),
+            ("normal", (700, 241), 8, "col"),
+            ("wide", (70, 129), 3, "row"),
+            ("wide", (129, 70), 7, "col"),
+            ("bits", (128, 513), 12, "row"),
+            ("bits", (300, 130), 5, "col"),
+            ("normal", (1, 1), 1, "row"),
+        ],
+    )
+    def test_digits_equal_host_split(self, kind, shape, k, per):
+        import numpy as np
+
+        from trnblas import ozaki
+        from trnblas.nki import dispatch
+
+        X = torch.from_numpy(self._data(kind, shape, per, k))
+        d, e = dispatch._oz_device_split(X, k, per)
+        ref, e_ref = ozaki.split(X, k, per=per, pad=(128, 128))
+        assert np.array_equal(d.float().numpy(), ref.float().numpy())
+        assert np.array_equal(e, e_ref)
+
+    def test_nonfinite_and_subnormal_maximum(self):
+        from trnblas.nki import dispatch
+
+        X = torch.randn(10, 12, dtype=torch.float64)
+        X[2, 3] = float("nan")
+        with pytest.raises(dispatch._OzNonFinite):
+            dispatch._oz_device_split(X, 4, "row")
+        X = torch.randn(10, 12, dtype=torch.float64)
+        X[:, 5] = 1e-310  # column 5's maximum is subnormal; no row's is
+        assert dispatch._oz_device_split(X, 4, "col") is None
+        assert dispatch._oz_device_split(X, 4, "row") is not None
+
+    @pytest.mark.parametrize("transA,transB", [(False, False), (True, True)])
+    def test_gemm_fp64_device_split_end_to_end(self, transA, transB):
+        from trnblas import gemm_fp64, ozaki
+
+        g = torch.Generator().manual_seed(2)
+        A = torch.randn(140, 300, generator=g, dtype=torch.float64)
+        B = torch.randn(300, 70, generator=g, dtype=torch.float64)
+        a = A.T.contiguous() if transA else A
+        b = B.T.contiguous() if transB else B
+        C = gemm_fp64(a, b, slices=6, transA=transA, transB=transB)
+        assert torch.equal(C, ozaki.reference_gemm(A, B, 6))
