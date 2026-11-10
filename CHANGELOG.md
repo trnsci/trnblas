@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] — 2026-11-10
+
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
+
+Headline: `trnblas.gemm_fp64`, an fp64-class GEMM by Ozaki splitting on the bf16 Tensor Engine (#22, #124), with the operand split on the device (#123, #125): 2e-16 to 4e-16 of |A||B| at the default k = 8, and 3.0× host fp64 on 2 vCPUs at (3267, 8400, 241), 10.3× at 4096³. `_host_empty` falls back to pageable memory when pinning raises.
+
 ### Added
 
 - **`gemm_fp64` splits its operands on the device** (#123, refs #22,
