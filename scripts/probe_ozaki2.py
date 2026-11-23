@@ -8,14 +8,15 @@ Run on a Trn2 instance (native TorchNeuron path), one logical core, LNC=2:
     NEURON_RT_VISIBLE_CORES=0 python scripts/probe_ozaki2.py shapes --arms b8 b9 \
         --out o2_b8b9.json
 
-`micro` (Q1, ~5 min): at M = N = 2048, K = 16384 (several PSUM groups for
+`micro` (Q1, ~6 min): at M = N = 2048, K = 16384 (several PSUM groups for
 every family), the residue-GEMM kernel time per modulus for b7 / b8 / b9
 against Ozaki I's kernel time per slice GEMM (k = 8) and aten bf16 `mm`;
-plus the device CRT kernel per output element at n = 12 .. 17.
+then at K = 4096 and the 53-bit counts, residue GEMM, CRT (ns per output
+element) and the fused kernel (both in one launch).
 
 `shapes` (Q2, Q3): at each shape and matched accuracy (configs below, from
 the CPU analysis), first-call time (compile), kernel ms (resident operands,
-residue GEMM and CRT separately), e2e ms of gemm_fp64, the host-CRT variant,
+residue GEMM and CRT separately, and the fused kernel), e2e ms of gemm_fp64, the host-CRT variant,
 host fp64 at 2 and 12 threads, max_cw on 256 sampled rows against an
 independent near-exact reference, and bitwise equality of those rows with
 the host reference (`ozaki2.reference_gemm` / `ozaki.reference_gemm`).
@@ -121,7 +122,7 @@ def oz2_kernel_fns(A, B, n, fam):
         for kk in kbs
         for nn in nbs
     ]
-    g, c = K2.GEMM_KERNELS[fam], K2.CRT_KERNELS[fam]
+    g, c, fu = (t.get(fam) for t in (K2.GEMM_KERNELS, K2.CRT_KERNELS, K2.FUSED_KERNELS))
     res = [D._call_kernel(g, f"ozaki2_gemm_{fam}", at, bt) for at, bt in blocks]
     sync()
 
@@ -133,7 +134,11 @@ def oz2_kernel_fns(A, B, n, fam):
         for r in res:
             D._call_kernel(c, f"ozaki2_crt_{fam}", r)
 
-    return gemm, crt
+    def fused():
+        for at, bt in blocks:
+            D._call_kernel(fu, f"ozaki2_fused_{fam}", at, bt)
+
+    return gemm, crt, fused
 
 
 def host_ms(A, B):
@@ -178,10 +183,16 @@ def case(name, shape, arm, c):
         t = time.perf_counter()
         ozaki2.split_ab(A, B, c, arm)
         rec["host_split_ms"] = (time.perf_counter() - t) * 1e3
-        gemm, crt = oz2_kernel_fns(A, B, c, arm)
+        gemm, crt, fused = oz2_kernel_fns(A, B, c, arm)
         rec["residue_gemm_ms"] = timed(gemm)
         rec["crt_ms"] = timed(crt)
         rec["kernel_ms"] = rec["residue_gemm_ms"] + rec["crt_ms"]
+        try:
+            rec["fused_ms"] = timed(fused)
+            rec["e2e_fused_ms"] = timed(lambda: K2.gemm(A, B, c, arm, "fused"), reps=1)
+            rec["bitwise_fused"] = bool(torch.equal(K2.gemm(A, B, c, arm, "fused"), C))
+        except Exception as exc:  # the fused kernel is optional for the decision
+            rec["fused_error"] = repr(exc)
         rec["bf16_gemms"] = c
         rec.update(check_rows(C, A, B, lambda a, b: ozaki2.reference_gemm(a, b, c, arm)))
         rec["bitwise_host_crt"] = bool(
@@ -203,19 +214,18 @@ def micro():
     K = 16384
     A, B = inputs(M, K, N)
     recs = []
-    a16 = A.to(torch.bfloat16).to("neuron")
-    b16 = B.to(torch.bfloat16).to("neuron")
-    recs.append(
-        {
-            "what": "aten bf16 mm (fp32 out)",
-            "ms": timed(lambda: torch.mm(a16, b16, out_dtype=torch.float32)),
-        }
-    )
+    a16 = D._to_device(A.to(torch.bfloat16))[0][0]
+    b16 = D._to_device(B.to(torch.bfloat16))[0][0]
+    try:
+        ms = timed(lambda: torch.mm(a16, b16, out_dtype=torch.float32))
+        recs.append({"what": "aten bf16 mm (fp32 out)", "ms": ms})
+    except Exception:  # no out_dtype overload on this backend
+        recs.append({"what": "aten bf16 mm (bf16 out)", "ms": timed(lambda: torch.mm(a16, b16))})
     run = oz1_kernel_fn(A, B, 8)
     ms = timed(run)
     recs.append({"what": "ozaki1 k=8 kernel", "ms": ms, "per_gemm_ms": ms / 36})
     for fam in ("b7", "b8", "b9"):
-        gemm, crt = oz2_kernel_fns(A, B, 4, fam)
+        gemm, _, _ = oz2_kernel_fns(A, B, 4, fam)
         ms = timed(gemm)
         recs.append(
             {
@@ -226,11 +236,19 @@ def micro():
             }
         )
     for fam, n in (("b7", 13), ("b7", 17), ("b8", 15), ("b9", 13)):
-        _, crt = oz2_kernel_fns(A[:, :1024], B[:1024], n, fam)
-        ms = timed(crt)
-        recs.append(
-            {"what": f"device crt {fam} n={n}", "ms": ms, "ns_per_element": ms * 1e6 / (M * N)}
-        )
+        gemm, crt, fused = oz2_kernel_fns(A[:, :4096], B[:4096], n, fam)
+        g_ms, c_ms = timed(gemm), timed(crt)
+        rec = {
+            "what": f"{fam} n={n} at 2048x4096x2048",
+            "residue_gemm_ms": g_ms,
+            "crt_ms": c_ms,
+            "crt_ns_per_element": c_ms * 1e6 / (M * N),
+        }
+        try:
+            rec["fused_ms"] = timed(fused)
+        except Exception as exc:
+            rec["fused_error"] = repr(exc)
+        recs.append(rec)
         print(recs[-1], flush=True)
     return recs
 

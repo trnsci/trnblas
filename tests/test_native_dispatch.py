@@ -42,7 +42,7 @@ EXPECTED_OPS = GEMM_OPS | {
     "ozaki_emax_col",
     "ozaki_split",
     "ozaki_split_col",
-    *(f"ozaki2_{kind}_{fam}" for kind in ("gemm", "crt") for fam in ("b7", "b8", "b9")),
+    *(f"ozaki2_{kind}_{fam}" for kind in ("gemm", "crt", "fused") for fam in ("b7", "b8", "b9")),
 }
 
 
@@ -505,6 +505,14 @@ def native_stub(monkeypatch):
             f"ozaki2_gemm_{fam}",
             lambda at, b, f=fam: torch.from_numpy(ozaki2.reference_residue_gemm(at, b, f)),
         )
+        ops[f"ozaki2_fused_{fam}"] = rec(
+            f"ozaki2_fused_{fam}",
+            lambda at, b, f=fam: torch.from_numpy(
+                ozaki2.crt_device(
+                    ozaki2.reference_residue_gemm(at, b, f), ozaki2.crt(f, at.shape[0])
+                )
+            ),
+        )
         ops[f"ozaki2_crt_{fam}"] = rec(
             f"ozaki2_crt_{fam}",
             lambda r, f=fam: torch.from_numpy(
@@ -755,6 +763,11 @@ class TestLazyRegistration:
         )
         keep = ozaki2.crt("b8", 14).keep
         assert fake("ozaki2_crt_b8")(meta(14, 384, 241)).shape == (keep, 384, 241)
+        assert fake("ozaki2_fused_b8")(meta(14, 256, 384), meta(14, 256, 241)).shape == (
+            keep,
+            384,
+            241,
+        )
         assert fake("j_batched")(
             meta(128, 256), meta(4, 128, 256), meta(1, 1), meta(1, 4), meta(128, 1), meta(1, 128)
         ).shape == (128, 4)

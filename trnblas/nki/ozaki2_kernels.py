@@ -83,11 +83,20 @@ if _HAS_NKI:
                     operand1=acc[i][j],
                 )
 
-    def _oz2_tile(at, b, out, m0, TM, n0, nsizes, moduli, GT):
+    def _oz2_tile(at, b, out, m0, TM, n0, nsizes, moduli, GT, c=None):
         """TM M tiles x N sub-tiles `nsizes` of every modulus's residues, from
         row m0 and column n0. Moduli are a static loop (O(n) traced code),
-        the PSUM groups of each a runtime loop."""
+        the PSUM groups of each a runtime loop. With CRT constants `c`
+        (fused kernels), each canonical residue tile goes into the tile's
+        CRT sums instead of HBM, and the packed CRT output is stored at the
+        end: the same ops as the residue kernel then the CRT kernel."""
         n = at.shape[0]
+        if c is not None:
+            Lf = [[[None] * c.nl for _ in nsizes] for _ in range(TM)]
+            qf = [
+                [nl.ndarray((128, ns), dtype=nl.float32, buffer=nl.sbuf) for ns in nsizes]
+                for _ in range(TM)
+            ]
         KT = at.shape[1] // 128
         G = KT // GT
         R = KT - G * GT
@@ -113,19 +122,27 @@ if _HAS_NKI:
             for i in range(TM):
                 r = m0 + i * 128
                 for j in range(len(nsizes)):
-                    c = n0 + noff[j]
-                    nl.store(out[l, r : r + 128, c : c + nsizes[j]], value=acc[i][j])
+                    if c is not None:
+                        _oz2_crt_acc(Lf[i][j], qf[i][j], acc[i][j], l, c, (128, nsizes[j]))
+                        continue
+                    cc = n0 + noff[j]
+                    nl.store(out[l, r : r + 128, cc : cc + nsizes[j]], value=acc[i][j])
+        if c is not None:
+            for i in range(TM):
+                for j in range(len(nsizes)):
+                    shape = (128, nsizes[j])
+                    _oz2_crt_store(Lf[i][j], qf[i][j], out, m0 + i * 128, n0 + noff[j], c, shape)
 
-    def _oz2_mblock(at, b, out, m0, TM, c0, NP, moduli, GT):
+    def _oz2_mblock(at, b, out, m0, TM, c0, NP, moduli, GT, c=None):
         """Columns [c0, c0 + NP) of one M block (as Ozaki I's `_oz_mblock`)."""
         NF = NP // 1024
         for nb in nl.affine_range(NF):
-            _oz2_tile(at, b, out, m0, TM, c0 + nb * 1024, [512, 512], moduli, GT)
+            _oz2_tile(at, b, out, m0, TM, c0 + nb * 1024, [512, 512], moduli, GT, c)
         if NP - NF * 1024:
             sizes = _lnc_sizes(NP - NF * 1024, 512)
-            _oz2_tile(at, b, out, m0, TM, c0 + NF * 1024, sizes, moduli, GT)
+            _oz2_tile(at, b, out, m0, TM, c0 + NF * 1024, sizes, moduli, GT, c)
 
-    def _oz2_gemm(at, b, out, moduli, GT):
+    def _oz2_gemm(at, b, out, moduli, GT, c=None):
         """The LNC split of `_ozaki_gemm_kernel`: halves of the 128-row M
         tiles per program (an odd middle tile computed by both, identically),
         or halves of the columns with at most two M tiles."""
@@ -135,54 +152,51 @@ if _HAS_NKI:
         MT = Mp // 128
         if n_prog > 1 and MT <= 2 and N >= 2:
             NPP = (N + n_prog - 1) // n_prog
-            _oz2_mblock(at, b, out, 0, MT, nl.program_id(0) * (N - NPP), NPP, moduli, GT)
+            _oz2_mblock(at, b, out, 0, MT, nl.program_id(0) * (N - NPP), NPP, moduli, GT, c)
             return
         MPT = (MT + n_prog - 1) // n_prog
         r0 = nl.program_id(0) * ((MT - MPT) * 128) if n_prog > 1 else 0
         NB = MPT // 2
         for mb in nl.affine_range(NB):
-            _oz2_mblock(at, b, out, r0 + mb * 256, 2, 0, N, moduli, GT)
+            _oz2_mblock(at, b, out, r0 + mb * 256, 2, 0, N, moduli, GT, c)
         if MPT % 2:
-            _oz2_mblock(at, b, out, r0 + NB * 256, 1, 0, N, moduli, GT)
+            _oz2_mblock(at, b, out, r0 + NB * 256, 1, 0, N, moduli, GT, c)
 
     # ── device CRT ───────────────────────────────────────────────────────────
 
     _OZ2_CW = 512  # columns per CRT tile
 
-    def _oz2_crt_tile(res, out, r0, c0, w, c):
-        """`ozaki2.crt_device` on rows r0 .. r0 + 127, columns c0 .. c0 + w - 1."""
-        shape = (128, w)
+    def _oz2_crt_acc(L, qa, r, l, c, shape):
+        """Add modulus l's residue tile r into the limb sums L (a list of
+        nl tiles, allocated on first use) and the quotient estimate qa."""
+        for j in range(c.nl):
+            wv = float(c.W[l, j])
+            if wv == 0.0:
+                continue
+            if L[j] is None:
+                L[j] = nl.ndarray(shape, dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_scalar(dst=L[j], data=r, op0=nl.multiply, operand0=wv)
+            else:
+                nisa.scalar_tensor_tensor(
+                    dst=L[j], data=r, op0=nl.multiply, operand0=wv, op1=nl.add, operand1=L[j]
+                )
+        om = float(c.omega[l])
+        if l == 0:
+            nisa.tensor_scalar(dst=qa, data=r, op0=nl.multiply, operand0=om)
+        else:
+            nisa.scalar_tensor_tensor(
+                dst=qa, data=r, op0=nl.multiply, operand0=om, op1=nl.add, operand1=qa
+            )
+
+    def _oz2_crt_store(L, qa, out, r0, c0, c, shape):
+        """Finish the CRT of one tile (`ozaki2.crt_device` after the sums):
+        q = rint(qa), D = L - q M, carries, packed pairs stored from row r0,
+        column c0 of out (keep, Mp, N)."""
+        w = shape[1]
 
         def f():
             return nl.ndarray(shape, dtype=nl.float32, buffer=nl.sbuf)
 
-        L = [None] * c.nl
-        qa = f()
-        for l in range(c.n):
-            r = nl.load(res[l, r0 : r0 + 128, c0 : c0 + w])
-            for j in range(c.nl):
-                wv = float(c.W[l, j])
-                if wv == 0.0:
-                    continue
-                if L[j] is None:
-                    L[j] = f()
-                    nisa.tensor_scalar(dst=L[j], data=r, op0=nl.multiply, operand0=wv)
-                else:
-                    nisa.scalar_tensor_tensor(
-                        dst=L[j],
-                        data=r,
-                        op0=nl.multiply,
-                        operand0=wv,
-                        op1=nl.add,
-                        operand1=L[j],
-                    )
-            om = float(c.omega[l])
-            if l == 0:
-                nisa.tensor_scalar(dst=qa, data=r, op0=nl.multiply, operand0=om)
-            else:
-                nisa.scalar_tensor_tensor(
-                    dst=qa, data=r, op0=nl.multiply, operand0=om, op1=nl.add, operand1=qa
-                )
         q = f()
         nisa.tensor_scalar(
             dst=q, data=qa, op0=nl.add, operand0=_OZ2_MAGIC, op1=nl.subtract, operand1=_OZ2_MAGIC
@@ -216,6 +230,16 @@ if _HAS_NKI:
                     dst=v, data=D[hi], op0=nl.multiply, operand0=sc, op1=nl.add, operand1=D[lo]
                 )
             nl.store(out[p - c.j0, r0 : r0 + 128, c0 : c0 + w], value=v)
+
+    def _oz2_crt_tile(res, out, r0, c0, w, c):
+        """`ozaki2.crt_device` on rows r0 .. r0 + 127, columns c0 .. c0 + w - 1."""
+        shape = (128, w)
+        L = [None] * c.nl
+        qa = nl.ndarray(shape, dtype=nl.float32, buffer=nl.sbuf)
+        for l in range(c.n):
+            r = nl.load(res[l, r0 : r0 + 128, c0 : c0 + w])
+            _oz2_crt_acc(L, qa, r, l, c, shape)
+        _oz2_crt_store(L, qa, out, r0, c0, c, shape)
 
     def _oz2_crt(res, out, c):
         """All tiles: row tiles split between the LNC programs (Mp is a
@@ -295,6 +319,34 @@ if _HAS_NKI:
         _oz2_crt(res, out, c)
         return out
 
+    def _oz2_fused(at, b, fam):
+        f = _o2.FAMILIES[fam]
+        c = _o2.crt(fam, at.shape[0])
+        out = nl.ndarray((c.keep, at.shape[2], b.shape[2]), dtype=nl.float32, buffer=nl.shared_hbm)
+        _oz2_gemm(at, b, out, f.moduli, f.group_tiles, c)
+        return out
+
+    @nki.jit
+    def _ozaki2_fused_b7_kernel(at, b):
+        """Residue GEMMs and the device CRT in one kernel, b7: (keep, Mp, N),
+        bitwise the residue kernel followed by the CRT kernel."""
+        return _oz2_fused(at, b, "b7")
+
+    @nki.jit
+    def _ozaki2_fused_b8_kernel(at, b):
+        """Fused residue GEMMs + CRT, b8."""
+        return _oz2_fused(at, b, "b8")
+
+    @nki.jit
+    def _ozaki2_fused_b9_kernel(at, b):
+        """Fused residue GEMMs + CRT, b9."""
+        return _oz2_fused(at, b, "b9")
+
+    FUSED_KERNELS = {
+        "b7": _ozaki2_fused_b7_kernel,
+        "b8": _ozaki2_fused_b8_kernel,
+        "b9": _ozaki2_fused_b9_kernel,
+    }
     GEMM_KERNELS = {
         "b7": _ozaki2_gemm_b7_kernel,
         "b8": _ozaki2_gemm_b8_kernel,
@@ -308,6 +360,7 @@ if _HAS_NKI:
 else:  # pragma: no cover - CPU-only installs
     GEMM_KERNELS = {}
     CRT_KERNELS = {}
+    FUSED_KERNELS = {}
 
 
 # ── host side: launches and the gemm_fp64(scheme="ozaki2") route ─────────────
@@ -317,19 +370,22 @@ def _launcher(fam: str, crt_mode: str):
     """`ozaki2.run`'s launch: the residue-GEMM kernel on K-major device
     residues (uploaded once per call when they fit, as Ozaki I's slices),
     then the device CRT (crt_mode "device") or the residues themselves
-    ("host"), downloaded. Under the simulator, both kernels on host blocks."""
+    ("host"), downloaded; "fused" runs both in one kernel (same bits as
+    "device"). Under the simulator, both kernels on host blocks."""
     import numpy as np
     import torch
 
     from . import dispatch as D
 
-    gemm_op, crt_op = f"ozaki2_gemm_{fam}", f"ozaki2_crt_{fam}"
+    gemm_op, crt_op, fused_op = (f"ozaki2_{k}_{fam}" for k in ("gemm", "crt", "fused"))
     cache: dict = {}
 
     def launch(ra, rb, m, kk, nn):
         if D._use_simulator():
             at, bt = _o2.host_blocks(ra, rb, m, kk, nn)
             D._check_kernel_operands(gemm_op, at, bt)
+            if crt_mode == "fused":
+                return D._simulate_bf16(FUSED_KERNELS[fam], at, bt)
             res = D._simulate_bf16(GEMM_KERNELS[fam], at, bt)
             if crt_mode == "host":
                 return res
@@ -338,6 +394,8 @@ def _launcher(fam: str, crt_mode: str):
         at = D._oz_device_block(ra, cache, "a", kk, m)
         bt = D._oz_device_block(rb, cache, "b", kk, nn)
         # .get: without nki (stubbed native ops in tests) the tables are empty
+        if crt_mode == "fused":
+            return D._to_host(D._call_kernel(FUSED_KERNELS.get(fam), fused_op, at, bt), "cpu")
         res = D._call_kernel(GEMM_KERNELS.get(fam), gemm_op, at, bt)
         if crt_mode == "device":
             res = D._call_kernel(CRT_KERNELS.get(fam), crt_op, res)

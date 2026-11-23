@@ -66,11 +66,12 @@ def test_default_is_fp64_accurate_and_bitwise(require_nki, shape):
 
 
 @pytest.mark.parametrize("fam,n", [("b7", 13), ("b8", 15), ("b9", 13)])
-@pytest.mark.parametrize("crt_mode", ["device", "host"])
+@pytest.mark.parametrize("crt_mode", ["device", "host", "fused"])
 def test_families_bitwise(require_nki, fam, n, crt_mode):
     A, B = inputs(400, 5000, 300, seed=1)
     C = _k2().gemm(A, B, n, fam, crt_mode)
-    assert torch.equal(C, ozaki2.reference_gemm(A, B, n, fam, crt_mode))
+    ref_mode = "host" if crt_mode == "host" else "device"  # fused: the device CRT's bits
+    assert torch.equal(C, ozaki2.reference_gemm(A, B, n, fam, ref_mode))
 
 
 @pytest.mark.parametrize("fam", ["b7", "b8", "b9"])

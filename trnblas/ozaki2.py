@@ -497,7 +497,7 @@ def plan(Mp: int, Kp: int, N: int, n: int, limit: int = _oz.BLOCK_BYTES, max_m=N
     return _oz._blocks(Mp, Mb), _oz._blocks(Kp, Kb), _oz._blocks(N, Nb)
 
 
-CRT_MODES = ("device", "host")
+CRT_MODES = ("device", "host", "fused")  # fused: the device CRT in the GEMM kernel
 
 
 def run(
@@ -534,7 +534,8 @@ def run(
     if N < _oz.SWAP_N and M > N:
         ra, rb, M, N, out = rb, ra, N, M, out.T
     mbs, kbs, nbs = plan(ra.xp, ra.kp, N, n, limit, max_m, max_n)
-    shift = 2 * c.beta * c.j0 if crt_mode == "device" else 0
+    dev = crt_mode != "host"
+    shift = 2 * c.beta * c.j0 if dev else 0
     for m0, mb in mbs:
         mr = min(mb, M - m0)
         if mr <= 0:
@@ -544,7 +545,7 @@ def run(
             acc = None
             for k0, kb in kbs:
                 got = launch(ra, rb, (m0, mb), (k0, kb), (n0, nb)).numpy()
-                if crt_mode == "device":
+                if dev:
                     X = unpack_device(got[:, :mr, :nr], c)
                 else:
                     X = crt_host(got[:, :mr, :nr], c)

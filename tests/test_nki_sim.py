@@ -358,3 +358,32 @@ class TestOzaki2Sim:
         B = torch.randn(300, 600, generator=g, dtype=torch.float64)
         C = gemm_fp64(A.T.contiguous(), B, transA=True, scheme="ozaki2", moduli=12)
         assert torch.equal(C, ozaki2.reference_gemm(A, B, 12))
+
+
+class TestOzaki2FusedSim:
+    """The fused kernel (residue GEMMs + device CRT in one launch) gives the
+    bits of the residue kernel followed by the CRT kernel."""
+
+    @pytest.mark.parametrize("fam,n,M,K,N", [("b7", 17, 256, 700, 600), ("b8", 6, 130, 1100, 64)])
+    def test_fused_bitwise(self, fam, n, M, K, N):
+        from trnblas import ozaki2
+        from trnblas.nki import dispatch, ozaki2_kernels
+
+        g = torch.Generator().manual_seed(n)
+        A = torch.randn(M, K, generator=g, dtype=torch.float64)
+        B = torch.randn(K, N, generator=g, dtype=torch.float64)
+        ra, rb = ozaki2.split_ab(A, B, n, fam)
+        at, bt = ra.d, rb.d[:, :, :N].contiguous()
+        got = dispatch._simulate_bf16(ozaki2_kernels.FUSED_KERNELS[fam], at, bt).numpy()
+        res = ozaki2.reference_residue_gemm(at, bt, fam)
+        assert (got == ozaki2.crt_device(res, ozaki2.crt(fam, n))).all()
+
+    def test_fused_end_to_end(self):
+        from trnblas import ozaki2
+        from trnblas.nki import ozaki2_kernels
+
+        g = torch.Generator().manual_seed(5)
+        A = torch.randn(140, 400, generator=g, dtype=torch.float64)
+        B = torch.randn(400, 80, generator=g, dtype=torch.float64)
+        C = ozaki2_kernels.gemm(A, B, 17, "b7", "fused")
+        assert torch.equal(C, ozaki2.reference_gemm(A, B, 17, "b7", "device"))

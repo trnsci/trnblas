@@ -1276,6 +1276,7 @@ _KERNEL_DTYPES: dict[str, frozenset] = {
     # fp32 residues into the device CRT
     **{f"ozaki2_gemm_{f}": frozenset({torch.bfloat16}) for f in ("b7", "b8", "b9")},
     **{f"ozaki2_crt_{f}": frozenset({torch.float32}) for f in ("b7", "b8", "b9")},
+    **{f"ozaki2_fused_{f}": frozenset({torch.bfloat16}) for f in ("b7", "b8", "b9")},
 }
 
 

@@ -184,6 +184,21 @@ _KERNELS = {
         for f, n in (("b7", 16), ("b8", 14), ("b9", 12))
         for tag, s in (("", (n, 384, 1300)), ("_tiny", (2, 128, 1)))
     },
+    # fused residue GEMM + CRT: the largest CRT state per tile (b7 at 28
+    # moduli, 4 PSUM sub-tiles), K over groups plus a remainder, a column
+    # split and a tail.
+    **{
+        f"ozaki2_fused_{f}{tag}": (
+            lambda d, f=f: _k2().FUSED_KERNELS[f],
+            lambda s=s: (_bf16(s[0], s[1], s[2]), _bf16(s[0], s[1], s[3])),
+        )
+        for f, kt in (("b7", 32), ("b8", 8), ("b9", 2))
+        for tag, s in (
+            ("", (17, (kt + 1) * 128, 384, 1300)),
+            ("_n28", (28, 128, 256, 1024)),
+            ("_col_split", (3, 3 * 128, 256, 1023)),
+        )
+    },
 }
 
 
