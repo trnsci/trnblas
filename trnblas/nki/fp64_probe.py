@@ -698,10 +698,15 @@ def format_e2(rep: dict) -> str:
 # ── LNC digests ──────────────────────────────────────────────────────────────
 
 
-def lnc_digests(ns=(100003, 1000000), device: str = "neuron") -> dict:
-    """SHA-256 of every reduction kernel's partials for fixed inputs, and
-    whether they equal the CPU reference. Run once at LNC=2 and once at LNC=1
-    (NEURON_LOGICAL_NC_CONFIG=1, whole chip): the digests must agree."""
+LNC_LARGE = [("dot32", "accurate"), ("sum32", "accurate"), ("dot32", "exact")]
+
+
+def lnc_digests(ns=(100003, 1000000), device: str = "neuron", budget_s: float = 1080.0) -> dict:
+    """SHA-256 of the reduction kernels' partials for fixed inputs (every
+    kernel at the first n, `LNC_LARGE` at the others, several tiles per
+    chunk), and whether they equal the CPU reference. Run once at LNC=2 and
+    once at LNC=1 (NEURON_LOGICAL_NC_CONFIG=1, whole chip): the digests must
+    agree. Stops starting kernels after `budget_s` (`truncated`)."""
     import hashlib
     import os
 
@@ -710,8 +715,9 @@ def lnc_digests(ns=(100003, 1000000), device: str = "neuron") -> dict:
     from .. import fp64
     from . import fp64_kernels as K
 
+    t0 = time.time()
     out = {"lnc": os.environ.get("NEURON_LOGICAL_NC_CONFIG", "2"), "digests": {}, "equal_ref": {}}
-    for n in ns:
+    for i, n in enumerate(ns):
         r64, ap64 = e2_vectors(n, seed=1)
         x = torch.from_numpy(r64.astype(np.float32))
         y = torch.from_numpy(ap64.astype(np.float32))
@@ -724,7 +730,11 @@ def lnc_digests(ns=(100003, 1000000), device: str = "neuron") -> dict:
             "sumff": [fr.hi, fr.lo],
             "nrmff": [fr.hi, fr.lo],
         }
-        for (kind, arm), _name in sorted(K.REDUCE_KERNELS.items()):
+        keys = sorted(K.REDUCE_KERNELS) if i == 0 else LNC_LARGE
+        for kind, arm in keys:
+            if time.time() - t0 > budget_s:
+                out["truncated"] = True
+                break
             xs = ops[kind]
             if device == "neuron":
                 parts = K.run_partials(kind, [t.to("neuron") for t in xs], arm)

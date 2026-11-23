@@ -7,7 +7,7 @@ writes JSON and prints a markdown table; each takes well under 20 minutes.
     python scripts/probe_fp64.py e0 --json e0.json           # run FIRST: gates the rest
     python scripts/probe_fp64.py e2 --n 1000000 --json e2_1e6.json
     python scripts/probe_fp64.py e2 --n 100000  --json e2_1e5.json
-    python scripts/probe_fp64.py e2 --n 10000000 --json e2_1e7.json
+    python scripts/probe_fp64.py e2 --n 10000000 --no-reference --json e2_1e7.json
     python scripts/probe_fp64.py e3 --json e3.json            # gemm_fp64 combine on device
     python scripts/probe_fp64.py lnc --json lnc2.json         # at LNC=2
     NEURON_LOGICAL_NC_CONFIG=1 python scripts/probe_fp64.py lnc --json lnc1.json
