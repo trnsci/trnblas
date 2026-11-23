@@ -239,6 +239,12 @@ def run_arms(kind, x64, y64, prec, data32=True, data64=True):
         else:
             r = F.exact_dot(torch.from_numpy(xd), torch.from_numpy(yd))
         out["fp32 data: exact-int"] = bits(float(r), ref)
+        parts = (
+            F.sum(tx, accumulate="exact", finish="partials")
+            if kind == "sum"
+            else F.dot(tx, ty, accumulate="exact", finish="partials")
+        )
+        out["exact arm window held"] = F.finish_exact(parts) is not None
         out["cond (fp32 data)"] = cond_of(kind, xd, yd)
     if data64:
         ref, _ = reference(kind, x64, y64, prec)
@@ -381,13 +387,16 @@ def format_markdown(rep) -> str:
         "fp64 data: host fp64",
         "fp64 data: exact-int",
     ]
-    hdr = ["case", "cond"] + [c.replace("data: ", "") for c in cols] + ["exact-int limbs"]
+    hdr = ["case", "cond"] + [c.replace("data: ", "") for c in cols]
+    hdr += ["exact-int limbs (fp64 data)", "device exact arm window"]
     lines = ["| " + " | ".join(hdr) + " |", "|" + "---|" * len(hdr)]
     for case, row in rep["table"].items():
         cond = row.get("cond (fp64 data)", row.get("cond (fp32 data)"))
         cells = [case, f"{cond:.1e}" if cond is not None else ""]
         cells += [f"{row[c]:.1f}" if c in row else "" for c in cols]
         cells.append(str(row.get("int limbs", "")))
+        held = row.get("exact arm window held")
+        cells.append("" if held is None else ("held" if held else "spill: host"))
         lines.append("| " + " | ".join(cells) + " |")
     lines.append("")
     lines.append(

@@ -94,7 +94,10 @@ def test_kernels_equal_cpu_reference_bitwise():
         for kind, arm in keys:
             xs = ops[kind]
             got = K.run_partials(kind, [t.to("neuron") for t in xs], arm)
-            ref = F.reference_partials(kind, xs, arm)
+            if arm == "exact":
+                ref = F.reference_exact_partials(kind, xs)
+            else:
+                ref = F.reference_partials(kind, xs, arm)
             assert torch.equal(got.view(torch.int32), ref.view(torch.int32)), (n, kind, arm)
 
 
@@ -115,7 +118,7 @@ def test_e2_arms_accuracy_and_throughput(n, outdir):
     only, with the first-call compile time), against the host fp64 round
     trip it replaces. Accuracy gates: the double-word arms reach >= 45 bits
     on these well-conditioned CG-like vectors; every kernel equals the CPU
-    reference bit for bit."""
+    reference bit for bit; the exact arm is exactly rounded."""
     budget = float(os.environ.get("TRNBLAS_FP64_BUDGET_S", "1080"))
     rep = Q.e2(n, budget_s=budget, check_reference=n <= 1000000)
     _dump(outdir, f"e2_{n}.json", rep)
@@ -126,6 +129,8 @@ def test_e2_arms_accuracy_and_throughput(n, outdir):
             assert row["bitwise_vs_cpu_reference"], key
         if key.endswith(("sloppy", "accurate")):
             assert row["bits"] >= 45, (key, row["bits"])
+        if key.endswith("exact") and row["window_held"]:
+            assert row["bits"] == 53.0, key  # exactly rounded
 
 
 def test_lnc_digests(outdir):

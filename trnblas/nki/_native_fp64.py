@@ -17,15 +17,15 @@ from . import fp64_kernels as _k
 _NCH = 4
 
 
-def _fake_partials(ncol):
+def _fake_partials(ncol, dtype=torch.float32):
     def fake(*xs):
-        return xs[0].new_empty((128, ncol * _NCH), dtype=torch.float32)
+        return xs[0].new_empty((128, ncol * _NCH), dtype=dtype)
 
     return fake
 
 
-def _register_reduce(name: str, arity: int, ncol: int):
-    fake = _fake_partials(ncol)
+def _register_reduce(name: str, arity: int, ncol: int, dtype=torch.float32):
+    fake = _fake_partials(ncol, dtype)
     if arity == 1:
 
         def op1(x: torch.Tensor) -> torch.Tensor:
@@ -52,9 +52,21 @@ def _register_reduce(name: str, arity: int, ncol: int):
 
 _ARITY = {"sum32": 1, "nrm32": 1, "dot32": 2, "sumff": 2, "nrmff": 2, "dotff": 4}
 
+
+def _ncol(kind, arm):
+    if arm == "exact":
+        return _k._EXACT_L + 3
+    return 3 if kind.startswith("nrm") else 2
+
+
 OPS = {
-    name: _register_reduce(name, _ARITY[kind], 3 if kind.startswith("nrm") else 2)
-    for (kind, _arm), name in _k.REDUCE_KERNELS.items()
+    name: _register_reduce(
+        name,
+        _ARITY[kind],
+        _ncol(kind, arm),
+        torch.int32 if arm == "exact" else torch.float32,
+    )
+    for (kind, arm), name in _k.REDUCE_KERNELS.items()
 }
 
 

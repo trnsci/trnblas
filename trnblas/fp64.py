@@ -565,7 +565,7 @@ def _route(tensors, backend: str | None) -> str:
     return "pytorch"
 
 
-def _operands(kind: str, args) -> tuple[str, list]:
+def _operands(kind: str, args, exact: bool = False) -> tuple[str, list]:
     """Normalise the inputs of sum / dot / nrm2 to float32 tensors: fp32 in,
     the fp32 kind; FF or float64 in, the float-float kind."""
     ffs = [isinstance(a, (FF, tuple)) or a.dtype == F64 for a in args]
@@ -584,11 +584,14 @@ def _operands(kind: str, args) -> tuple[str, list]:
 
 
 def partials(kind: str, xs: Sequence[torch.Tensor], backend=None, accumulate="accurate"):
-    """Chunk partials (P, 2 NCH) or (P, 3 NCH) on the selected backend."""
+    """Chunk partials (P, 2 NCH) or (P, 3 NCH) on the selected backend
+    (int32 (P, NCH (EXACT_LIMBS + 3)) for the exact arm)."""
     if len({t.numel() for t in xs}) != 1:
         raise ValueError("operands must have the same number of elements")
     route = _route(xs, backend)
     if route == "pytorch":
+        if accumulate == "exact":
+            return reference_exact_partials(kind, xs)
         return reference_partials(kind, xs, accumulate)
     from .nki import fp64_kernels as K
 
@@ -608,8 +611,22 @@ def _finish(parts: torch.Tensor, kind: str, finish: str):
 
 
 def _check_arm(accumulate: str) -> None:
-    if accumulate not in ARMS:
-        raise ValueError(f"accumulate must be one of {ARMS}; got {accumulate!r}")
+    if accumulate not in ARMS + ("exact",):
+        raise ValueError(f"accumulate must be one of {ARMS + ('exact',)}; got {accumulate!r}")
+
+
+def _exact_finish(parts, kind, xs, finish):
+    """Finish of the exact arm: exactly rounded float64 (host fallback when a
+    group's window did not hold every term)."""
+    if finish == "partials":
+        return parts
+    if finish != "host":
+        raise ValueError("the exact arm finishes on the host ('host' or 'partials')")
+    v = finish_exact(parts)
+    if v is None:  # sticky: recompute exactly on the host from the operands
+        h = [t.detach().to("cpu").to(F64) for t in xs]
+        return exact_sum(h[0]) if kind == "sum32" else exact_dot(h[0], h[1])
+    return torch.tensor(v, dtype=F64)
 
 
 def sum(x, *, backend=None, finish: str = "host", accumulate: str = "accurate"):
@@ -619,9 +636,12 @@ def sum(x, *, backend=None, finish: str = "host", accumulate: str = "accurate"):
     the device's chunk partials (hybrid). "ff": an FF scalar from a fixed
     float-float fold. "partials": the raw (P, 2 NCH) partials.
     `accumulate` picks the arm (`ARMS`): "accurate" (default), "sloppy",
-    "comp" (Sum2) or "plain" (fp32), for measurement."""
+    "comp" (Sum2) or "plain" (fp32), for measurement; or "exact" (float32
+    operands): the integer-limb arm, exactly rounded."""
     _check_arm(accumulate)
     kind, xs = _operands("sum", [x])
+    if accumulate == "exact":
+        return _exact_finish(partials(kind, xs, backend, accumulate), kind, xs, finish)
     return _finish(partials(kind, xs, backend, accumulate), kind, finish)
 
 
@@ -634,6 +654,8 @@ def dot(x, y, *, backend=None, finish: str = "host", accumulate: str = "accurate
     Dot2, "plain" is an fp32 dot in the same order). See `sum` for `finish`."""
     _check_arm(accumulate)
     kind, xs = _operands("dot", [x, y])
+    if accumulate == "exact":
+        return _exact_finish(partials(kind, xs, backend, accumulate), kind, xs, finish)
     return _finish(partials(kind, xs, backend, accumulate), kind, finish)
 
 
@@ -642,6 +664,8 @@ def nrm2(x, *, backend=None, accumulate: str = "accurate") -> torch.Tensor:
     scaled by a power of two from its largest |x| before squaring, so there
     is no overflow or underflow for any finite fp32 / float-float input."""
     _check_arm(accumulate)
+    if accumulate == "exact":
+        raise ValueError("nrm2 has no exact arm")
     kind, xs = _operands("nrm", [x])
     return _finish(partials(kind, xs, backend, accumulate), kind, "host")
 
@@ -951,6 +975,96 @@ def combine_exact(parts, *, exp=None) -> torch.Tensor:
     return torch.from_numpy(np.ascontiguousarray(res))
 
 
+# ── The device's exact arm: fp32 terms into int32 limbs ─────────────────────
+#
+# `accumulate="exact"` for float32 operands (sum32, dot32): every term (x, or
+# both parts p, e of TwoProd(x, y)) is cut into EXACT_LIMBS 21-bit digits of a
+# fixed-point window per (partition, chunk) group, and the digits are added
+# into int32 lanes (GpSimd int32 add, exact mod 2^32). The window top is
+# T = Eg - 126 for Eg the largest biased fp32 exponent of the group's terms,
+# so every term has |v| < 2^T, and digit j of v is
+#   Q_j = floor(|v| 2^(21 (j + 1) - T)) mod 2^21,
+# from r_0 = |v| 2^(21 - T) (two power-of-two scalings, exact) and the floor
+# chain Q_j = floor(r_j), r_(j+1) = 2^21 (r_j - Q_j) of the Ozaki device split
+# (each r_j < 2^21, so the floor by the corrected fp32 -> uint32 cast is exact).
+# A term with bits below the window (r_L != 0), or one so small that all its
+# digits are zero (r_0 < 2^-100), sets the group's sticky flag: the result is
+# then not exact and the caller recomputes it on the host. The window covers
+# 21 L = 126 bits: a dot of fp32 data stays exact while the group's products
+# span up to ~78 bits of exponent. After the lane pass one carry pass makes
+# digits 0 .. L - 1 canonical ([0, 2^21)) with a signed overflow limb, by an
+# arithmetic shift built from logical shifts and masks; the W lanes then fold
+# by int32 adds with no further carries (< 2^30). Output per group:
+# L + 1 limbs, T and the sticky flag (int32), as (P, NCH (L + 3)).
+
+EXACT_LIMBS = 6
+EXACT_COLS = EXACT_LIMBS + 3
+
+
+def _exact_terms(kind: str, rows: list, t: int) -> list:
+    if kind == "sum32":
+        return [rows[0][:, :, t, :]]
+    p, e = two_prod(rows[0][:, :, t, :], rows[1][:, :, t, :])
+    return [p, e]
+
+
+def reference_exact_partials(kind: str, xs: Sequence[torch.Tensor]) -> torch.Tensor:
+    """The exact-arm kernels' output on the host: int32 (P, NCH (L + 3))."""
+    if kind not in ("sum32", "dot32"):
+        raise ValueError("the exact arm takes float32 sum or dot operands")
+    L = EXACT_LIMBS
+    pl = plan(xs[0].numel())
+    rows = [layout(t.to("cpu", F32), pl).view(P, NCH, pl.tpc, pl.W) for t in xs]
+    # group maxima: of |x| (sum) or of |fl(x y)| (dot), as the kernels' pass 1
+    lead = rows[0] if kind == "sum32" else rows[0] * rows[1]
+    m = (lead.contiguous().view(torch.int32) & 0x7FFFFFFF).amax(dim=(2, 3))
+    Eg = (m >> 23).numpy().astype(np.int64)  # (P, NCH)
+    T = Eg - 126
+    acc = np.zeros((L + 1, P, NCH, pl.W), dtype=np.int64)
+    sticky = np.zeros((P, NCH, pl.W), dtype=bool)
+    scale = np.ldexp(1.0, (21 - T)[:, :, None])
+    for t in range(pl.tpc):
+        for v in _exact_terms(kind, rows, t):
+            a = np.abs(v.numpy().astype(np.float64))
+            r = a * scale  # exact in float64
+            sticky |= (a != 0) & (r < 2.0**-100)
+            sg = np.where(v.numpy() < 0, -1, 1)
+            for j in range(L):
+                q = np.floor(r)
+                acc[j] += sg * q.astype(np.int64)
+                r = (r - q) * 2.0**21
+            sticky |= r != 0
+    _check32(acc, "exact lane accumulation")
+    acc = _carry(acc[list(range(L)) + [L]], 21)  # digits 0 .. L - 1, overflow limb L
+    w = pl.W
+    while w > 1:
+        k = w // 2
+        acc[..., :k] = acc[..., :k] + acc[..., w - k : w]
+        sticky[..., :k] |= sticky[..., w - k : w]
+        _check32(acc, "exact fold")
+        w -= k
+    out = np.zeros((P, NCH, EXACT_COLS), dtype=np.int64)
+    out[:, :, : L + 1] = np.moveaxis(acc[..., 0], 0, -1)
+    out[:, :, L + 1] = T
+    out[:, :, L + 2] = sticky[..., 0]
+    return torch.from_numpy(out.reshape(P, -1).astype(np.int32))
+
+
+def finish_exact(parts: torch.Tensor):
+    """Exactly rounded float64 of the exact arm's partials, or None if a
+    group's sticky flag is set (the window did not hold every term)."""
+    L = EXACT_LIMBS
+    a = parts.detach().to("cpu").numpy().astype(np.int64).reshape(P, NCH, EXACT_COLS)
+    if bool(a[:, :, L + 2].any()):
+        return None
+    total = Fraction(0)
+    for T in np.unique(a[:, :, L + 1]):
+        sel = a[:, :, L + 1] == T
+        num = _limbs_value(a[sel][:, : L + 1], 21)
+        total += Fraction(num) * Fraction(2) ** int(T - 21 * L)
+    return float(total)
+
+
 # ── Device fp64 construction: RN64(hi + lo) 2^E as raw bits ─────────────────
 #
 # The combine of gemm_fp64 is RN64(hi + lo) * 2^(eA_i + eB_j + off) per
@@ -1059,6 +1173,8 @@ __all__ = [
     "FF_MAX",
     "FF_MIN_FULL",
     "ARMS",
+    "EXACT_COLS",
+    "EXACT_LIMBS",
     "NCH",
     "Plan",
     "SPLIT_MAX",
@@ -1078,6 +1194,7 @@ __all__ = [
     "ff_add_sloppy",
     "ff_mul",
     "ff_mul_fp",
+    "finish_exact",
     "finish_ff",
     "finish_host",
     "from_fp64",
@@ -1086,6 +1203,7 @@ __all__ = [
     "nrm2",
     "partials",
     "plan",
+    "reference_exact_partials",
     "reference_partials",
     "split",
     "split_bits",

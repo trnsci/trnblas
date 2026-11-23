@@ -443,10 +443,12 @@ E2_KERNELS = [
     ("dot32", "comp"),
     ("dot32", "sloppy"),
     ("dot32", "accurate"),
+    ("dot32", "exact"),
     ("sum32", "plain"),
     ("sum32", "comp"),
     ("sum32", "sloppy"),
     ("sum32", "accurate"),
+    ("sum32", "exact"),
     ("nrm32", "accurate"),
     ("dotff", "sloppy"),
     ("dotff", "accurate"),
@@ -478,6 +480,14 @@ def e2_vectors(n: int, seed: int = 0):
         p = r + (rr2 / rr) * p
         rr = rr2
     return r, A(p)
+
+
+def _ref_partials(kind, xs, arm):
+    from .. import fp64
+
+    if arm == "exact":
+        return fp64.reference_exact_partials(kind, xs)
+    return fp64.reference_partials(kind, xs, arm)
 
 
 def _bits(r: float, ref: float) -> float:
@@ -621,14 +631,20 @@ def e2(
 
         def run(xs=xs, kind=kind, arm=arm, sim=sim):
             if sim:
-                return fp64.reference_partials(kind, xs, arm)
+                return _ref_partials(kind, xs, arm)
             return K.run_partials(kind, xs, arm)
+
+        def fin(parts, kind=kind, arm=arm):
+            if arm == "exact":
+                v = fp64.finish_exact(parts)
+                return float("nan") if v is None else v
+            return fp64.finish_host(parts, kind)
 
         t0 = time.perf_counter()
         parts = run()
         first = time.perf_counter() - t0
-        val = fp64.finish_host(parts, kind)
-        e2e = _timeit(lambda run=run, kind=kind: fp64.finish_host(run(), kind), reps, sync)
+        val = fin(parts)
+        e2e = _timeit(lambda run=run, fin=fin: fin(run()), reps, sync)
         rows = [fp64.layout(t, pl).contiguous() for t in xs]
         if sim:
             kern = e2e
@@ -647,8 +663,10 @@ def e2(
             "kernel_ns_per_elem": kern / n * 1e9,
             "layout_ms": lay * 1e3,
         }
+        if arm == "exact":
+            row["window_held"] = fp64.finish_exact(parts) is not None
         if check_reference:
-            ref = fp64.reference_partials(kind, [t.to("cpu") for t in xs], arm)
+            ref = _ref_partials(kind, [t.to("cpu") for t in xs], arm)
             row["bitwise_vs_cpu_reference"] = bool(
                 torch.equal(parts.view(torch.int32), ref.view(torch.int32))
             )
@@ -711,10 +729,10 @@ def lnc_digests(ns=(100003, 1000000), device: str = "neuron") -> dict:
             if device == "neuron":
                 parts = K.run_partials(kind, [t.to("neuron") for t in xs], arm)
             else:
-                parts = fp64.reference_partials(kind, xs, arm)
+                parts = _ref_partials(kind, xs, arm)
             key = f"{kind}/{arm}/n={n}"
             out["digests"][key] = hashlib.sha256(parts.numpy().tobytes()).hexdigest()
-            ref = fp64.reference_partials(kind, xs, arm)
+            ref = _ref_partials(kind, xs, arm)
             out["equal_ref"][key] = bool(
                 torch.equal(parts.view(torch.int32), ref.view(torch.int32))
             )

@@ -61,7 +61,10 @@ REDUCE_KERNELS: dict[tuple[str, str], str] = {
     ("dotff", "sloppy"): "_fp64_dotff_sloppy_kernel",
     ("nrm32", "accurate"): "_fp64_nrm32_accurate_kernel",
     ("nrmff", "accurate"): "_fp64_nrmff_accurate_kernel",
+    ("sum32", "exact"): "_fp64_sum32_exact_kernel",
+    ("dot32", "exact"): "_fp64_dot32_exact_kernel",
 }
+_EXACT_L = 6  # = trnblas.fp64.EXACT_LIMBS
 for _name in REDUCE_KERNELS.values():
     KERNEL_DTYPES[_name] = frozenset({torch.float32})
 KERNEL_DTYPES["_fp64_probe_alu_kernel"] = frozenset({torch.float32})
@@ -303,6 +306,209 @@ if HAS_NKI:
             for j in nl.affine_range(_NCH):
                 _fv_chunk(ins, out, j, W, tpc, kind, mode)
         return out
+
+    # ---------------------------------------------------------------------
+    # The exact arm (fp64.reference_exact_partials): 21-bit digits of each
+    # term in a per-group fixed-point window, int32 lanes on GpSimd.
+    # ---------------------------------------------------------------------
+
+    def _fx_i(shape):
+        return nl.ndarray(shape, dtype=nl.int32, buffer=nl.sbuf)
+
+    def _fx_pow2(field, shape):
+        """2^(field - 127) as float32 from an integer-valued float32 field."""
+        u = nl.ndarray(shape, dtype=nl.uint32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=u, src=field)
+        b = nl.ndarray(shape, dtype=nl.uint32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=b, data=u, op0=nl.left_shift, operand0=23)
+        return b.view(nl.float32)
+
+    def _fx_digits(v, sa, sb, acc, sticky, shape):
+        """Add the digits of terms v into the limb lanes acc[0 .. L - 1]."""
+        u32 = nl.uint32
+        av = nl.ndarray(shape, dtype=u32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=av, data=v.view(u32), op0=nl.bitwise_and, operand0=0x7FFFFFFF)
+        a = av.view(nl.float32)
+        neg = _fv_t(shape)
+        nisa.tensor_scalar(dst=neg, data=v, op0=nl.less, operand0=0.0)
+        sg = _fv_t(shape)
+        nisa.tensor_scalar(
+            dst=sg, data=neg, op0=nl.multiply, operand0=-2.0, op1=nl.add, operand1=1.0
+        )
+        r0 = _fv_t(shape)
+        nisa.tensor_scalar(dst=r0, data=a, op0=nl.multiply, operand0=sa)
+        r = _fv_t(shape)
+        nisa.tensor_scalar(dst=r, data=r0, op0=nl.multiply, operand0=sb)
+        tiny = _fv_t(shape)
+        nisa.tensor_scalar(dst=tiny, data=r, op0=nl.less, operand0=2.0**-100)
+        nzv = _fv_t(shape)
+        nisa.tensor_scalar(dst=nzv, data=a, op0=nl.not_equal, operand0=0.0)
+        lost = _fv_op(tiny, nzv, nl.multiply, shape)
+        nisa.tensor_tensor(dst=sticky, data1=sticky, data2=lost, op=nl.maximum)
+        for j in range(_EXACT_L):
+            c = nl.ndarray(shape, dtype=u32, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=c, src=r)
+            d = _fv_t(shape)
+            nisa.scalar_tensor_tensor(
+                dst=d, data=c, op0=nl.multiply, operand0=-1.0, op1=nl.add, operand1=r
+            )
+            q = _fv_t(shape)  # floor(r) = c - [d < 0]
+            nisa.scalar_tensor_tensor(
+                dst=q,
+                data=d,
+                op0=nl.less,
+                operand0=0.0,
+                op1=nl.subtract,
+                operand1=c,
+                reverse1=True,
+            )
+            b = _fv_t(shape)  # frac(r) = d + [d < 0]
+            nisa.scalar_tensor_tensor(
+                dst=b, data=d, op0=nl.less, operand0=0.0, op1=nl.add, operand1=d
+            )
+            r = _fv_t(shape)
+            nisa.tensor_scalar(dst=r, data=b, op0=nl.multiply, operand0=2.0**21)
+            dq = _fv_op(q, sg, nl.multiply, shape)
+            di = _fx_i(shape)
+            nisa.tensor_copy(dst=di, src=dq)
+            nisa.tensor_tensor(
+                dst=acc[j], data1=acc[j], data2=di, op=nl.add, engine=nisa.gpsimd_engine
+            )
+        below = _fv_t(shape)
+        nisa.tensor_scalar(dst=below, data=r, op0=nl.not_equal, operand0=0.0)
+        nisa.tensor_tensor(dst=sticky, data1=sticky, data2=below, op=nl.maximum)
+
+    def _fx_carry(acc, zero, shape):
+        """Digits 0 .. L - 1 into [0, 2^21), carries upward, the last into
+        acc[L]: c = a >> 21 (arithmetic: logical shift | sign extension)."""
+        u32 = nl.uint32
+        for j in range(_EXACT_L - 1, -1, -1):
+            au = acc[j].view(u32)
+            lsh = nl.ndarray(shape, dtype=u32, buffer=nl.sbuf)
+            nisa.tensor_scalar(dst=lsh, data=au, op0=nl.right_shift, operand0=21)
+            sbit = nl.ndarray(shape, dtype=u32, buffer=nl.sbuf)
+            nisa.tensor_scalar(dst=sbit, data=au, op0=nl.right_shift, operand0=31)
+            ext = _fx_i(shape)  # 0 - sign: 0 or -1
+            nisa.tensor_tensor(
+                dst=ext,
+                data1=zero,
+                data2=sbit.view(nl.int32),
+                op=nl.subtract,
+                engine=nisa.gpsimd_engine,
+            )
+            hi = nl.ndarray(shape, dtype=u32, buffer=nl.sbuf)
+            nisa.tensor_scalar(dst=hi, data=ext.view(u32), op0=nl.bitwise_and, operand0=0xFFFFF800)
+            cu = nl.ndarray(shape, dtype=u32, buffer=nl.sbuf)
+            nisa.tensor_tensor(dst=cu, data1=lsh, data2=hi, op=nl.bitwise_or)
+            nisa.tensor_scalar(dst=au, data=au, op0=nl.bitwise_and, operand0=(1 << 21) - 1)
+            up = acc[j - 1] if j else acc[_EXACT_L]
+            nisa.tensor_tensor(
+                dst=up, data1=up, data2=cu.view(nl.int32), op=nl.add, engine=nisa.gpsimd_engine
+            )
+
+    def _fx_chunk(ins, out, c, W, tpc, kind):
+        L = _EXACT_L
+        ncol = L + 3
+        c0 = c * (tpc * W)
+        sh = (128, W)
+        M = _fv_t(sh)
+        nisa.memset(dst=M, value=0.0)
+        for t in nl.sequential_range(tpc):
+            xt = nl.load(ins[0][0:128, c0 + t * W : c0 + (t + 1) * W])
+            if kind == "dot32":
+                yt = nl.load(ins[1][0:128, c0 + t * W : c0 + (t + 1) * W])
+                lead = _fv_op(xt, yt, nl.multiply, sh)
+            else:
+                lead = xt
+            a = nl.ndarray(sh, dtype=nl.uint32, buffer=nl.sbuf)
+            nisa.tensor_scalar(
+                dst=a, data=lead.view(nl.uint32), op0=nl.bitwise_and, operand0=0x7FFFFFFF
+            )
+            nisa.tensor_tensor(dst=M, data1=M, data2=a.view(nl.float32), op=nl.maximum)
+        m = _fv_t((128, 1))
+        nisa.tensor_reduce(dst=m, op=nl.maximum, data=M, axis=1, keepdims=True)
+        Eu = nl.ndarray((128, 1), dtype=nl.uint32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=Eu, data=m.view(nl.uint32), op0=nl.right_shift, operand0=23)
+        Eg = _fv_t((128, 1))
+        nisa.tensor_copy(dst=Eg, src=Eu)
+        fa = _fv_t((128, 1))  # field of 2^min(147 - Eg, 127)
+        nisa.tensor_scalar(
+            dst=fa, data=Eg, op0=nl.multiply, operand0=-1.0, op1=nl.add, operand1=274.0
+        )
+        nisa.tensor_scalar(dst=fa, data=fa, op0=nl.minimum, operand0=254.0)
+        fb = _fv_t((128, 1))  # field of 2^max(20 - Eg, 0)
+        nisa.tensor_scalar(
+            dst=fb, data=Eg, op0=nl.multiply, operand0=-1.0, op1=nl.add, operand1=147.0
+        )
+        nisa.tensor_scalar(dst=fb, data=fb, op0=nl.maximum, operand0=127.0)
+        sa = _fx_pow2(fa, (128, 1))
+        sb = _fx_pow2(fb, (128, 1))
+        acc = []
+        for _j in range(L + 1):
+            z = _fx_i(sh)
+            nisa.memset(dst=z, value=0)
+            acc.append(z)
+        zero = _fx_i(sh)
+        nisa.memset(dst=zero, value=0)
+        sticky = _fv_t(sh)
+        nisa.memset(dst=sticky, value=0.0)
+        for t in nl.sequential_range(tpc):
+            xt = nl.load(ins[0][0:128, c0 + t * W : c0 + (t + 1) * W])
+            if kind == "dot32":
+                yt = nl.load(ins[1][0:128, c0 + t * W : c0 + (t + 1) * W])
+                p, e = _fv_two_prod(xt, yt, sh)
+                _fx_digits(p, sa, sb, acc, sticky, sh)
+                _fx_digits(e, sa, sb, acc, sticky, sh)
+            else:
+                _fx_digits(xt, sa, sb, acc, sticky, sh)
+        _fx_carry(acc, zero, sh)
+        w = W
+        while w > 1:
+            k = w // 2
+            for j in range(L + 1):
+                nisa.tensor_tensor(
+                    dst=acc[j][:, 0:k],
+                    data1=acc[j][:, 0:k],
+                    data2=acc[j][:, w - k : w],
+                    op=nl.add,
+                    engine=nisa.gpsimd_engine,
+                )
+            nisa.tensor_tensor(
+                dst=sticky[:, 0:k], data1=sticky[:, 0:k], data2=sticky[:, w - k : w], op=nl.maximum
+            )
+            w -= k
+        for j in range(L + 1):
+            nl.store(out[0:128, ncol * c + j : ncol * c + j + 1], value=acc[j][:, 0:1])
+        Tf = _fv_t((128, 1))
+        nisa.tensor_scalar(dst=Tf, data=Eg, op0=nl.subtract, operand0=126.0)
+        Ti = _fx_i((128, 1))
+        nisa.tensor_copy(dst=Ti, src=Tf)
+        nl.store(out[0:128, ncol * c + L + 1 : ncol * c + L + 2], value=Ti)
+        Si = _fx_i((128, 1))
+        nisa.tensor_copy(dst=Si, src=sticky[:, 0:1])
+        nl.store(out[0:128, ncol * c + L + 2 : ncol * c + L + 3], value=Si)
+
+    def _fx_reduce(ins, kind):
+        F = ins[0].shape[1]
+        W, tpc = _fv_plan(F)
+        out = nl.ndarray((128, (_EXACT_L + 3) * _NCH), dtype=nl.int32, buffer=nl.shared_hbm)
+        n_prog = nl.num_programs() if nl.program_ndim() > 0 else 1
+        cpp = _NCH // n_prog
+        if n_prog > 1:
+            for j in nl.affine_range(cpp):
+                _fx_chunk(ins, out, nl.program_id(0) * cpp + j, W, tpc, kind)
+        else:
+            for j in nl.affine_range(_NCH):
+                _fx_chunk(ins, out, j, W, tpc, kind)
+        return out
+
+    @nki.jit
+    def _fp64_sum32_exact_kernel(x):
+        return _fx_reduce((x,), "sum32")
+
+    @nki.jit
+    def _fp64_dot32_exact_kernel(x, y):
+        return _fx_reduce((x, y), "dot32")
 
     @nki.jit
     def _fp64_sum32_plain_kernel(x):

@@ -492,3 +492,47 @@ def test_combine_bits_equals_ozaki_combine():
     got = F.combine_bits(parts[0], da.e, db.e, k, M, N)
     ref = ozaki.combine(parts[0], da.e, db.e, k, M, N)
     assert torch.equal(got.view(torch.int64), ref.view(torch.int64))
+
+
+# ── the device exact arm (fp32 terms into int32 limbs) ───────────────────────
+
+
+@pytest.mark.parametrize("n", [1, 1000, 100003, 700001])
+def test_exact_arm_is_exactly_rounded(n):
+    rng = np.random.default_rng(n)
+    x = _f32(rng.standard_normal(n) * 10.0 ** rng.integers(-6, 6, n))
+    y = _f32(rng.standard_normal(n))
+    assert float(F.sum(x, accumulate="exact")) == _exact_sum(x.double().numpy())
+    assert float(F.dot(x, y, accumulate="exact")) == float(F.exact_dot(x.double(), y.double()))
+    parts = F.dot(x, y, accumulate="exact", finish="partials")
+    assert parts.dtype == torch.int32 and parts.shape == (F.P, F.NCH * F.EXACT_COLS)
+    assert F.finish_exact(parts) is not None  # the window held every term
+
+
+def test_exact_arm_ill_conditioned_and_fallback():
+    # cond ~ 1e32 in fp32 data: exact
+    x = _f32([2.0**60, 1.0, -(2.0**60), 3.0])
+    y = _f32([2.0**60, 1.0, 2.0**60, 2.0**-30])
+    assert float(F.dot(x, y, accumulate="exact")) == 1.0 + 3 * 2.0**-30
+    # spread past the 126-bit window: sticky, host fallback, still exact
+    z = _f32([2.0**100, 2.0**-100, -(2.0**100)])
+    assert F.finish_exact(F.sum(z, accumulate="exact", finish="partials")) is None
+    assert float(F.sum(z, accumulate="exact")) == 2.0**-100
+    with pytest.raises(ValueError):
+        F.nrm2(z, accumulate="exact")
+
+
+def test_exact_arm_is_chunk_local():
+    n = 700001
+    x = _f32(RNG.standard_normal(n))
+    y = _f32(RNG.standard_normal(n))
+    full = F.reference_exact_partials("dot32", [x, y])
+    pl = F.plan(n)
+    X = F.layout(x, pl).view(F.P, F.NCH, -1)
+    Y = F.layout(y, pl).view(F.P, F.NCH, -1)
+    c = 2
+    Xc = torch.zeros_like(X)
+    Xc[:, c] = X[:, c]
+    part = F.reference_exact_partials("dot32", [Xc.reshape(-1), Y.reshape(-1)])
+    k = F.EXACT_COLS
+    assert torch.equal(part[:, c * k : (c + 1) * k], full[:, c * k : (c + 1) * k])

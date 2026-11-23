@@ -108,8 +108,27 @@ def test_kernel_equals_reference_bitwise(key, n, lnc, monkeypatch):
     kind, arm = key
     xs = _operands(kind, n, np.random.default_rng(n))
     got = K.run_partials(kind, xs, arm, simulate=True)
-    ref = F.reference_partials(kind, xs, arm)
+    if arm == "exact":
+        ref = F.reference_exact_partials(kind, xs)
+    else:
+        ref = F.reference_partials(kind, xs, arm)
     assert torch.equal(got.view(torch.int32), ref.view(torch.int32))
+
+
+@pytest.mark.parametrize("kind", ["sum32", "dot32"])
+def test_exact_kernel_window_and_sticky(kind, monkeypatch):
+    """Spreads beyond the 126-bit window set the sticky flag identically."""
+    monkeypatch.setenv("NEURON_LOGICAL_NC_CONFIG", "2")
+    rng = np.random.default_rng(7)
+    n = 40000
+    x = (rng.standard_normal(n) * np.exp2(rng.integers(-60, 60, n))).astype(np.float32)
+    x[::997] = 2.0**-140  # subnormal-scale terms far below the window
+    y = rng.standard_normal(n).astype(np.float32)
+    xs = [torch.from_numpy(x)] + ([torch.from_numpy(y)] if kind == "dot32" else [])
+    got = K.run_partials(kind, xs, "exact", simulate=True)
+    ref = F.reference_exact_partials(kind, xs)
+    assert torch.equal(got, ref)
+    assert F.finish_exact(ref) is None  # sticky: the host recomputes
 
 
 def test_public_api_under_the_simulator(monkeypatch):
