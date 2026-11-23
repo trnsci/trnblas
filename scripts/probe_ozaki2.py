@@ -239,6 +239,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("mode", choices=["micro", "shapes"])
     ap.add_argument("--arms", nargs="*", default=["ozaki1", "b7"])
+    ap.add_argument("--counts", nargs="*", type=int, help="override the configs' counts")
     ap.add_argument("--shapes", nargs="*", default=list(SHAPES))
     ap.add_argument("--out", default="probe_ozaki2.json")
     ap.add_argument("--budget-s", type=float, default=1080)
@@ -258,7 +259,7 @@ def main():
     recs = []
     for name in a.shapes:
         for arm in a.arms:
-            for c in CONFIGS[arm]:
+            for c in a.counts or CONFIGS[arm]:
                 if time.time() - t0 > a.budget_s:
                     print(f"budget reached, skipping {name} {arm} {c}", flush=True)
                     continue
