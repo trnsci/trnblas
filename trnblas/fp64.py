@@ -951,6 +951,109 @@ def combine_exact(parts, *, exp=None) -> torch.Tensor:
     return torch.from_numpy(np.ascontiguousarray(res))
 
 
+# ── Device fp64 construction: RN64(hi + lo) 2^E as raw bits ─────────────────
+#
+# The combine of gemm_fp64 is RN64(hi + lo) * 2^(eA_i + eB_j + off) per
+# element, today on the host (66 of 181 ms at 4096^3, trnblas#125). The bits
+# of that float64 can be built on the device from exact fp32 arithmetic and
+# bitvec ops only (`ff_to_fp64_bits` is the arithmetic, op for op):
+#   1. (s, t) = TwoSum(hi, lo): s + t = hi + lo exactly, |t| <= ulp(s) / 2.
+#   2. In units of the float64 ulp of s's binade, |s + t| = S 2^29 + v with S
+#      the 24-bit significand of s and v = t sign(s) 2^(52 - e_s) (exact:
+#      times +-1 and a power of two), |v| <= 2^28. RN64 rounds v to an integer q, ties to even (S 2^29
+#      is even, so the parity of the sum is that of q); for |v| < 2^23 by the
+#      fp32 2^23 trick, above it v is already an integer.
+#   3. If |s| is a power of two and |s + t| falls below it (v < -1/4),
+#      the result is in the binade below: v doubles and the exponent drops.
+#   4. significand = A 2^29 + B with A = S m - [q < 0] (24 bits) and
+#      B = q mod 2^29 (two's complement AND); the exponent is
+#      e_s + 1023 + E - (m - 1). hi word = sign | exponent << 20 | (A - 2^23)
+#      >> 3, lo word = ((A - 2^23) & 7) << 29 | B.
+# No integer add goes through fp32: integers are only converted when exact.
+# Elements whose result is zero are +-0; elements outside the handled range
+# (non-finite, s subnormal or below 2^-75, result exponent outside the normal
+# float64 range) are flagged for the host.
+
+
+def ff_to_fp64_bits(hi, lo, E) -> tuple[np.ndarray, np.ndarray]:
+    """float64 bits of RN64(hi + lo) 2^E from float32 hi, lo and integer E
+    (|E| < 2^24), by the device's arithmetic. Returns (uint64 bits, flag):
+    flag[i] is True where the element is outside the handled range (the bits
+    are then meaningless and the caller computes it on the host)."""
+    f = np.float32
+    h = np.ascontiguousarray(hi, dtype=f)
+    l = np.ascontiguousarray(lo, dtype=f)
+    Ef = np.broadcast_to(np.asarray(E, dtype=f), h.shape)
+    with np.errstate(all="ignore"):
+        s = h + l
+        bb = s - h
+        tt = s - bb
+        e1 = h - tt
+        e2 = l - bb
+        t = e1 + e2
+        sb = s.view(np.uint32)
+        sign = sb >> np.uint32(31)
+        Es = ((sb >> np.uint32(23)) & np.uint32(0xFF)).astype(f)
+        frac = sb & np.uint32(0x7FFFFF)
+        S = (frac | np.uint32(0x800000)).astype(f)
+        fz = (frac.astype(f) == f(0)).astype(f)
+        # v1 = t 2^(52 - e_s): scale bits (306 - Es) << 23, valid for Es in [52, 254]
+        sc1 = (np.clip(f(306) - Es, 1, 254).astype(np.uint32) << np.uint32(23)).view(f)
+        ss = f(1) - f(2) * sign.astype(f)  # +-1: work on |s + t| = |s| + t sign(s)
+        v1 = (t * ss) * sc1
+        m2 = fz * (v1 < f(-0.25)).astype(f)  # binade drop
+        mf = m2 + f(1)
+        v = v1 * mf
+        av = (v.view(np.uint32) & np.uint32(0x7FFFFFFF)).view(f)
+        r = (av + f(8388608.0)) - f(8388608.0)
+        small = (av < f(8388608.0)).astype(f)
+        neg = (v < f(0)).astype(f)
+        sg = f(1) - f(2) * neg
+        rs = r * sg
+        d = (rs - v) * small
+        q = v + d
+        qi = q.astype(np.int32)  # exact: an integer below 2^29 in magnitude
+        B = qi.view(np.uint32) & np.uint32((1 << 29) - 1)
+        borrow = (q < f(0)).astype(f)
+        A = S * mf - borrow
+        Au = (A - f(8388608.0)).astype(np.uint32)
+        E64 = Es + f(896) - m2 + Ef
+        bad = (
+            ~np.isfinite(s)
+            | ~np.isfinite(t)
+            | ((s != 0) & ((Es < 52) | (Es > 254)))
+            | ((s != 0) & ((E64 < 1) | (E64 > 2046)))
+        )
+        E64u = np.clip(E64, 0, 2047).astype(np.uint32)
+        hiw = (sign << np.uint32(31)) | (E64u << np.uint32(20)) | (Au >> np.uint32(3))
+        low = ((Au & np.uint32(7)) << np.uint32(29)) | B
+        zero = s == 0
+        hiw = np.where(zero, sign << np.uint32(31), hiw)
+        low = np.where(zero, np.uint32(0), low)
+    bits = (hiw.astype(np.uint64) << np.uint64(32)) | low.astype(np.uint64)
+    return bits, bad
+
+
+def combine_bits(hilo, eA, eB, slices: int, M: int, N: int) -> torch.Tensor:
+    """`ozaki.combine` (one launch block) through `ff_to_fp64_bits`, with the
+    flagged elements computed on the host: float64 (M, N), equal to
+    `ozaki.combine(hilo, eA, eB, slices, M, N)` bit for bit."""
+    from . import ozaki
+
+    hl = hilo.detach().to("cpu").numpy() if isinstance(hilo, torch.Tensor) else hilo
+    E = np.asarray(eA[:M], np.int64)[:, None] + ozaki.exponent_offset(slices)
+    E = E + np.asarray(eB[:N], np.int64)[None, :]
+    if np.abs(E).max(initial=0) >= 1 << 24:
+        return ozaki.combine(torch.from_numpy(hl), eA, eB, slices, M, N)
+    bits, bad = ff_to_fp64_bits(hl[0, :M, :N], hl[1, :M, :N], E)
+    out = bits.view(np.float64)
+    if bool(bad.any()):
+        i, j = np.nonzero(bad)
+        v = hl[0, i, j].astype(np.float64) + hl[1, i, j].astype(np.float64)
+        out[i, j] = np.ldexp(v, E[i, j].astype(np.int32))
+    return torch.from_numpy(np.ascontiguousarray(out))
+
+
 __all__ = [
     "FF",
     "FF_MAX",
@@ -963,11 +1066,13 @@ __all__ = [
     "as_ff",
     "axpy",
     "combine",
+    "combine_bits",
     "combine_exact",
     "dot",
     "exact_dot",
     "exact_sum",
     "fast_two_sum",
+    "ff_to_fp64_bits",
     "ff_add",
     "ff_add_fp",
     "ff_add_sloppy",

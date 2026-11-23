@@ -68,6 +68,9 @@ KERNEL_DTYPES["_fp64_probe_alu_kernel"] = frozenset({torch.float32})
 KERNEL_DTYPES["_fp64_probe_fma_kernel"] = frozenset({torch.float32})
 KERNEL_DTYPES["_fp64_probe_eft_kernel"] = frozenset({torch.float32})
 KERNEL_DTYPES["_fp64_probe_pe_kernel"] = frozenset({torch.float32})
+KERNEL_DTYPES["_fp64_ff_bits_kernel"] = frozenset({torch.float32})
+
+_FB_W = 512  # columns per tile of the fp64-bits combine
 
 
 def _fv_plan(F):
@@ -487,6 +490,156 @@ if HAS_NKI:
         return out
 
 
+if HAS_NKI:
+    # ---------------------------------------------------------------------
+    # fp64 bits of RN64(hi + lo) 2^E on the device (fp64.ff_to_fp64_bits,
+    # op for op): the gemm_fp64 combine without the host pass.
+    # ---------------------------------------------------------------------
+
+    def _fb_u(shape):
+        return nl.ndarray(shape, dtype=nl.uint32, buffer=nl.sbuf)
+
+    def _fb_ts(data, op0, operand0, shape, op1=None, operand1=None, dtype=None):
+        r = nl.ndarray(shape, dtype=dtype or nl.float32, buffer=nl.sbuf)
+        if op1 is None:
+            nisa.tensor_scalar(dst=r, data=data, op0=op0, operand0=operand0)
+        else:
+            nisa.tensor_scalar(
+                dst=r, data=data, op0=op0, operand0=operand0, op1=op1, operand1=operand1
+            )
+        return r
+
+    def _fb_cvt(src, dtype, shape):
+        r = nl.ndarray(shape, dtype=dtype, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=r, src=src)
+        return r
+
+    def _fb_tile(hilo, ea_col, eb, out, flag, r0, c0, w):
+        """Bits of one (128, w) tile into out[r0 : r0 + 128, 2 c0 : 2 (c0 + w)];
+        flag (128, 1) accumulates the tile's out-of-range maximum."""
+        sh = (128, w)
+        u32, f32 = nl.uint32, nl.float32
+        h = nl.load(hilo[0, r0 : r0 + 128, c0 : c0 + w])
+        lo = nl.load(hilo[1, r0 : r0 + 128, c0 : c0 + w])
+        ebt = _fv_t(sh)
+        nisa.dma_copy(dst=ebt, src=eb[0:1, c0 : c0 + w].broadcast(0, 128))
+        E = _fv_t(sh)
+        nisa.tensor_scalar(dst=E, data=ebt, op0=nl.add, operand0=ea_col)
+        s, t = _fv_two_sum(h, lo, sh)
+        sb = s.view(u32)
+        sign_u = _fb_ts(sb, nl.right_shift, 31, sh, dtype=u32)
+        Es = _fb_cvt(
+            _fb_ts(sb, nl.right_shift, 23, sh, op1=nl.bitwise_and, operand1=0xFF, dtype=u32),
+            f32,
+            sh,
+        )
+        frac = _fb_ts(sb, nl.bitwise_and, 0x7FFFFF, sh, dtype=u32)
+        S = _fb_cvt(_fb_ts(frac, nl.bitwise_or, 0x800000, sh, dtype=u32), f32, sh)
+        fz = _fb_ts(_fb_cvt(frac, f32, sh), nl.equal, 0.0, sh)
+        sce = _fb_ts(Es, nl.multiply, -1.0, sh, op1=nl.add, operand1=306.0)
+        scc = _fb_ts(sce, nl.maximum, 1.0, sh, op1=nl.minimum, operand1=254.0)
+        sc = _fb_ts(_fb_cvt(scc, u32, sh), nl.left_shift, 23, sh, dtype=u32).view(f32)
+        ss = _fb_ts(_fb_cvt(sign_u, f32, sh), nl.multiply, -2.0, sh, op1=nl.add, operand1=1.0)
+        v1 = _fv_op(_fv_op(t, ss, nl.multiply, sh), sc, nl.multiply, sh)
+        m2 = _fv_op(fz, _fb_ts(v1, nl.less, -0.25, sh), nl.multiply, sh)
+        mf = _fb_ts(m2, nl.add, 1.0, sh)
+        v = _fv_op(v1, mf, nl.multiply, sh)
+        av = _fb_ts(v.view(u32), nl.bitwise_and, 0x7FFFFFFF, sh, dtype=u32).view(f32)
+        r1 = _fb_ts(av, nl.add, 8388608.0, sh)  # two instructions: both round
+        r = _fb_ts(r1, nl.subtract, 8388608.0, sh)
+        small = _fb_ts(av, nl.less, 8388608.0, sh)
+        neg = _fb_ts(v, nl.less, 0.0, sh)
+        sg = _fb_ts(neg, nl.multiply, -2.0, sh, op1=nl.add, operand1=1.0)
+        rs = _fv_op(r, sg, nl.multiply, sh)
+        d = _fv_op(_fv_op(rs, v, nl.subtract, sh), small, nl.multiply, sh)
+        q = _fv_op(v, d, nl.add, sh)
+        qi = _fb_cvt(q, nl.int32, sh)
+        B = _fb_ts(qi.view(u32), nl.bitwise_and, (1 << 29) - 1, sh, dtype=u32)
+        borrow = _fb_ts(q, nl.less, 0.0, sh)
+        A = _fv_op(_fv_op(S, mf, nl.multiply, sh), borrow, nl.subtract, sh)
+        Au = _fb_cvt(_fb_ts(A, nl.subtract, 8388608.0, sh), u32, sh)
+        nz = _fb_ts(s, nl.not_equal, 0.0, sh)
+        E64 = _fv_op(_fv_op(_fb_ts(Es, nl.add, 896.0, sh), m2, nl.subtract, sh), E, nl.add, sh)
+        # out of range: s or t non-finite; s != 0 with Es < 52 or E64 outside [1, 2046]
+        tE = _fb_cvt(
+            _fb_ts(
+                t.view(u32), nl.right_shift, 23, sh, op1=nl.bitwise_and, operand1=0xFF, dtype=u32
+            ),
+            f32,
+            sh,
+        )
+        b1 = _fv_op(_fb_ts(Es, nl.less, 52.0, sh), _fb_ts(E64, nl.less, 1.0, sh), nl.maximum, sh)
+        b2 = _fv_op(b1, _fb_ts(E64, nl.greater, 2046.0, sh), nl.maximum, sh)
+        b3 = _fv_op(b2, nz, nl.multiply, sh)
+        b4 = _fv_op(b3, _fb_ts(Es, nl.equal, 255.0, sh), nl.maximum, sh)
+        bad = _fv_op(b4, _fb_ts(tE, nl.equal, 255.0, sh), nl.maximum, sh)
+        bm = _fv_t((128, 1))
+        nisa.tensor_reduce(dst=bm, op=nl.maximum, data=bad, axis=1, keepdims=True)
+        nisa.tensor_tensor(dst=flag, data1=flag, data2=bm, op=nl.maximum)
+        E64z = _fv_op(E64, nz, nl.multiply, sh)
+        E64c = _fb_ts(E64z, nl.maximum, 0.0, sh, op1=nl.minimum, operand1=2047.0)
+        Eu = _fb_ts(_fb_cvt(E64c, u32, sh), nl.left_shift, 20, sh, dtype=u32)
+        hw = _fb_ts(sign_u, nl.left_shift, 31, sh, dtype=u32)
+        nisa.tensor_tensor(dst=hw, data1=hw, data2=Eu, op=nl.bitwise_or)
+        a3 = _fb_ts(Au, nl.right_shift, 3, sh, dtype=u32)
+        nisa.tensor_tensor(dst=hw, data1=hw, data2=a3, op=nl.bitwise_or)
+        lw = _fb_ts(Au, nl.bitwise_and, 7, sh, op1=nl.left_shift, operand1=29, dtype=u32)
+        nisa.tensor_tensor(dst=lw, data1=lw, data2=B, op=nl.bitwise_or)
+        T = _fb_u((128, 2 * w))
+        nisa.tensor_copy(dst=T[:, 0 : 2 * w : 2], src=lw)
+        nisa.tensor_copy(dst=T[:, 1 : 2 * w : 2], src=hw)
+        nl.store(out[r0 : r0 + 128, 2 * c0 : 2 * (c0 + w)], value=T.view(nl.int32))
+
+    def _fb_rows(hilo, ea, eb, out, b):
+        """Row tile b (rows 128 b ..): all column tiles, then the tile's flags
+        into out[R : R + 128, b]."""
+        R = hilo.shape[1]
+        N = hilo.shape[2]
+        r0 = b * 128
+        CF = N // _FB_W
+        tail = N - CF * _FB_W
+        ea_col = nl.load(ea[r0 : r0 + 128, 0:1])
+        flag = _fv_t((128, 1))
+        nisa.memset(dst=flag, value=0.0)
+        if CF:
+            for c in nl.sequential_range(CF):
+                _fb_tile(hilo, ea_col, eb, out, flag, r0, c * _FB_W, _FB_W)
+        if tail:
+            _fb_tile(hilo, ea_col, eb, out, flag, r0, CF * _FB_W, tail)
+        fi = nl.ndarray((128, 1), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=fi, src=flag)
+        nl.store(out[R : R + 128, b : b + 1], value=fi)
+
+    @nki.jit
+    def _fp64_ff_bits_kernel(hilo, ea, eb):
+        """float64 bits of RN64(hi + lo) 2^(ea_i + eb_j) (`fp64.ff_to_fp64_bits`):
+        `hilo` (2, R, N) float32 (the Ozaki kernel's output, R a multiple of
+        128, R / 128 <= 2 N), `ea` (R, 1) and `eb` (1, N) float32 integer
+        exponents. Returns (R + 128, 2 N) int32: rows 0 .. R - 1 are the
+        little-endian words of the R x N float64 results (a plain view on the
+        host), and out[R + p, b] flags row 128 b + p (1: an element of it is
+        out of the handled range; take the host combine). Elementwise, so any
+        LNC split gives the same bits; at LNC=2 the programs take halves of
+        the row tiles (an odd middle tile is computed by both, identically)."""
+        R = hilo.shape[1]
+        N = hilo.shape[2]
+        out = nl.ndarray((R + 128, 2 * N), dtype=nl.int32, buffer=nl.shared_hbm)
+        RT = R // 128
+        z = nl.ndarray((128, 2 * N), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.memset(dst=z, value=0)
+        nl.store(out[R : R + 128, 0 : 2 * N], value=z)
+        n_prog = nl.num_programs() if nl.program_ndim() > 0 else 1
+        per = (RT + n_prog - 1) // n_prog
+        if n_prog > 1:
+            b0 = nl.program_id(0) * (RT - per)
+            for i in nl.affine_range(per):
+                _fb_rows(hilo, ea, eb, out, b0 + i)
+        else:
+            for i in nl.affine_range(RT):
+                _fb_rows(hilo, ea, eb, out, i)
+        return out
+
+
 # ── Launching ────────────────────────────────────────────────────────────────
 
 
@@ -549,3 +702,45 @@ def run_partials(kind: str, xs, accumulate: str, simulate: bool = False) -> torc
 def lnc() -> int:
     """The LNC setting a kernel launch will see (NEURON_LOGICAL_NC_CONFIG)."""
     return int(os.environ.get("NEURON_LOGICAL_NC_CONFIG", "2"))
+
+
+def combine_bits_device(
+    hilo: torch.Tensor, eA, eB, slices: int, M: int, N: int, simulate=False, out=None
+):
+    """`ozaki.combine` of one launch block, with the RN64 and the scaling on
+    the device (`_fp64_ff_bits_kernel`): float64 (M, N) on the host, equal to
+    `ozaki.combine(hilo, eA, eB, slices, M, N)` bit for bit (flagged rows are
+    recomputed on the host). `hilo` (2, Rp, >= N) float32, Rp a multiple of
+    128, on the device (on the host under `simulate`). `out`: optional host
+    int32 (Rp + 128, 2 N) buffer to download into (pinned, reused)."""
+    from .. import ozaki
+
+    Rp = hilo.shape[1]
+    off = ozaki.exponent_offset(slices)
+    E_a = np.asarray(eA[:M], np.int64) + off
+    E_b = np.asarray(eB[:N], np.int64)
+    big = max(np.abs(E_a).max(initial=0), np.abs(E_b).max(initial=0)) >= 1 << 22
+    if big or Rp % 128 or Rp // 128 > 2 * N:
+        return ozaki.combine(hilo.to("cpu"), eA, eB, slices, M, N)
+    hl = hilo if hilo.shape[2] == N else hilo[:, :, :N]
+    hl = hl.contiguous()
+    ea = np.zeros((Rp, 1), np.float32)
+    ea[:M, 0] = E_a
+    eb = E_b.astype(np.float32)[None, :]
+    dev = hl.device
+    res = call(
+        "_fp64_ff_bits_kernel",
+        hl,
+        torch.from_numpy(ea).to(dev),
+        torch.from_numpy(np.ascontiguousarray(eb)).to(dev),
+        simulate=simulate,
+    )
+    host = res.to("cpu") if out is None else out.copy_(res)
+    o = host.numpy()
+    C = o[:Rp].view(np.float64)[:M]  # a view: no copy
+    flags = o[Rp : Rp + 128, : Rp // 128].T.reshape(-1)[:M]
+    bad = np.nonzero(flags)[0]
+    if len(bad):
+        sub = hilo.to("cpu")[:, torch.from_numpy(bad)]
+        C[bad] = ozaki.combine(sub, np.asarray(eA)[bad], eB, slices, len(bad), N).numpy()
+    return torch.from_numpy(C)

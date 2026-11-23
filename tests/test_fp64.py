@@ -434,3 +434,61 @@ def test_e0_probe_detects_a_bad_engine():
     assert res[("vector", "subtract is IEEE RN", "ties_add")] == "PASS"
     row = "vector scalar_tensor_tensor (mul (P,1), add tensor)"
     assert res[(row, "fused multiply-add?", "cancel")].startswith("fused")
+
+
+# ── fp64 bits on the device (combine) ────────────────────────────────────────
+
+
+def _adversarial_hilo(n, rng):
+    h = (rng.standard_normal(n) * np.exp2(rng.integers(-60, 60, n))).astype(np.float32)
+    l = h.astype(np.float64) * rng.standard_normal(n) * np.exp2(rng.integers(-60, 0, n))
+    l = l.astype(np.float32)
+    k = n // 10
+    # powers of two with lo of either sign (the binade drop), at and near ties
+    h[:k] = np.exp2(rng.integers(-30, 30, k)).astype(np.float32) * rng.choice([-1, 1], k)
+    f = np.array([1, 1.5, 0.5, 3, 0.75])[rng.integers(0, 5, k)]
+    l[:k] = (
+        -h[:k].astype(np.float64) * rng.choice([-1, 1], k) * np.exp2(-rng.integers(24, 60, k)) * f
+    ).astype(np.float32)
+    f = np.array([1, 1.5, 0.5, 3])[rng.integers(0, 4, k)]
+    l[k : 2 * k] = (
+        h[k : 2 * k].astype(np.float64)
+        * np.exp2(-rng.integers(24, 32, k))
+        * rng.choice([-1, 1], k)
+        * f
+    ).astype(np.float32)
+    h[2 * k : 2 * k + 100] = 0
+    l[2 * k : 2 * k + 50] = 0
+    h[2 * k + 100 : 2 * k + 200] = -0.0
+    l[2 * k + 100 : 2 * k + 150] = -0.0
+    return h, l
+
+
+def test_ff_to_fp64_bits_is_rn64_of_the_sum():
+    rng = np.random.default_rng(11)
+    h, l = _adversarial_hilo(1_000_000, rng)
+    E = rng.integers(-900, 900, h.size)
+    bits, bad = F.ff_to_fp64_bits(h, l, E)
+    with np.errstate(all="ignore"):
+        ref = np.ldexp(h.astype(np.float64) + l.astype(np.float64), E)
+    assert np.array_equal(bits[~bad], ref[~bad].view(np.uint64))
+    # flagged: only |hi + lo| < 2^-75 or results that leave the normal float64 range
+    s = np.abs(h[bad].astype(np.float64) + l[bad])
+    out = ~np.isfinite(ref[bad]) | (np.abs(ref[bad]) < 2.0**-1021)
+    assert ((s < 2.0**-75) & (s > 0) | out).all()
+
+
+def test_ff_to_fp64_bits_flags():
+    h = np.array([np.inf, np.nan, 2.0**-80, 1.0, 1.0, 0.0], np.float32)
+    l = np.zeros(6, np.float32)
+    E = np.array([0, 0, 0, 1100, -1100, 5000])
+    _bits, bad = F.ff_to_fp64_bits(h, l, E)
+    assert bad.tolist() == [True, True, True, True, True, False]
+
+
+def test_combine_bits_equals_ozaki_combine():
+    A, B, parts, exp, da, db, k = _ozaki_parts(M=200, K=640, N=130, kb=1)
+    M, N = A.shape[0], B.shape[1]
+    got = F.combine_bits(parts[0], da.e, db.e, k, M, N)
+    ref = ozaki.combine(parts[0], da.e, db.e, k, M, N)
+    assert torch.equal(got.view(torch.int64), ref.view(torch.int64))

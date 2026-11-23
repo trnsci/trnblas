@@ -94,8 +94,20 @@ def fp64_probe_pe(at: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return _k.kernel("_fp64_probe_pe_kernel")(at, b)
 
 
+@nki_op(
+    "trnblas::fp64_ff_bits",
+    mutates_args={},
+    fake_fn=lambda hilo, ea, eb: hilo.new_empty(
+        (hilo.shape[1] + 128, 2 * hilo.shape[2]), dtype=torch.int32
+    ),
+)
+def fp64_ff_bits(hilo: torch.Tensor, ea: torch.Tensor, eb: torch.Tensor) -> torch.Tensor:
+    return _k.kernel("_fp64_ff_bits_kernel")(hilo, ea, eb)
+
+
 OPS.update(
     {
+        "_fp64_ff_bits_kernel": fp64_ff_bits,
         "_fp64_probe_alu_kernel": fp64_probe_alu,
         "_fp64_probe_fma_kernel": fp64_probe_fma,
         "_fp64_probe_eft_kernel": fp64_probe_eft,

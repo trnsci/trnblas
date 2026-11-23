@@ -2,7 +2,7 @@
 
 Native TorchNeuron path only. Every test writes its JSON report into
 TRNBLAS_FP64_PROBE_DIR (default: the pytest tmp dir) as e0.json,
-e2_<n>.json, lnc<L>.json. Run E0 first: the other results assume what it
+e2_<n>.json, e3.json, lnc<L>.json. Run E0 first: the other results assume what it
 checks (fp32 add / subtract / multiply round to nearest even on VectorE,
 TwoSum and Dekker TwoProd exact). Each test runs in well under 20 minutes
 on one logical core (the E2 runs stop starting new kernels after
@@ -140,3 +140,15 @@ def test_lnc_digests(outdir):
     if other.exists():
         o = json.loads(other.read_text())
         assert o["digests"] == rep["digests"]
+
+
+def test_e3_combine_on_device(outdir):
+    """E3: the gemm_fp64 combine with the fp64 bits built on the device is
+    bitwise equal to `ozaki.combine`, with its time against today's
+    download + host combine, per launch-block shape."""
+    rep = Q.e3()
+    _dump(outdir, "e3.json", rep)
+    print("\n" + Q.format_e3(rep))
+    assert rep["seconds"] < 1200
+    for k, r in rep["shapes"].items():
+        assert r["bitwise_equal_ozaki_combine"], k

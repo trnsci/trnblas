@@ -58,6 +58,12 @@ _PROBE_ARGS = {
         np.ones((Q.PE_K, 128), np.float32),
         np.ones((Q.PE_K, 512), np.float32),
     ],
+    # fp64-bits combine: column tiles plus a tail, an odd row-tile count
+    "_fp64_ff_bits_kernel": lambda: [
+        np.ones((2, 384, 1100), np.float32),
+        np.zeros((384, 1), np.float32),
+        np.zeros((1, 1100), np.float32),
+    ],
 }
 
 
@@ -75,7 +81,7 @@ def test_every_fp64_kernel_is_covered():
         for name, obj in vars(K).items()
         if name.endswith("_kernel") and type(obj).__module__.startswith("nki")
     }
-    covered = set(K.REDUCE_KERNELS.values()) | set(_PROBE_ARGS)
+    covered = set(K.REDUCE_KERNELS.values()) | set(_PROBE_ARGS)  # incl. the ff_bits kernel
     assert kernels == covered
     assert set(K.KERNEL_DTYPES) == covered
 
@@ -135,3 +141,33 @@ def test_e0_probe_runs_in_the_simulator(monkeypatch):
     # The simulator evaluates numpy fp32 op by op: no fusion anywhere.
     for row in Q.FMA_ROWS:
         assert res[(row, "fused multiply-add?", "cancel")] == "two roundings (no FMA)"
+
+
+def _ozaki_like(R, N, rng):
+    h = (rng.standard_normal((R, N)) * np.exp2(rng.integers(0, 40, (R, N)))).astype(np.float32)
+    l = h.astype(np.float64) * rng.standard_normal((R, N)) * np.exp2(-rng.integers(20, 50, (R, N)))
+    l = l.astype(np.float32)
+    h[:20] = np.exp2(rng.integers(0, 30, (20, N))).astype(np.float32)  # powers of two,
+    l[:20] = (-h[:20] * np.exp2(-rng.integers(24, 40, (20, N)))).astype(np.float32)  # below
+    h[30, :2] = 0
+    l[30, :1] = 0
+    h[31, 0] = np.inf
+    return torch.from_numpy(np.stack([h, l]))
+
+
+@pytest.mark.parametrize("lnc", ["1", "2"])
+@pytest.mark.parametrize("shape", [(256, 700, 250), (384, 241, 300), (128, 3, 128)])
+def test_ff_bits_kernel_equals_ozaki_combine(shape, lnc, monkeypatch):
+    from trnblas import ozaki
+
+    monkeypatch.setenv("NEURON_LOGICAL_NC_CONFIG", lnc)
+    R, N, M = shape
+    rng = np.random.default_rng(R + N)
+    hilo = _ozaki_like(R, N, rng)
+    eA = rng.integers(-300, 300, R)
+    eB = rng.integers(-300, 300, N)
+    eA[5], eA[6] = 1000, -1000  # rows leaving the float64 range: flagged, host
+    with np.errstate(all="ignore"):
+        got = K.combine_bits_device(hilo, eA, eB, 8, M, N, simulate=True)
+        ref = ozaki.combine(hilo, eA, eB, 8, M, N)
+    assert torch.equal(got.view(torch.int64), ref.view(torch.int64))

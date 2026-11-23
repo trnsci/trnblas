@@ -719,3 +719,111 @@ def lnc_digests(ns=(100003, 1000000), device: str = "neuron") -> dict:
                 torch.equal(parts.view(torch.int32), ref.view(torch.int32))
             )
     return out
+
+
+# ── E3: the gemm_fp64 combine on the device ──────────────────────────────────
+
+# (rows, cols) of one Ozaki launch block's (hi, lo) output: a 4096^3 and a
+# 2048^3 product, and the DF-MP2 shapes as they launch (C^T for narrow N).
+E3_SHAPES = [(4096, 4096), (2048, 2048), (256, 3267), (256, 8192)]
+
+
+def ozaki_like_hilo(R: int, N: int, seed: int = 0):
+    """Synthetic (hi, lo) like the Ozaki kernel's: hi integer-valued group
+    sums scaled by powers of two (>= 1), lo their TwoSum error terms."""
+    rng = np.random.default_rng(seed)
+    hi = np.ldexp(np.round(rng.standard_normal((R, N)) * 2.0**30), rng.integers(0, 40, (R, N)))
+    hi = hi.astype(np.float32)
+    lo = hi.astype(np.float64) * rng.standard_normal((R, N)) * 2.0**-26
+    lo = np.round(lo).astype(np.float32)
+    return np.stack([hi, lo])
+
+
+def e3(shapes=None, *, device: str = "neuron", reps: int = 10, budget_s: float = 1080.0) -> dict:
+    """E3: `fp64_kernels.combine_bits_device` (the fp64 bits built on the
+    device, then downloaded into a reused pinned buffer) against today's
+    route (download the (hi, lo) pair, `ozaki.combine` on the host), per
+    launch-block shape: ms, and bitwise equality."""
+    import torch
+
+    from .. import ozaki
+    from . import fp64_kernels as K
+
+    t_start = time.time()
+    sim = device != "neuron"
+    if not sim:
+        from . import dispatch as D
+
+        sync = D._device_synchronize
+
+        def download(t):
+            return D._to_host(t, "cpu")
+
+        def empty(shape):
+            return D._host_empty(shape, torch.int32, "cpu")
+    else:
+
+        def sync():
+            return None
+
+        def download(t):
+            return t.to("cpu")
+
+        def empty(shape):
+            return torch.empty(shape, dtype=torch.int32)
+
+    rep = {"device": device, "host_threads": torch.get_num_threads(), "shapes": {}}
+    for R, N in shapes or E3_SHAPES:
+        if time.time() - t_start > budget_s:
+            rep["truncated"] = True
+            break
+        rng = np.random.default_rng(R + N)
+        hilo = torch.from_numpy(ozaki_like_hilo(R, N, seed=R * N))
+        eA = rng.integers(-60, 60, R)
+        eB = rng.integers(-60, 60, N)
+        Hd = hilo.to(device) if not sim else hilo
+        buf = empty((R + 128, 2 * N))
+        t0 = time.perf_counter()
+        got = K.combine_bits_device(Hd, eA, eB, 8, R, N, simulate=sim, out=buf)
+        first = time.perf_counter() - t0
+        ref = ozaki.combine(download(Hd), eA, eB, 8, R, N)
+        eq = bool(torch.equal(got.view(torch.int64), ref.view(torch.int64)))
+        t_dev = _timeit(
+            lambda Hd=Hd, eA=eA, eB=eB, R=R, N=N, buf=buf: K.combine_bits_device(
+                Hd, eA, eB, 8, R, N, simulate=sim, out=buf
+            ),
+            reps,
+            sync,
+        )
+        t_host = _timeit(
+            lambda Hd=Hd, eA=eA, eB=eB, R=R, N=N: ozaki.combine(download(Hd), eA, eB, 8, R, N),
+            reps,
+            sync,
+        )
+        t_dl = _timeit(lambda Hd=Hd: download(Hd), reps, sync)
+        rep["shapes"][f"{R}x{N}"] = {
+            "bitwise_equal_ozaki_combine": eq,
+            "first_call_s": first,
+            "device_route_ms": t_dev * 1e3,
+            "host_route_ms": t_host * 1e3,
+            "hilo_download_ms": t_dl * 1e3,
+            "speedup": t_host / t_dev if t_dev else None,
+        }
+    rep["seconds"] = time.time() - t_start
+    return rep
+
+
+def format_e3(rep: dict) -> str:
+    lines = [
+        f"E3: gemm_fp64 combine ({rep['device']}, {rep['host_threads']} host threads)",
+        "| block (rows x cols) | device route ms | host route ms (download + combine) | "
+        "download ms | speedup | bitwise | first call s |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for k, r in rep["shapes"].items():
+        lines.append(
+            f"| {k} | {r['device_route_ms']:.2f} | {r['host_route_ms']:.2f} | "
+            f"{r['hilo_download_ms']:.2f} | {r['speedup']:.2f} | "
+            f"{r['bitwise_equal_ozaki_combine']} | {r['first_call_s']:.1f} |"
+        )
+    return "\n".join(lines)
