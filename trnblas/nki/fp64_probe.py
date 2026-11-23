@@ -421,3 +421,301 @@ def ideal_run(name: str, *arrays: np.ndarray) -> np.ndarray:
             seq, tiles = _pe_sequential(at, b, slice(0, b.shape[1]))
             return np.stack([seq, tiles])
     raise KeyError(name)
+
+
+# ── Device runner ────────────────────────────────────────────────────────────
+
+
+def device_run(name: str, *arrays: np.ndarray) -> np.ndarray:
+    """Launch probe kernel `name` on the neuron device; host numpy result."""
+    import torch
+
+    from . import fp64_kernels as K
+
+    ts = [torch.from_numpy(np.ascontiguousarray(a)).to("neuron") for a in arrays]
+    return K.call(name, *ts).to("cpu").numpy()
+
+
+# ── E2: accuracy and throughput of the arms ──────────────────────────────────
+
+E2_KERNELS = [
+    ("dot32", "plain"),
+    ("dot32", "comp"),
+    ("dot32", "sloppy"),
+    ("dot32", "accurate"),
+    ("sum32", "plain"),
+    ("sum32", "comp"),
+    ("sum32", "sloppy"),
+    ("sum32", "accurate"),
+    ("nrm32", "accurate"),
+    ("dotff", "sloppy"),
+    ("dotff", "accurate"),
+    ("sumff", "accurate"),
+    ("nrmff", "accurate"),
+]
+
+
+def e2_vectors(n: int, seed: int = 0):
+    """CG-like float64 vectors (residual r and A p of a shifted 1-D Poisson
+    CG after 8 iterations): smooth plus rough parts, several decades."""
+    rng = np.random.default_rng(seed)
+    b = rng.standard_normal(n)
+    r = b.copy()
+    p = r.copy()
+    rr = float(r @ r)
+
+    def A(v):
+        w = 2.001 * v
+        w[1:] -= v[:-1]
+        w[:-1] -= v[1:]
+        return w
+
+    for _ in range(8):
+        Ap = A(p)
+        alpha = rr / float(p @ Ap)
+        r = r - alpha * Ap
+        rr2 = float(r @ r)
+        p = r + (rr2 / rr) * p
+        rr = rr2
+    return r, A(p)
+
+
+def _bits(r: float, ref: float) -> float:
+    if ref == 0:
+        return 53.0 if r == 0 else 0.0
+    if not np.isfinite(r):
+        return 0.0
+    rel = abs(r - ref) / abs(ref)
+    return 53.0 if rel == 0 else float(max(0.0, min(53.0, -np.log2(rel))))
+
+
+def _exact_ref(kind: str, xs64: list) -> float:
+    """Exactly rounded fp64 value of the reduction of the (fp64) operands."""
+    import math
+
+    if kind.startswith("sum"):
+        return math.fsum(xs64[0].tolist())
+    if kind.startswith("nrm"):
+        x = xs64[0]
+        m = float(np.abs(x).max())
+        s = 2.0 ** np.frexp(m)[1] if m else 1.0
+        xs = x / s  # a power of two: exact
+        p = xs * xs
+        c = 134217729.0 * xs
+        h = c - (c - xs)
+        lo = xs - h
+        e = lo * lo - (((p - h * h) - lo * h) - h * lo)
+        return s * math.sqrt(math.fsum(np.concatenate([p, e]).tolist()))
+    x, y = xs64
+    p = x * y
+    c = 134217729.0 * x
+    xh = c - (c - x)
+    xl = x - xh
+    c = 134217729.0 * y
+    yh = c - (c - y)
+    yl = y - yh
+    e = xl * yl - (((p - xh * yh) - xl * yh) - xh * yl)
+    return math.fsum(np.concatenate([p, e]).tolist())
+
+
+def _timeit(fn, reps: int, sync) -> float:
+    ts = []
+    for _ in range(reps):
+        sync()
+        t = time.perf_counter()
+        fn()
+        sync()
+        ts.append(time.perf_counter() - t)
+    return float(np.median(ts))
+
+
+def e2(
+    n: int,
+    *,
+    device: str = "neuron",
+    reps: int = 20,
+    kernels=None,
+    budget_s: float = 1080.0,
+    check_reference: bool = True,
+) -> dict:
+    """E2 at length n: for each (kind, arm) kernel, correct bits against the
+    exactly rounded reference, bitwise equality with the CPU reference, the
+    first-call (compile) time and the warm time per element, end to end
+    (layout + kernel + partials download + host finish) and kernel only;
+    plus the host fp64 round trip each replaces (device -> host copy of the
+    fp32 operands and numpy float64). Stops starting new kernels after
+    `budget_s` seconds (partial report, `truncated`). `device="cpu"` runs the
+    pytorch reference as the "device" (for tests)."""
+    import torch
+
+    from .. import fp64
+    from . import fp64_kernels as K
+
+    t_start = time.time()
+    if device == "neuron":
+        from . import dispatch as D
+
+        sync = D._device_synchronize
+    else:
+
+        def sync():
+            return None
+
+    r64, ap64 = e2_vectors(n)
+    r32, ap32 = r64.astype(np.float32), ap64.astype(np.float32)
+    X = torch.from_numpy(r32).to(device)
+    Y = torch.from_numpy(ap32).to(device)
+    fr, fa = fp64.from_fp64(torch.from_numpy(r64)), fp64.from_fp64(torch.from_numpy(ap64))
+    XH, XL = fr.hi.to(device), fr.lo.to(device)
+    YH, YL = fa.hi.to(device), fa.lo.to(device)
+    rep = {"n": n, "device": device, "plan": list(fp64.plan(n)), "kernels": {}, "host_fp64": {}}
+    rd = r32.astype(np.float64)
+    ad = ap32.astype(np.float64)
+
+    def host_dot():
+        x = X.to("cpu").numpy().astype(np.float64)
+        y = Y.to("cpu").numpy().astype(np.float64)
+        return float(np.dot(x, y))
+
+    def host_sum():
+        return float(np.sum(X.to("cpu").numpy().astype(np.float64)))
+
+    def host_nrm():
+        return float(np.linalg.norm(X.to("cpu").numpy().astype(np.float64)))
+
+    for name, fn, ref in (
+        ("dot", host_dot, _exact_ref("dot", [rd, ad])),
+        ("sum", host_sum, _exact_ref("sum", [rd])),
+        ("nrm2", host_nrm, _exact_ref("nrm", [rd])),
+    ):
+        t = _timeit(fn, reps, sync)
+        rep["host_fp64"][name] = {
+            "ms": t * 1e3,
+            "ns_per_elem": t / n * 1e9,
+            "bits": _bits(fn(), ref),
+        }
+    refs = {
+        "dot32": _exact_ref("dot", [rd, ad]),
+        "sum32": _exact_ref("sum", [rd]),
+        "nrm32": _exact_ref("nrm", [rd]),
+        "dotff": _exact_ref("dot", [r64, ap64]),
+        "sumff": _exact_ref("sum", [r64]),
+        "nrmff": _exact_ref("nrm", [r64]),
+    }
+    ops = {
+        "dot32": [X, Y],
+        "sum32": [X],
+        "nrm32": [X],
+        "dotff": [XH, XL, YH, YL],
+        "sumff": [XH, XL],
+        "nrmff": [XH, XL],
+    }
+    pl = fp64.plan(n)
+    for kind, arm in kernels or E2_KERNELS:
+        if time.time() - t_start > budget_s:
+            rep["truncated"] = True
+            break
+        xs = ops[kind]
+        key = f"{kind}/{arm}"
+        sim = device != "neuron"
+
+        def run(xs=xs, kind=kind, arm=arm, sim=sim):
+            if sim:
+                return fp64.reference_partials(kind, xs, arm)
+            return K.run_partials(kind, xs, arm)
+
+        t0 = time.perf_counter()
+        parts = run()
+        first = time.perf_counter() - t0
+        val = fp64.finish_host(parts, kind)
+        e2e = _timeit(lambda run=run, kind=kind: fp64.finish_host(run(), kind), reps, sync)
+        rows = [fp64.layout(t, pl).contiguous() for t in xs]
+        if sim:
+            kern = e2e
+            lay = 0.0
+        else:
+            name = K.REDUCE_KERNELS[(kind, arm)]
+            kern = _timeit(lambda name=name, rows=rows: K.call(name, *rows), reps, sync)
+            lay = _timeit(lambda xs=xs: [fp64.layout(t, pl) for t in xs], reps, sync)
+        row = {
+            "bits": _bits(val, refs[kind]),
+            "value": val,
+            "first_call_s": first,
+            "e2e_ms": e2e * 1e3,
+            "e2e_ns_per_elem": e2e / n * 1e9,
+            "kernel_ms": kern * 1e3,
+            "kernel_ns_per_elem": kern / n * 1e9,
+            "layout_ms": lay * 1e3,
+        }
+        if check_reference:
+            ref = fp64.reference_partials(kind, [t.to("cpu") for t in xs], arm)
+            row["bitwise_vs_cpu_reference"] = bool(
+                torch.equal(parts.view(torch.int32), ref.view(torch.int32))
+            )
+        rep["kernels"][key] = row
+    rep["seconds"] = time.time() - t_start
+    return rep
+
+
+def format_e2(rep: dict) -> str:
+    n = rep["n"]
+    lines = [
+        f"E2 at n = {n} ({rep['device']}, plan {rep['plan']})",
+        "| arm | bits | e2e ns/elem | kernel ns/elem | first call s | bitwise vs CPU ref |",
+        "|---|---|---|---|---|---|",
+    ]
+    for k, r in rep["kernels"].items():
+        lines.append(
+            f"| {k} | {r['bits']:.1f} | {r['e2e_ns_per_elem']:.3f} | "
+            f"{r['kernel_ns_per_elem']:.3f} | {r['first_call_s']:.1f} | "
+            f"{r.get('bitwise_vs_cpu_reference', '')} |"
+        )
+    for k, r in rep["host_fp64"].items():
+        lines.append(
+            f"| host fp64 round trip {k} | {r['bits']:.1f} | {r['ns_per_elem']:.3f} | | | |"
+        )
+    return "\n".join(lines)
+
+
+# ── LNC digests ──────────────────────────────────────────────────────────────
+
+
+def lnc_digests(ns=(100003, 1000000), device: str = "neuron") -> dict:
+    """SHA-256 of every reduction kernel's partials for fixed inputs, and
+    whether they equal the CPU reference. Run once at LNC=2 and once at LNC=1
+    (NEURON_LOGICAL_NC_CONFIG=1, whole chip): the digests must agree."""
+    import hashlib
+    import os
+
+    import torch
+
+    from .. import fp64
+    from . import fp64_kernels as K
+
+    out = {"lnc": os.environ.get("NEURON_LOGICAL_NC_CONFIG", "2"), "digests": {}, "equal_ref": {}}
+    for n in ns:
+        r64, ap64 = e2_vectors(n, seed=1)
+        x = torch.from_numpy(r64.astype(np.float32))
+        y = torch.from_numpy(ap64.astype(np.float32))
+        fr, fa = fp64.from_fp64(torch.from_numpy(r64)), fp64.from_fp64(torch.from_numpy(ap64))
+        ops = {
+            "dot32": [x, y],
+            "sum32": [x],
+            "nrm32": [x],
+            "dotff": [fr.hi, fr.lo, fa.hi, fa.lo],
+            "sumff": [fr.hi, fr.lo],
+            "nrmff": [fr.hi, fr.lo],
+        }
+        for (kind, arm), _name in sorted(K.REDUCE_KERNELS.items()):
+            xs = ops[kind]
+            if device == "neuron":
+                parts = K.run_partials(kind, [t.to("neuron") for t in xs], arm)
+            else:
+                parts = fp64.reference_partials(kind, xs, arm)
+            key = f"{kind}/{arm}/n={n}"
+            out["digests"][key] = hashlib.sha256(parts.numpy().tobytes()).hexdigest()
+            ref = fp64.reference_partials(kind, xs, arm)
+            out["equal_ref"][key] = bool(
+                torch.equal(parts.view(torch.int32), ref.view(torch.int32))
+            )
+    return out

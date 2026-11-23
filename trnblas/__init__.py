@@ -11,6 +11,9 @@ Cholesky-based density fitting, and general scientific linear algebra.
 
 __version__ = "0.13.0"
 
+# fp64-class vector arithmetic (float-float and exact integer paths)
+from . import fp64
+
 # Level 1 — Vector operations
 from .level1 import asum, axpy, dot, iamax, nrm2, scal
 
@@ -53,6 +56,8 @@ __all__ = [
     "trsm",
     "trmm",
     "metric_inv_half",
+    # fp64-class vector arithmetic
+    "fp64",
     # Backend
     "HAS_NKI",
     "set_backend",

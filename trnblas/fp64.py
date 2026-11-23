@@ -59,6 +59,26 @@ Range and precision limits of float-float (all from the fp32 format):
   by a power of two first, so it has no such limit.
 * Non-finite inputs give a nan result (inf - inf in the error terms): the
   policy is "inf or nan in, nan out" for every reduction.
+
+Accumulation arms (`ARMS`, for measurement): "plain" fp32, "comp" (Sum2 /
+Dot2 of Ogita, Rump and Oishi: TwoSum compensation, i.e. branch-free
+Neumaier), "sloppy" (SloppyDWPlusDW; Stloukal and Jezequel, arXiv:2611.08371,
+report that sloppy double-word addition suffices for their workload) and
+"accurate" (AccurateDWPlusDW, the default).
+
+Which to use (CPU accuracy table on trnsci/trnsci#169): double-word gives
+48-52 correct bits on well-conditioned reductions (CG r.r and p.Ap, norms,
+DFT grid quadratures, same-sign energy sums), where plain fp32 gives 20-30;
+its error grows like 2^-48 cond, about 5 bits worse than an fp64 sum, so for
+ill-conditioned dots (cond >~ 1e8) and for the gemm_fp64 combine use the
+exact path. The integer path is exact at any condition number; its cost is
+the number of limbs, set by the exponent spread of the data.
+
+Extension path: triple-word fp32 (~72 bits) with the branch-free multi-word
+algorithms of arXiv:2607.11391 would cover the gap between double-word and
+the exact path (cancelling energy sums, cond up to ~2^20) at about twice the
+double-word cost; the layout, arms and kernels here take it as a fourth
+accumulation arm. Not implemented in step 1.
 """
 
 from __future__ import annotations
