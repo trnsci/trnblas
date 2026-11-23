@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`gemm_fp64(..., scheme="ozaki2")`: an Ozaki scheme II prototype** (#132;
+  Ozaki, Uchino and Imamura, arXiv:2504.08009). Integer scaling by the
+  Cauchy–Schwarz bound, balanced residues modulo `moduli` (default 17)
+  coprime odd moduli below 2^7, one bf16 GEMM per modulus in a single launch
+  with a 4-instruction VectorE modular reduction at each 4096-term PSUM group
+  close (`_ozaki2_gemm_b7_kernel`; b8 and b9 variants with 1024- and 256-term
+  groups for measurement), and the CRT on the device in exact fp32 integer
+  ops (`_ozaki2_crt_*_kernel`). The CPU analysis puts about 53 bits at 17
+  GEMMs, against 36 for Ozaki I at k = 8. Bitwise against the host reference
+  `trnblas.ozaki2.reference_gemm`, LNC-invariant by construction, verified
+  in MLIR at trn2 LNC=1 and LNC=2 and in `nki.simulate` at both. The
+  operands are scaled on the host for now. `scheme="ozaki1"` stays the
+  default and is unchanged. Device measurement is pending.
+- `scripts/ozaki2_analysis.py` (CPU accuracy and cost analysis of both
+  schemes, bf16 and FP8 residue arms, by bits delivered) and
+  `scripts/probe_ozaki2.py` (device probe, JSON).
+
 ### Tests
 
 - **Device conformance runs are signal-only** (trnsci/trnsci#35; test code

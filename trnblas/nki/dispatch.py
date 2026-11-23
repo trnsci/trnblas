@@ -1272,6 +1272,10 @@ _KERNEL_DTYPES: dict[str, frozenset] = {
     "ozaki_split": frozenset({torch.int32, torch.float32}),  # raw bits + exponent constants
     "ozaki_emax_col": frozenset({torch.int32}),
     "ozaki_split_col": frozenset({torch.int32, torch.float32}),
+    # Ozaki II prototype (#132, nki/ozaki2_kernels.py): bf16 residues in,
+    # fp32 residues into the device CRT
+    **{f"ozaki2_gemm_{f}": frozenset({torch.bfloat16}) for f in ("b7", "b8", "b9")},
+    **{f"ozaki2_crt_{f}": frozenset({torch.float32}) for f in ("b7", "b8", "b9")},
 }
 
 
