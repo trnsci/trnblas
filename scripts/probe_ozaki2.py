@@ -50,6 +50,7 @@ SHAPES = {
     "1024^3": (1024, 1024, 1024),
     "2048^3": (2048, 2048, 2048),
     "4096^3": (4096, 4096, 4096),
+    "8192^3": (8192, 8192, 8192),
     "3267x8400x241": (3267, 8400, 241),
     "8192x3508x241": (8192, 3508, 241),
 }
@@ -261,7 +262,9 @@ def main():
     ap.add_argument("mode", choices=["micro", "shapes"])
     ap.add_argument("--arms", nargs="*", default=["ozaki1", "b7"])
     ap.add_argument("--counts", nargs="*", type=int, help="override the configs' counts")
-    ap.add_argument("--shapes", nargs="*", default=list(SHAPES))
+    ap.add_argument(
+        "--shapes", nargs="*", default=[s for s in SHAPES if s != "8192^3"], choices=list(SHAPES)
+    )
     ap.add_argument("--out", default="probe_ozaki2.json")
     ap.add_argument("--budget-s", type=float, default=1080)
     ap.add_argument(
