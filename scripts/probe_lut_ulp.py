@@ -6,7 +6,7 @@ refined variants.
 One kernel evaluates every variant on a (128, F) fp32 tile: ScalarE
 `activation` sqrt / rsqrt / reciprocal / exp / log; GpSimd
 `tensor_scalar(op0=rsqrt)` and `tensor_tensor(op=power)`; VectorE
-`nisa.reciprocal` and `tensor_tensor(divide)`; and one or two VectorE Newton
+`nisa.reciprocal` (VectorE `tensor_tensor` divide fails trn2 ISA validation, NCC_IINAR001); and one or two VectorE Newton
 steps after the rsqrt / reciprocal LUT (plus one Heron step after the sqrt
 LUT). The host runs it once per function on inputs covering that function's
 valid range (log-uniform over the whole range, a dense band near 1 and the
@@ -64,7 +64,6 @@ ROWS = [
     ("reciprocal", "ScalarE reciprocal + 1 VectorE Newton step", None),
     ("rsqrt", "GpSimd rsqrt + 1 VectorE Newton step", None),
     ("sqrt", "x * GpSimd rsqrt", None),
-    ("reciprocal", "VectorE tensor_tensor divide 1/x", None),
     ("sqrt", "GpSimd tensor_tensor power x^0.5", None),
     ("rsqrt", "GpSimd tensor_tensor power x^-0.5", None),
 ]
@@ -126,8 +125,6 @@ if HAS_NKI:
         nisa.memset(dst=half, value=0.5)
         mhalf = _t()
         nisa.memset(dst=mhalf, value=-0.5)
-        ones = _t()
-        nisa.memset(dst=ones, value=1.0)
         rows = []
         s_lut = _act(xt, nl.sqrt)
         r_lut = _act(xt, nl.rsqrt)
@@ -151,7 +148,6 @@ if HAS_NKI:
         t = _ts2(_tt(xt, q_lut, nl.multiply), -1.0, 2.0)
         rows.append(_tt(q_lut, t, nl.multiply))
         rows += [_newton_rsqrt(xt, g), _tt(xt, g, nl.multiply)]
-        rows.append(_tt(ones, xt, nl.divide))
         rows.append(_tt(xt, half, nl.power, engine=nisa.gpsimd_engine))
         rows.append(_tt(xt, mhalf, nl.power, engine=nisa.gpsimd_engine))
         for i, r in enumerate(rows):
