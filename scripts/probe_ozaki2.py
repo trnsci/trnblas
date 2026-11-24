@@ -141,10 +141,13 @@ def oz2_kernel_fns(A, B, n, fam):
     return gemm, crt, fused
 
 
+HOST_THREADS = [2, 12]
+
+
 def host_ms(A, B):
     out = {}
     nt = torch.get_num_threads()
-    for t in (2, 12):
+    for t in HOST_THREADS:
         torch.set_num_threads(t)
         out[f"host_{t}t_ms"] = timed(lambda: A @ B, reps=2)
     torch.set_num_threads(nt)
@@ -261,12 +264,22 @@ def main():
     ap.add_argument("--shapes", nargs="*", default=list(SHAPES))
     ap.add_argument("--out", default="probe_ozaki2.json")
     ap.add_argument("--budget-s", type=float, default=1080)
+    ap.add_argument(
+        "--host-threads",
+        nargs="*",
+        type=int,
+        default=HOST_THREADS,
+        help="host fp64 baselines (thread counts); match them to the CPUs the run is pinned to",
+    )
     a = ap.parse_args()
+    HOST_THREADS[:] = a.host_threads
     if not (D.HAS_NKI and D._get_dispatch_path() == "native"):
         sys.exit("needs the native TorchNeuron path (Trn2)")
     D._REQUIRE_NKI = True
     meta = {
         "lnc": os.environ.get("NEURON_LOGICAL_NC_CONFIG", "2"),
+        "host_threads": HOST_THREADS,
+        "cpus": sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else None,
         "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     t0 = time.time()
