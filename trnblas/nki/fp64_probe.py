@@ -317,7 +317,7 @@ def _pe_verdict(rep):
         s = rep[key]["psum_accumulate"]["sample"]
         if s == 1.0:
             v[key] = "fp32 RN-even per add"
-        elif abs(s - float(_f32(wide))) == 0:
+        elif abs(s - float(np.float32(wide))) == 0:
             v[key] = "wider than fp32, rounded once"
         else:
             v[key] = f"other: {s!r}"
