@@ -22,7 +22,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `trnblas.ozaki2.reference_gemm`, LNC-invariant by construction, verified
   in MLIR at trn2 LNC=1 and LNC=2 and in `nki.simulate` at both. The
   operands are scaled on the host for now. `scheme="ozaki1"` stays the
-  default and is unchanged. Device measurement is pending.
+  default and is unchanged. On Trn2 the device result is bitwise equal to
+  the host reference at LNC=1 and LNC=2. At 53 bits, the fused kernel takes
+  0.57× Ozaki I's kernel time at 4096³ and 0.53–0.57× on the DF-MP2 shapes
+  (#132). End to end it is slower than Ozaki I until the operand split moves
+  to the device.
 - `scripts/ozaki2_analysis.py` (CPU accuracy and cost analysis of both
   schemes, bf16 and FP8 residue arms, by bits delivered) and
   `scripts/probe_ozaki2.py` (device probe, JSON).
