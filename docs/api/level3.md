@@ -140,9 +140,10 @@ On Trn2 (one logical core, LNC=2, kernel time on resident operands, #132),
 the device result is bitwise equal to `reference_gemm` at LNC=1 and LNC=2.
 At 53 bits, the fused kernel (`crt_mode="fused"`) takes 0.57× Ozaki I's
 kernel time at 4096³ and 0.53× at 8192³. On the DF-MP2 shapes
-(3267, 8400, 241) and (8192, 3508, 241) it takes 0.53× and 0.57×. Below
-2048³ it is no faster (1.0× at 2048³, 2.0× at 1024³). End to end, the prototype loses to Ozaki I,
-because it still scales and reduces the operands on the host.
+(3267, 8400, 241) and (8192, 3508, 241) it takes 0.53× and 0.57×. At
+2048³ and below it is no faster (1.0× at 2048³, 2.0× at 1024³). End to
+end, the prototype loses to Ozaki I, because it still scales and reduces
+the operands on the host.
 
 ## `symm(alpha, A, B, beta=0.0, C=None, side="left", uplo="upper")`
 
