@@ -16,8 +16,8 @@ from _ozaki_ref import inputs as _inputs
 from _ozaki_ref import max_cw as _max_cw
 
 import trnblas
-from trnblas import ozaki
-from trnblas.nki import dispatch
+from trnblas import fp64, ozaki
+from trnblas.nki import dispatch, fp64_kernels
 
 # ── split ────────────────────────────────────────────────────────────────────
 
@@ -312,6 +312,7 @@ def native_reference(monkeypatch):
 
     class Calls(list):
         split: list
+        combine: list
 
     calls = Calls()
 
@@ -337,7 +338,17 @@ def native_reference(monkeypatch):
     for name in ("_ozaki_gemm_kernel", *DEVICE_SPLIT_KERNELS):
         monkeypatch.setattr(dispatch, name, object(), raising=False)
     monkeypatch.setattr(dispatch, "_OZ_DEVICE_SPLIT", True)
+    monkeypatch.setattr(dispatch, "_OZ_DEVICE_COMBINE", True)
+    combine_calls: list = []
+
+    def ff_bits(name, *ts, simulate=False):
+        assert name == "_fp64_ff_bits_kernel" and not simulate
+        combine_calls.append(tuple(ts[0].shape))
+        return torch.from_numpy(fp64.ff_bits_kernel_reference(*ts))
+
+    monkeypatch.setattr(fp64_kernels, "call", ff_bits)
     calls.split = split_calls
+    calls.combine = combine_calls
     return calls
 
 
@@ -436,3 +447,109 @@ def test_device_split_oversize_operand_takes_host_split(native_reference, monkey
     A, B = _inputs(40, 60, 30, seed=16)
     assert torch.equal(trnblas.gemm_fp64(A, B, slices=3), ozaki.reference_gemm(A, B, 3))
     assert "ozaki_split" not in native_reference.split
+
+
+# ── device combine (#125) ────────────────────────────────────────────────────
+
+
+def test_ff_bits_kernel_reference_equals_ozaki_combine():
+    """The CPU stand-in of `_fp64_ff_bits_kernel`, through
+    `combine_bits_device`'s host logic (flags, host recombine of flagged
+    rows), equals `ozaki.combine` bit for bit, incl. rows leaving the range."""
+    rng = np.random.default_rng(3)
+    R, N, M = 384, 300, 290
+    hi = np.ldexp(np.round(rng.standard_normal((R, N)) * 2.0**30), rng.integers(0, 40, (R, N)))
+    hi = hi.astype(np.float32)
+    lo = np.round(hi.astype(np.float64) * rng.standard_normal((R, N)) * 2.0**-26)
+    hilo = torch.from_numpy(np.stack([hi, lo.astype(np.float32)]))
+    eA = rng.integers(-300, 300, R)
+    eB = rng.integers(-300, 300, N)
+    eA[5], eA[6] = 1000, -1000  # overflow and gradual underflow: flagged rows
+    out = fp64.ff_bits_kernel_reference(
+        hilo,
+        np.pad(eA[:M] + ozaki.exponent_offset(8), (0, R - M)).astype(np.float32)[:, None],
+        eB.astype(np.float32)[None, :],
+    )
+    flags = out[R:, : R // 128].T.reshape(-1)
+    assert flags[5] == 1 and flags[6] == 1 and flags[:M].sum() == 2
+    with np.errstate(all="ignore"):
+        ref = ozaki.combine(hilo, eA, eB, 8, M, N)
+        got = fp64_kernels_host_combine(hilo, eA, eB, 8, M, N, None)
+    assert torch.equal(got.view(torch.int64), ref.view(torch.int64))
+
+
+@pytest.mark.parametrize(
+    "shape", [(200, 333, 77), (130, 200, 600), (300, 128, 1100), (1100, 64, 40)]
+)
+def test_device_combine_route_matches_reference(native_reference, shape, monkeypatch):
+    """The combine on the device: bitwise `reference_gemm`, one combine per
+    band of output rows over all N blocks (C^T bands for narrow N)."""
+    monkeypatch.setattr(ozaki, "LAUNCH_M", 256)
+    monkeypatch.setattr(ozaki, "LAUNCH_N", 512)
+    M, K, N = shape
+    A, B = _inputs(M, K, N, seed=M + N)
+    C = trnblas.gemm_fp64(A, B, slices=5)
+    assert C.shape == (M, N) and C.dtype == torch.float64
+    assert torch.equal(C, ozaki.reference_gemm(A, B, 5, max_m=256, max_n=512))
+    swap = N < ozaki.SWAP_N and M > N
+    rows, cols = (N, M) if swap else (M, N)
+    bands = -(-ozaki._round_up(rows, 128) // 256)
+    assert len(native_reference.combine) == bands
+    assert all(s[0] == 2 and s[2] == cols for s in native_reference.combine)
+    assert len(native_reference) == bands * -(-cols // 512)
+
+
+def test_device_combine_flagged_rows_take_the_host(native_reference):
+    A, B = _inputs(150, 90, 700, seed=21)
+    A[3] *= 1e300
+    A[4] *= 1e-300
+    B[:, 8] *= 1e10  # C[3, 8] overflows to inf: row 3 is flagged
+    B[:, 9] *= 1e-12  # C[4, 9] is subnormal: row 4 is flagged
+    with np.errstate(all="ignore"):
+        C = trnblas.gemm_fp64(A, B, slices=6)
+        ref = ozaki.reference_gemm(A, B, 6)
+    assert torch.equal(C.view(torch.int64), ref.view(torch.int64))
+    assert C[3, 8].isinf() and 0 < C[4, 9].abs() < 2.2e-308
+    assert native_reference.combine
+
+
+def test_device_combine_off_uses_host_combine(native_reference, monkeypatch):
+    monkeypatch.setattr(dispatch, "_OZ_DEVICE_COMBINE", False)
+    A, B = _inputs(70, 90, 600, seed=22)
+    assert torch.equal(trnblas.gemm_fp64(A, B, slices=4), ozaki.reference_gemm(A, B, 4))
+    assert not native_reference.combine and native_reference
+
+
+def test_device_combine_several_k_blocks_keep_host_combine(native_reference, monkeypatch):
+    """K split across launches: the parts are summed in fp64 on the host."""
+    real_plan = ozaki.plan
+    monkeypatch.setattr(ozaki, "plan", lambda Mp, Kp, N, k, *a: real_plan(Mp, Kp, N, k, 1 << 18))
+    A, B = _inputs(130, 1100, 600, seed=23)
+    C = trnblas.gemm_fp64(A, B, slices=3)
+    assert torch.equal(C, ozaki.reference_gemm(A, B, 3, limit=1 << 18))
+    assert not native_reference.combine
+
+
+def test_run_bands_writes_in_place():
+    """`ozaki.run` with a host stand-in of the device combine: the result is
+    a float64 view of the words buffer (no copy), equal to `reference_gemm`."""
+    A, B = _inputs(300, 200, 700, seed=24)
+
+    def comb(hilo, ea, eb, k, rows, N, out):
+        return fp64_kernels_host_combine(hilo, ea, eb, k, rows, N, out)
+
+    C = ozaki.run(A, B, 4, ozaki.reference_launch, max_m=128, max_n=256, device_combine=comb)
+    assert torch.equal(C, ozaki.reference_gemm(A, B, 4, max_m=128, max_n=256))
+    assert C.untyped_storage().nbytes() == 8 * (384 + 128) * 700
+
+
+def fp64_kernels_host_combine(hilo, ea, eb, k, rows, N, out):
+    """combine_bits_device's host logic around the CPU stand-in kernel."""
+    import unittest.mock
+
+    with unittest.mock.patch.object(
+        fp64_kernels,
+        "call",
+        lambda name, *ts, simulate=False: torch.from_numpy(fp64.ff_bits_kernel_reference(*ts)),
+    ):
+        return fp64_kernels.combine_bits_device(hilo, ea, eb, k, rows, N, out=out)

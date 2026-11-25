@@ -154,7 +154,10 @@ def gemm_fp64(
     diagonal s + t <= k - 1 of slice pairs runs as bf16 matmuls with exact fp32
     PSUM accumulation, in groups of at most 4096 terms (same-diagonal pairs
     concatenated along K), and each group is folded into a VectorE TwoSum
-    (hi, lo) pair. The host recombines in fp64 with the power-of-two scales.
+    (hi, lo) pair. The combine, RN64(hi + lo) times the power-of-two scales,
+    runs on the device too (#125; bitwise the host combine `ozaki.combine`,
+    which covers flagged rows, several K blocks and
+    TRNBLAS_OZAKI_DEVICE_COMBINE=0).
 
     `slices` is the precision knob: k (k + 1) / 2 slice GEMMs. Measured on
     Trn2 (max |C - C_exact| / (|A| |B|), normal data): about 1e-12 at k = 6,

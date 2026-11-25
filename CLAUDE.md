@@ -88,8 +88,10 @@ since it's reused across all auxiliary basis indices P.
 - **No FP64 arithmetic.** Trainium's Tensor Engine maxes out at FP32.
   `gemm_fp64` (#22, `trnblas/ozaki.py` + `_ozaki_gemm_kernel`) gives an
   fp64-class GEMM by Ozaki splitting: exact 7-bit bf16 integer slices, exact
-  fp32 PSUM groups of 4096 terms, VectorE TwoSum eviction, fp64 recombine on
-  the host. `slices` (default 8) is the precision knob. Double-double (fp32
+  fp32 PSUM groups of 4096 terms, VectorE TwoSum eviction, and the fp64
+  combine on the device too (#125: `_fp64_ff_bits_kernel` per band of output
+  rows, bitwise `ozaki.combine`; flagged rows and several K blocks keep the
+  host combine). `slices` (default 8) is the precision knob. Double-double (fp32
   hi/lo) stays at fp32 accuracy on the device and was dropped. The split runs
   on the device from the raw fp64 bits (#123: `_ozaki_emax*_kernel`,
   `_ozaki_split*_kernel`, bitvec ops + exact fp32 only; CPU twin

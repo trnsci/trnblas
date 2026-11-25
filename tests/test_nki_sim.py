@@ -216,6 +216,32 @@ class TestOzakiSimulator:
         err = ((C - A @ B).abs() / (A.abs() @ B.abs())).max().item()
         assert err < 2e-15
 
+    @pytest.mark.parametrize("lnc", ["1", "2"])
+    @pytest.mark.parametrize("M,K,N", [(300, 200, 700), (700, 130, 90)])
+    def test_gemm_fp64_device_combine_bands(self, M, K, N, lnc, monkeypatch):
+        """The combine on the device (#125) through `_fp64_ff_bits_kernel`,
+        one launch per band of output rows over several N blocks (and C^T
+        bands for narrow N), with flagged rows: bitwise `reference_gemm`."""
+        import numpy as np
+
+        from trnblas import gemm_fp64, ozaki
+        from trnblas.nki import dispatch
+
+        monkeypatch.setenv("NEURON_LOGICAL_NC_CONFIG", lnc)
+        monkeypatch.setattr(ozaki, "LAUNCH_M", 256)
+        monkeypatch.setattr(ozaki, "LAUNCH_N", 256)
+        assert dispatch._OZ_DEVICE_COMBINE
+        g = torch.Generator().manual_seed(M)
+        A = torch.randn(M, K, generator=g, dtype=torch.float64)
+        B = torch.randn(K, N, generator=g, dtype=torch.float64)
+        A[3] *= 1e300
+        B[:, 8] *= 1e10  # C[3, 8] overflows: a flagged row
+        with np.errstate(all="ignore"):
+            C = gemm_fp64(A, B, slices=3)
+            ref = ozaki.reference_gemm(A, B, 3, max_m=256, max_n=256)
+        assert torch.equal(C.view(torch.int64), ref.view(torch.int64))
+        assert C[3, 8].isinf()
+
 
 class TestOzakiDeviceSplitSim:
     """The device split kernels (#123) under nki.simulate: the digits and

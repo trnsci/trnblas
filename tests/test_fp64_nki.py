@@ -190,3 +190,27 @@ def test_ff_bits_kernel_equals_ozaki_combine(shape, lnc, monkeypatch):
         got = K.combine_bits_device(hilo, eA, eB, 8, M, N, simulate=True)
         ref = ozaki.combine(hilo, eA, eB, 8, M, N)
     assert torch.equal(got.view(torch.int64), ref.view(torch.int64))
+
+
+@pytest.mark.parametrize("lnc", ["1", "2"])
+@pytest.mark.parametrize("shape", [(256, 700), (384, 241), (128, 3)])
+def test_ff_bits_kernel_reference_equals_kernel_output(shape, lnc, monkeypatch):
+    """`fp64.ff_bits_kernel_reference` (the CPU stand-in that the CPU tests of
+    the gemm_fp64 device combine, #125, run on) is the kernel's raw output
+    bit for bit: the flag rows, and the float64 words of every row not
+    flagged (a flagged row is recombined on the host, so its words are
+    unspecified: they differ at a non-finite element)."""
+    monkeypatch.setenv("NEURON_LOGICAL_NC_CONFIG", lnc)
+    R, N = shape
+    rng = np.random.default_rng(R * N)
+    hilo = _ozaki_like(R, N, rng).numpy()
+    ea = rng.integers(-300, 300, (R, 1)).astype(np.float32)
+    eb = rng.integers(-300, 300, (1, N)).astype(np.float32)
+    ea[5], ea[6] = 1000, -1000
+    with np.errstate(all="ignore"):
+        got = np.asarray(nki.simulate(K.kernel("_fp64_ff_bits_kernel"))(hilo, ea, eb))
+        ref = F.ff_bits_kernel_reference(hilo, ea, eb)
+    assert np.array_equal(got[R:], ref[R:])
+    ok = ref[R:, : R // 128].T.reshape(-1) == 0
+    assert not ok[31] and not ok[6]  # an inf; results below the normal range
+    assert np.array_equal(got[:R][ok], ref[:R][ok])

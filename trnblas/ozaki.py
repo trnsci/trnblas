@@ -521,6 +521,7 @@ def run(
     max_m: int = LAUNCH_M,
     max_n: int = LAUNCH_N,
     split_ab=None,
+    device_combine=None,
 ) -> torch.Tensor:
     """C = A @ B in fp64 by Ozaki splitting. A (M, K) and B (K, N) are finite
     fp64 on the host. `launch(da, db, (m0, mb), (k0, kb), (n0, nb)) ->
@@ -530,7 +531,12 @@ def run(
     `empty(shape, dtype)` allocates the slices and the result.
     `split_ab(A, B, slices, empty) -> (Digits, Digits)` makes the slices
     (default: `split_a` and `split_b` on the host; the device route splits
-    on the device, #123, with the same digits)."""
+    on the device, #123, with the same digits).
+
+    `device_combine` (optional; the device route passes
+    `fp64_kernels.combine_bits_device`, #125) replaces `combine` with the
+    same bits, band by band of output rows (`_run_bands`). Products with
+    several K blocks, or a band too large for one launch, keep `combine`."""
     k = check_slices(slices)
     M, K = A.shape
     N = B.shape[1]
@@ -541,11 +547,17 @@ def run(
         da, db = split_a(A, k, empty), split_b(B, k, empty)
     else:
         da, db = split_ab(A, B, k, empty)
-    C = empty((M, N), torch.float64)
-    out = C
-    if N < SWAP_N and M > N:  # C^T = B^T A^T: B's slices are the first operand
-        da, db, M, N, out = db, da, N, M, C.mT
+    swap = N < SWAP_N and M > N
+    if swap:  # C^T = B^T A^T: B's slices are the first operand
+        da, db, M, N = db, da, N, M
     mbs, kbs, nbs = plan(da.xp, da.kp, N, k, limit, max_m, max_n)
+    if device_combine is not None and bands_fit(mbs, kbs, N, limit):
+        Ct = _run_bands(da, db, k, M, N, mbs, nbs, kbs[0], launch, device_combine, empty)
+        if not swap:
+            return Ct
+        return empty((N, M), torch.float64).copy_(Ct.mT)
+    C = empty((N, M) if swap else (M, N), torch.float64)
+    out = C.mT if swap else C
     for m0, mb in mbs:
         mr = min(mb, M - m0)
         if mr <= 0:
@@ -563,6 +575,42 @@ def run(
             if acc is not None:
                 out[m0 : m0 + mr, n0 : n0 + nb] = acc
     return C
+
+
+def bands_fit(mbs: list, kbs: list, N: int, limit: int = BLOCK_BYTES) -> bool:
+    """True when `_run_bands` applies: one K block, and every row band's
+    (hi, lo) (8 mb N bytes) and float64 words with flag rows
+    (8 (mb + 128) N bytes) stay within `limit` (#112)."""
+    mb = max(b for _, b in mbs)
+    return len(kbs) == 1 and 8 * (mb + TILE_K) * N <= limit
+
+
+def _run_bands(da, db, k, M, N, mbs, nbs, kk, launch, device_combine, empty):
+    """`run`'s loop with the combine on the device (#125), for one K block.
+
+    Each band of output rows m0 .. m0 + mb - 1 launches its N blocks, joins
+    their (hi, lo) along N where they are (on the device), and
+    `device_combine(hilo, ea, eb, k, mr, N, out=...)` writes the band's
+    float64 words into rows m0 .. m0 + mb + 127 of an int32
+    (Mp + 128, 2 N) buffer: the first mr rows of the band are the result
+    rows in place, the rest (padding and the band's 128 flag rows) are
+    overwritten by the next band. Bands run in order, so the result is
+    rows 0 .. M - 1 of the buffer, read as float64 with no copy (its storage
+    keeps Mp - M + 128 spare rows). A combine that returns other memory
+    (its host fallbacks) is copied into place."""
+    words = empty((da.xp + TILE_K, 2 * N), torch.int32)
+    for m0, mb in mbs:
+        mr = min(mb, M - m0)
+        if mr <= 0:
+            continue
+        parts = [launch(da, db, (m0, mb), kk, nn) for nn in nbs]
+        hilo = parts[0] if len(parts) == 1 else torch.cat(parts, dim=2)
+        dest = words[m0 : m0 + mb + TILE_K]
+        got = device_combine(hilo, da.e[m0 : m0 + mr], db.e[:N], k, mr, N, out=dest)
+        rows = dest[:mr].view(torch.float64)
+        if got.data_ptr() != rows.data_ptr():
+            rows.copy_(got)
+    return words[:M].view(torch.float64)
 
 
 def host_blocks(da: Digits, db: Digits, m, kk, n):

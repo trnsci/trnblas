@@ -51,7 +51,18 @@ How it works:
 3. **Eviction (device).** Each group is scaled by 2^(7(k−1−d)) on its way out
    of PSUM and folded into an SBUF fp32 TwoSum (hi, lo) pair on VectorE,
    diagonals smallest first.
-4. **Combine (host).** C = (hi + lo) · 2^(e_i + e_j − 12 − 7(k−1)) in fp64.
+4. **Combine (device, #125).** C = RN64(hi + lo) · 2^(e_i + e_j − 12 − 7(k−1)),
+   the float64 words built on the device by `_fp64_ff_bits_kernel`
+   (`trnblas.fp64`, #134) from exact fp32 and bitvec ops, bitwise equal to
+   the host combine `trnblas.ozaki.combine`. The (hi, lo) blocks of one band
+   of output rows stay on the device, are joined along N, and one launch per
+   band writes the band's words, which are downloaded straight into the
+   result's storage. Rows the kernel flags (a non-finite element, or a
+   result outside the normal float64 range: overflow or gradual underflow)
+   are recombined on the host, as are products with several K blocks;
+   `TRNBLAS_OZAKI_DEVICE_COMBINE=0` keeps the host combine. Measured on
+   Trn2 for one 4096 × 4096 block: 14.5 ms against 79.4 ms for the
+   download and host combine.
 
 Properties:
 

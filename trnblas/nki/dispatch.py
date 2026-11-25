@@ -817,10 +817,12 @@ def _oz_device_block(dg, cache: dict, key: str, kk, xx) -> torch.Tensor:
     return v
 
 
-def _ozaki_launcher():
+def _ozaki_launcher(keep_on_device: bool = False):
     """`ozaki.run`'s launch for one gemm_fp64 call: the NKI kernel on K-major
     device slices (uploaded once when they fit, see `_OZ_RESIDENT_BYTES`), or
-    under the simulator on host slices. Returns host fp32 (2, mb, nb)."""
+    under the simulator on host slices. Returns fp32 (2, mb, nb): on the
+    host, or left on the device with `keep_on_device` (for the device
+    combine, #125)."""
     from .. import ozaki
 
     cache: dict = {}
@@ -833,7 +835,8 @@ def _ozaki_launcher():
         _check_kernel_operands("ozaki_gemm", da.d, db.d)
         at = _oz_device_block(da, cache, "a", kk, m)
         bt = _oz_device_block(db, cache, "b", kk, n)
-        return _to_host(_call_kernel(_ozaki_gemm_kernel, "ozaki_gemm", at, bt), "cpu")
+        hilo = _call_kernel(_ozaki_gemm_kernel, "ozaki_gemm", at, bt)
+        return hilo if keep_on_device else _to_host(hilo, "cpu")
 
     return launch
 
@@ -955,6 +958,36 @@ def _ozaki_split_ab(device_split: bool):
     return split_ab
 
 
+# ── Device combine (#125) ────────────────────────────────────────────────────
+# The host combine (download the kernel's (hi, lo), RN64(hi + lo) times the
+# row and column scales in fp64) was ~4 ns per element on 2 vCPUs, 66 of
+# 181 ms at 4096^3. On the kernel route the (hi, lo) blocks stay on the
+# device and `_fp64_ff_bits_kernel` (trnblas.fp64, #134) builds the float64
+# words there from exact fp32 and bitvec ops, bitwise equal to
+# `ozaki.combine`: measured on Trn2, 14.5 against 79.4 ms for a 4096^2
+# block. Rows it flags (a non-finite element, or one whose result leaves
+# the normal float64 range) are recombined on the host, as are products
+# with several K blocks. TRNBLAS_OZAKI_DEVICE_COMBINE=0 keeps the host
+# combine.
+
+_OZ_DEVICE_COMBINE = os.environ.get("TRNBLAS_OZAKI_DEVICE_COMBINE", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
+
+
+def _oz_device_combine(hilo, ea, eb, slices, rows, N, out=None):
+    """`ozaki.run`'s `device_combine`: `fp64_kernels.combine_bits_device`
+    (under the simulator, on host (hi, lo) through `nki.simulate`)."""
+    from . import fp64_kernels
+
+    return fp64_kernels.combine_bits_device(
+        hilo, ea, eb, slices, rows, N, simulate=_use_simulator(), out=out
+    )
+
+
 def nki_gemm_fp64(A: torch.Tensor, B: torch.Tensor, slices: int) -> torch.Tensor:
     """fp64 (M, N) = A @ B for 2-D host fp64 A (M, K), B (K, N): the Ozaki
     kernel on the native path, else host fp64 matmul (see `_ozaki_route`).
@@ -967,9 +1000,18 @@ def nki_gemm_fp64(A: torch.Tensor, B: torch.Tensor, slices: int) -> torch.Tensor
     dev = _OZ_DEVICE_SPLIT
     if not dev and not (torch.isfinite(A).all() and torch.isfinite(B).all()):
         return torch.matmul(A, B)
+    comb = _oz_device_combine if _OZ_DEVICE_COMBINE else None
     try:
         return ozaki.run(
-            A, B, k, _ozaki_launcher(), empty=_ozaki_host_empty, split_ab=_ozaki_split_ab(dev)
+            A,
+            B,
+            k,
+            _ozaki_launcher(keep_on_device=comb is not None),
+            empty=_ozaki_host_empty,
+            max_m=ozaki.LAUNCH_M,
+            max_n=ozaki.LAUNCH_N,
+            split_ab=_ozaki_split_ab(dev),
+            device_combine=comb,
         )
     except _OzNonFinite:
         return torch.matmul(A, B)
