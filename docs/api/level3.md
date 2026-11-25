@@ -19,7 +19,7 @@ CPU/GPU.
 Batched GEMM over the leading dimension — used for DF-MP2 tensor contractions
 over auxiliary basis indices. Routed like `gemm` on the native path.
 
-## `gemm_fp64(A, B, *, slices=8, transA=False, transB=False)`
+## `gemm_fp64(A, B, *, slices=8, transA=False, transB=False, scheme="ozaki1", moduli=None)`
 
 fp64-class product `op(A) @ op(B)` on the bf16 Tensor Engine, by Ozaki
 splitting ([#22](https://github.com/trnsci/trnblas/issues/22)). Returns
@@ -109,6 +109,41 @@ Properties:
 
 `alpha` / `beta` are not taken: scale the fp64 result. Batched operands are
 not supported.
+
+### `scheme="ozaki2"` (prototype, [#132](https://github.com/trnsci/trnblas/issues/132))
+
+The Ozaki scheme II (Ozaki, Uchino and Imamura, arXiv:2504.08009) in place
+of the slicing above; `scheme="ozaki1"` stays the default. Host half:
+`trnblas/ozaki2.py`; kernels: `trnblas/nki/ozaki2_kernels.py`.
+
+1. **Scale (host).** Row i of A by 2^mu_i and column j of B by 2^nu_j, then
+   round to integers. The exponents come from the Cauchy–Schwarz bound
+   ||Ā_i||·||B̄_j|| ≤ M/4, with M the product of the moduli.
+2. **Residues (host).** Balanced residues modulo `moduli` (n) pairwise
+   coprime odd moduli below 2^7 (127, 125, 123, ...), |r| ≤ 63, exact in bf16.
+3. **Residue GEMMs (device, one launch for all moduli).** One bf16 GEMM per
+   modulus with fp32 PSUM groups of 4096 terms (4096·63² < 2^24, exact),
+   and a 4-instruction VectorE modular reduction at each group close, then
+   a canonical residue.
+4. **CRT (device).** Exact fp32 integer ops: limb sums of the CRT weights,
+   the quotient by M, carries to balanced digits, packed digit pairs; the
+   host sums the top few in fp64 and unscales.
+
+`moduli` is the precision knob, about 3.3 bits per modulus (n GEMMs, against
+k(k+1)/2 for Ozaki I). The default of 17 gives about 53 bits of |A||B|, the
+level of `slices=8` (36 GEMMs). The result is deterministic: residues are
+canonical, so every bit is a function of the scaled integers only,
+independent of the tiling and the LNC split, and equals
+`trnblas.ozaki2.reference_gemm`.
+
+On Trn2 (one logical core, LNC=2, kernel time on resident operands, #132),
+the device result is bitwise equal to `reference_gemm` at LNC=1 and LNC=2.
+At 53 bits, the fused kernel (`crt_mode="fused"`) takes 0.57× Ozaki I's
+kernel time at 4096³ and 0.53× at 8192³. On the DF-MP2 shapes
+(3267, 8400, 241) and (8192, 3508, 241) it takes 0.53× and 0.57×. At
+2048³ and below it is no faster (1.0× at 2048³, 2.0× at 1024³). End to
+end, the prototype loses to Ozaki I, because it still scales and reduces
+the operands on the host.
 
 ## `symm(alpha, A, B, beta=0.0, C=None, side="left", uplo="upper")`
 

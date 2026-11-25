@@ -26,11 +26,13 @@ trnblas/
 │   ├── level2.py            # gemv, symv, trmv, ger
 │   ├── level3.py            # gemm, gemm_fp64, batched_gemm, symm, syrk, trsm, trmm, metric_inv_half
 │   ├── ozaki.py             # gemm_fp64 host half: split (+ device-split twin), schedule, plan, combine, bitwise reference
+│   ├── ozaki2.py            # gemm_fp64(scheme="ozaki2") prototype (#132): scaling, residues, CRT (host + device twin), reference
 │   ├── parallel.py          # SPMD multi-core GEMM + DF-MP2 (torchrun)
 │   └── nki/
 │       ├── __init__.py
 │       ├── dispatch.py      # auto/pytorch/nki dispatch, NKI kernels, native/XLA path selection
 │       ├── _native.py       # TorchNeuron custom ops (nki_op), loaded lazily
+│       ├── ozaki2_kernels.py # Ozaki II residue-GEMM + device-CRT kernels and launcher (#132)
 │       └── multicore.py     # opt-in single-process pair-energy split (set_cores)
 ├── tests/
 │   ├── conftest.py          # Fixtures: random matrices, SPD matrices

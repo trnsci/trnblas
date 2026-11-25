@@ -131,6 +131,48 @@ def ozaki_split_col(xw: torch.Tensor, rcs: torch.Tensor) -> torch.Tensor:
     return _d._ozaki_split_col_kernel(xw, rcs)
 
 
+# ── Ozaki II prototype (#132) ────────────────────────────────────────────────
+# One residue-GEMM op and one device-CRT op per moduli family; the kernels
+# live in `ozaki2_kernels.py`.
+
+
+def _register_ozaki2(fam: str):
+    from .. import ozaki2 as _o2
+    from . import ozaki2_kernels as _k2
+
+    def gemm(at: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        return _k2.GEMM_KERNELS[fam](at, b)
+
+    def crt(res: torch.Tensor) -> torch.Tensor:
+        return _k2.CRT_KERNELS[fam](res)
+
+    def fused(at: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        return _k2.FUSED_KERNELS[fam](at, b)
+
+    def gemm_fake(at, b):
+        return at.new_empty((at.shape[0], at.shape[2], b.shape[2]), dtype=torch.float32)
+
+    def crt_fake(res):
+        keep = _o2.crt(fam, res.shape[0]).keep
+        return res.new_empty((keep, res.shape[1], res.shape[2]), dtype=torch.float32)
+
+    def fused_fake(at, b):
+        keep = _o2.crt(fam, at.shape[0]).keep
+        return at.new_empty((keep, at.shape[2], b.shape[2]), dtype=torch.float32)
+
+    gemm.__name__, crt.__name__ = f"ozaki2_gemm_{fam}", f"ozaki2_crt_{fam}"
+    fused.__name__ = f"ozaki2_fused_{fam}"
+    return {
+        gemm.__name__: nki_op(
+            f"trnblas::{gemm.__name__}", gemm, mutates_args={}, fake_fn=gemm_fake
+        ),
+        crt.__name__: nki_op(f"trnblas::{crt.__name__}", crt, mutates_args={}, fake_fn=crt_fake),
+        fused.__name__: nki_op(
+            f"trnblas::{fused.__name__}", fused, mutates_args={}, fake_fn=fused_fake
+        ),
+    }
+
+
 # ── SYRK ─────────────────────────────────────────────────────────────────────
 
 
@@ -256,6 +298,7 @@ OPS = {
     "ozaki_split": ozaki_split,
     "ozaki_emax_col": ozaki_emax_col,
     "ozaki_split_col": ozaki_split_col,
+    **{k: v for fam in ("b7", "b8", "b9") for k, v in _register_ozaki2(fam).items()},
 }
 
 

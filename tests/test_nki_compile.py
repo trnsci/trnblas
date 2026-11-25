@@ -161,7 +161,52 @@ _KERNELS = {
         lambda d: d._ozaki_split_col_kernel,
         lambda: (_i32(8400, 2 * 241), _f32(8, 256)),
     ),
+    # Ozaki II prototype (#132): every family; K over several groups plus a
+    # remainder, an odd M-tile count, an N tail; two M tiles (column split);
+    # one tile. The CRT at 16 / 14 / 12 moduli with an N tail, and tiny.
+    **{
+        f"ozaki2_gemm_{f}{tag}": (
+            lambda d, f=f: _k2().GEMM_KERNELS[f],
+            lambda f=f, s=s: (_bf16(s[0], s[1], s[2]), _bf16(s[0], s[1], s[3])),
+        )
+        for f, kt in (("b7", 32), ("b8", 8), ("b9", 2))
+        for tag, s in (
+            ("", (3, (2 * kt + 1) * 128, 384, 1300)),
+            ("_col_split", (2, 3 * 128, 256, 1023)),
+            ("_tiny", (2, 128, 128, 1)),
+        )
+    },
+    **{
+        f"ozaki2_crt_{f}{tag}": (
+            lambda d, f=f: _k2().CRT_KERNELS[f],
+            lambda s=s: (_f32(*s),),
+        )
+        for f, n in (("b7", 16), ("b8", 14), ("b9", 12))
+        for tag, s in (("", (n, 384, 1300)), ("_tiny", (2, 128, 1)))
+    },
+    # fused residue GEMM + CRT: the largest CRT state per tile (b7 at 28
+    # moduli, 4 PSUM sub-tiles), K over groups plus a remainder, a column
+    # split and a tail.
+    **{
+        f"ozaki2_fused_{f}{tag}": (
+            lambda d, f=f: _k2().FUSED_KERNELS[f],
+            lambda s=s: (_bf16(s[0], s[1], s[2]), _bf16(s[0], s[1], s[3])),
+        )
+        for f, kt in (("b7", 32), ("b8", 8), ("b9", 2))
+        for tag, s in (
+            ("", (17, (kt + 1) * 128, 384, 1300)),
+            ("_n28", (28, 128, 256, 1024)),
+            ("_col_split", (3, 3 * 128, 256, 1023)),
+        )
+    },
 }
+
+
+def _k2():
+    from trnblas.nki import ozaki2_kernels
+
+    return ozaki2_kernels
+
 
 # Native-only kernels that split work across the cores of an LNC=2 logical
 # core by program_id (and degrade to one program at LNC=1): verified on trn2
@@ -184,6 +229,7 @@ _LNC2 = {
     "ozaki_split_tiny",
     "ozaki_split_col",
     "ozaki_split_col_narrow",
+    *(k for k in _KERNELS if k.startswith("ozaki2_")),
 }
 
 
@@ -237,4 +283,19 @@ def test_every_kernel_is_covered():
         if callable(obj) and type(obj).__module__.startswith("nki")
     }
     missing = {k for k in kernels if id(getattr(dispatch, k)) not in covered}
+    assert not missing, missing
+
+
+def test_every_ozaki2_kernel_is_covered():
+    """Every @nki.jit kernel of nki/ozaki2_kernels.py has an entry above."""
+    from trnblas.nki import dispatch, ozaki2_kernels
+
+    covered = {id(get(dispatch)) for get, _ in _KERNELS.values()}
+    kernels = {
+        name
+        for name, obj in vars(ozaki2_kernels).items()
+        if name.endswith("_kernel") and callable(obj) and type(obj).__module__.startswith("nki")
+    }
+    assert kernels, "no Ozaki II kernels found"
+    missing = {k for k in kernels if id(getattr(ozaki2_kernels, k)) not in covered}
     assert not missing, missing
