@@ -980,12 +980,21 @@ _OZ_DEVICE_COMBINE = os.environ.get("TRNBLAS_OZAKI_DEVICE_COMBINE", "1").strip()
 
 def _oz_device_combine(hilo, ea, eb, slices, rows, N, out=None):
     """`ozaki.run`'s `device_combine`: `fp64_kernels.combine_bits_device`
-    (under the simulator, on host (hi, lo) through `nki.simulate`)."""
+    (under the simulator, on host (hi, lo) through `nki.simulate`). If the
+    combine kernel fails, the band is combined on the host (same bits),
+    unless TRNBLAS_REQUIRE_NKI."""
+    from .. import ozaki
     from . import fp64_kernels
 
-    return fp64_kernels.combine_bits_device(
-        hilo, ea, eb, slices, rows, N, simulate=_use_simulator(), out=out
-    )
+    try:
+        return fp64_kernels.combine_bits_device(
+            hilo, ea, eb, slices, rows, N, simulate=_use_simulator(), out=out
+        )
+    except Exception as exc:
+        if _REQUIRE_NKI:
+            raise
+        _warn_fallback(exc, "gemm_fp64 device combine failed — combining on the host")
+        return ozaki.combine(hilo.detach().to("cpu"), ea, eb, slices, rows, N)
 
 
 def nki_gemm_fp64(A: torch.Tensor, B: torch.Tensor, slices: int) -> torch.Tensor:

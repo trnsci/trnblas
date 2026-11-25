@@ -23,7 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   copy). The host combine still runs for rows the kernel flags (a
   non-finite element, or a result outside the normal float64 range), for
   products with several K blocks (K beyond ~1M at k = 8), for a band
-  whose words would pass 2 GiB (#112), and under
+  whose words would pass 2 GiB (#112), for a band whose combine launch
+  fails (with a warning; it raises under `TRNBLAS_REQUIRE_NKI`), and under
   `TRNBLAS_OZAKI_DEVICE_COMBINE=0`. `ozaki.run` takes the combine as
   `device_combine=`; `fp64.ff_bits_kernel_reference` is the kernel's raw
   output (words and flag rows) on the host. The end-to-end device timing is

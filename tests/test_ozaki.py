@@ -513,6 +513,23 @@ def test_device_combine_flagged_rows_take_the_host(native_reference):
     assert native_reference.combine
 
 
+def test_device_combine_failure_combines_on_the_host(native_reference, monkeypatch):
+    """A failing combine kernel falls back to the host combine for its band
+    (same bits), with a warning; under TRNBLAS_REQUIRE_NKI it raises."""
+
+    def broken(name, *ts, simulate=False):
+        raise RuntimeError("combine kernel failed to compile")
+
+    monkeypatch.setattr(fp64_kernels, "call", broken)
+    A, B = _inputs(130, 90, 600, seed=25)
+    with pytest.raises(RuntimeError, match="compile"):
+        trnblas.gemm_fp64(A, B, slices=4)
+    monkeypatch.setattr(dispatch, "_REQUIRE_NKI", False)
+    with pytest.warns(UserWarning, match="device combine failed"):
+        C = trnblas.gemm_fp64(A, B, slices=4)
+    assert torch.equal(C, ozaki.reference_gemm(A, B, 4))
+
+
 def test_device_combine_off_uses_host_combine(native_reference, monkeypatch):
     monkeypatch.setattr(dispatch, "_OZ_DEVICE_COMBINE", False)
     A, B = _inputs(70, 90, 600, seed=22)
