@@ -10,7 +10,9 @@ multiplication using an integer modular technique" (arXiv:2504.08009):
    2^nu_j, then rounded to integers Abar, Bbar (exact in fp64). The exponents
    come from the Cauchy-Schwarz bound: ||Abar_i||_2 ||Bbar_j||_2 <= M / 4,
    with M the product of the moduli, so |(Abar Bbar)_ij| <= M / 4 and the
-   integer product is determined by its residues.
+   integer product is determined by its residues. The norm bound is an
+   exact integer sum from the raw bits (`norm_terms`), the same on the host
+   and on the device (#132), in any order and layout.
 2. **Residues.** For each modulus m_l, the balanced residues of Abar and Bbar
    (|r| <= (m_l - 1) / 2), exact in bf16.
 3. **Residue GEMMs.** One bf16 GEMM per modulus, fp32 PSUM accumulation in K
@@ -38,8 +40,16 @@ LNC split and even the rounding of the reciprocal multiply.
 L_c = sum_l W[l, c] r_l of the weights' beta-bit limbs (exact), the quotient
 q = rint(sum_l fl(w_l / M) r_l) (exact: |C / M| <= 1/4), D_c = L_c - q M_c,
 carry normalisation to balanced beta-bit digits, and pairs of digits packed
-into exact fp32 values. The host sums the top `keep` packed values in fp64.
-`crt_host` is the same reconstruction in fp64 words on the host.
+into exact fp32 values. The result is RN64 of the kept packed integer times
+the scales, one rounding (`combine_packed`; on the device, the float64 words
+are built from exact fp32 and bitvec ops, `packed_to_fp64_bits`).
+`crt_host` is the reconstruction in fp64 words on the host.
+
+**Device split (#132).** `split_from_bits` is the device split's arithmetic:
+the exponents and the exact norm sums, the scale exponents, the Ozaki I
+digits of the scaled integers (`ozaki.split_from_bits` with given row
+exponents), and the residues from the digits; it equals `split` bit for
+bit.
 """
 
 from __future__ import annotations
@@ -234,23 +244,134 @@ def bound(n: int, fam=DEFAULT_FAMILY) -> float:
     return float(math.isqrt(M // 4)) * (1 - 2.0**-40)
 
 
-def scale_exponents(X: np.ndarray, axis: int, T: float) -> np.ndarray:
-    """int64 exponents mu (one per row for axis=1, per column for axis=0)
-    with || rint(X 2^mu) ||_2 <= T along `axis`: 2^mu ||x|| <= T - sqrt(K) / 2
-    (rounding adds at most 1/2 per entry). Zero rows / columns get 0."""
+# ── the norm bound (exact, from the raw bits) ────────────────────────────────
+#
+# The scale exponents need an upper bound of each row's (column's) 2-norm.
+# A float sum depends on its order, and the device's order depends on the
+# operand's layout and the LNC split, so the bound is an exact integer sum:
+# with e the row exponent (|x| < 2^e),
+#   P1u = |x| 2^(20 - e) cut to its top 24 bits from the bit fields (as the
+#         device split, #123), plus 2^-23 of its scale for a subnormal x:
+#         P1u >= the truncated part, so P1u + ulp24 >= |x| 2^(20 - e);
+#   w   = P1u cut to 12 significant bits, plus one unit of the 12th bit:
+#         w >= |x| 2^(20 - e), and w^2 is exact in fp32 (24 bits);
+#   tau = floor(w^2 / 2^6), an integer below 2^35.
+# Then sum_k x_k^2 <= 2^(2 (e - 20)) 2^6 (S + K) with S = sum_k tau_k: exact
+# in any order (the device adds 9-bit limbs of tau, every partial sum an
+# integer below 2^24), so S, and the exponents, do not depend on the
+# layout, the tiling or the LNC. w overestimates |x| by at most 2^-11
+# relative, so the bound is within about 2^-10 of the fp64 norm's square
+# and the exponents match the fp64-norm rule except within that of a
+# power-of-two boundary. Zero and padding elements give tau = 0.
+
+NORM_GRID = 6  # tau = floor(w^2 / 2^NORM_GRID)
+NORM_LIMB = 9  # the device sums tau in 9-bit limbs: tau < 2^(4 * 9)
+
+
+def norm_terms(X: np.ndarray, e: np.ndarray, axis: int) -> np.ndarray:
+    """tau (float64 integers, X's shape) of every element of X for the row
+    (axis=1) or column (axis=0) exponents e, by the device's arithmetic (all
+    of it exact; see the comment above). Finite X. A row whose largest
+    element is subnormal (e < -1021; the device route leaves it to the host)
+    is scaled up by 2^64 first, so its elements are normal."""
+    f32, u32 = np.float32, np.uint32
+    X = np.ascontiguousarray(X, dtype=np.float64)
+    e = np.asarray(e, dtype=np.int64)
+    sub = e < -1021  # a subnormal maximum (host only): scale up by 2^64, exactly
+    if sub.any():
+        X = X.copy()
+        if axis == 1:
+            X[sub] *= 2.0**64
+        else:
+            X[:, sub] *= 2.0**64
+        e = e + 64 * sub
+    w2 = X.view(u32).reshape(*X.shape, 2)
+    lo, hi = w2[..., 0], w2[..., 1]
+    E = (hi >> u32(20)) & u32(0x7FF)
+    rc = (1003 + e).astype(f32)
+    rc = rc[:, None] if axis == 1 else rc[None, :]
+    with np.errstate(all="ignore"):
+        Xe = np.maximum(E, u32(1)).astype(f32) - rc
+        S1 = ((np.maximum(Xe, f32(-70)) + f32(127)).astype(u32) << u32(23)).view(f32)
+        z = (E == 0).astype(f32)
+        m1 = (((hi & u32(0xFFFFF)) << u32(3)) | (lo >> u32(29)) | u32(0x3F800000)).view(f32)
+        P1 = (z * f32(-(1 - 2.0**-23)) + m1) * S1
+        pb = P1.view(u32)
+        t12 = ((pb >> u32(12)) << u32(12)).view(f32)
+        Ef = ((pb >> u32(23)) & u32(0xFF)).astype(f32)
+        u12 = ((np.maximum(Ef, f32(12)) - f32(11)).astype(u32) << u32(23)).view(f32)
+        w = t12 + u12
+        y = (w * f32(2.0**-NORM_GRID)) * w
+    return np.floor(y.astype(np.float64))
+
+
+def exponents_of(X: np.ndarray, axis: int) -> np.ndarray:
+    """int64 e per row (axis=1) / column (axis=0): the frexp exponent of the
+    largest magnitude (|x| < 2^e), 0 for a zero row / column."""
     K = X.shape[axis]
     amax = np.abs(X).max(axis=axis) if K else np.zeros(X.shape[1 - axis])
-    e = np.frexp(amax)[1].astype(np.int64)  # amax < 2^e
-    Y = np.ldexp(X, -e[:, None] if axis == 1 else -e[None, :])  # |Y| < 1, exact
-    nrm = np.sqrt(np.einsum("ij,ij->i" if axis == 1 else "ij,ij->j", Y, Y))
-    nrm *= 1 + 2.0**-30  # covers the rounding of the fp64 norm
+    return np.frexp(amax)[1].astype(np.int64), amax > 0
+
+
+def norm_sums(X: np.ndarray, e: np.ndarray, axis: int) -> np.ndarray:
+    """S = sum of `norm_terms` per row (axis=1) / column (axis=0), int64
+    (exact), in blocks."""
+    R, C = X.shape
+    out = np.zeros(R if axis == 1 else C, dtype=np.int64)
+    if R == 0 or C == 0:
+        return out
+    if axis == 1:
+        step = max(1, _oz._block_elems() // C)
+
+        def block(r0, r1, _scratch):
+            out[r0:r1] = norm_terms(X[r0:r1], e[r0:r1], 1).sum(axis=1).astype(np.int64)
+
+        _oz._parallel_blocks(R, step, block)
+        return out
+    parts: list = []
+
+    def cblock(r0, r1, _scratch):
+        parts.append(norm_terms(X[r0:r1], e, 0).astype(np.int64).sum(axis=0))
+
+    _oz._parallel_blocks(R, max(1, _oz._block_elems() // C, 256), cblock)
+    return np.sum(parts, axis=0)
+
+
+def scale_from_sums(S, e, nonzero, K: int, T: float) -> np.ndarray:
+    """int64 scale exponents mu from the exact norm sums S (`norm_sums`) and
+    the exponents e: the largest mu with 2^mu 2^(e - 20) sqrt(2^6 (S + K))
+    <= T - sqrt(K) / 2 (the norm bound times 2^mu leaves room for the
+    rounding to integers, at most 1/2 per entry), so
+    || rint(x 2^mu) ||_2 <= T. Computed in fp64 with downward slack (the
+    host and the device route both call this on the same exact S, so they
+    agree bit for bit). Zero rows / columns get 0."""
     budget = T - 0.5 * math.sqrt(max(K, 1))
     if budget <= 0:
         raise ValueError(f"too few moduli for K = {K}")
+    S = np.asarray(S, dtype=np.int64)
+    Q = (S + K).astype(np.float64) * 2.0**NORM_GRID * (1 + 2.0**-50)
     with np.errstate(divide="ignore"):
-        ex = np.frexp(budget / np.where(nrm > 0, nrm, 1.0))[1].astype(np.int64)
-    mu = ex - 1 - e  # 2^(ex - 1) <= budget / nrm
-    return np.where(amax > 0, mu, 0)
+        zq = budget / np.sqrt(np.where(Q > 0, Q, 1.0)) * (1 - 2.0**-40)
+    ex = np.frexp(zq)[1].astype(np.int64) - 1  # 2^ex <= zq
+    mu = ex + 20 - np.asarray(e, dtype=np.int64)
+    return np.where(nonzero, mu, 0)
+
+
+def scale_exponents(X: np.ndarray, axis: int, T: float) -> np.ndarray:
+    """int64 exponents mu (one per row for axis=1, per column for axis=0)
+    with || rint(X 2^mu) ||_2 <= T along `axis`, from the exact norm bound
+    (`norm_sums`, `scale_from_sums`): the same exponents as the device split.
+    Zero rows / columns get 0."""
+    e, nz = exponents_of(X, axis)
+    return scale_from_sums(norm_sums(X, e, axis), e, nz, X.shape[axis], T)
+
+
+def digits_for(mu: np.ndarray, e: np.ndarray, nonzero) -> int:
+    """Digits k of the Ozaki I split grid (`ozaki.split_from_bits` with row
+    exponents e' = 6 + 7 (k - 1) - mu, #123) that hold every scaled row:
+    |x 2^mu| < 2^(mu + e) <= 2^(6 + 7 (k - 1)), so e' >= e."""
+    top = int(np.max(np.where(nonzero, mu + e, 0), initial=0))
+    return 1 + max(0, -(-(top - (_oz.SLICE_BITS - 1)) // _oz.SLICE_BITS))
 
 
 def _canon(r: np.ndarray, m: int) -> np.ndarray:
@@ -283,25 +404,26 @@ def residues_of(Xbar: np.ndarray, moduli) -> list:
 
 
 class Residues:
-    """One operand's residues: `d` bf16 (n, Kp, Xp), K-major (the kernel's
-    layout, like `ozaki.Digits` with kmajor=True), `e` the int64 scale
-    exponents (mu of A's rows / nu of B's columns)."""
+    """One operand's residues: `d` bf16 (n, Kp, Xp) when `kmajor` (the
+    kernel's layout, like `ozaki.Digits`), else (n, Xp, Kp) (the device
+    split of a row-major A, transposed on the device per launch block);
+    `e` the int64 scale exponents (mu of A's rows / nu of B's columns)."""
 
     __slots__ = ("d", "e", "kmajor")
 
-    def __init__(self, d: torch.Tensor, e: np.ndarray):
-        self.d, self.e, self.kmajor = d, e, True
+    def __init__(self, d: torch.Tensor, e: np.ndarray, kmajor: bool = True):
+        self.d, self.e, self.kmajor = d, e, kmajor
 
     def block(self, k0, k1, x0, x1) -> torch.Tensor:
-        return self.d[:, k0:k1, x0:x1]
+        return self.d[:, k0:k1, x0:x1] if self.kmajor else self.d[:, x0:x1, k0:k1]
 
     @property
     def kp(self) -> int:
-        return self.d.shape[1]
+        return self.d.shape[1] if self.kmajor else self.d.shape[2]
 
     @property
     def xp(self) -> int:
-        return self.d.shape[2]
+        return self.d.shape[2] if self.kmajor else self.d.shape[1]
 
 
 def split(X: torch.Tensor, n: int, fam=DEFAULT_FAMILY, per: str = "col", empty=None) -> Residues:
@@ -345,6 +467,94 @@ def split(X: torch.Tensor, n: int, fam=DEFAULT_FAMILY, per: str = "col", empty=N
 
 def split_ab(A: torch.Tensor, B: torch.Tensor, n: int, fam=DEFAULT_FAMILY, empty=None):
     return split(A, n, fam, per="row", empty=empty), split(B, n, fam, per="col", empty=empty)
+
+
+# ── the device split's arithmetic (#132) ─────────────────────────────────────
+#
+# The device split cuts the scaled integer Xbar = rint(x 2^mu) into the
+# balanced base-128 digits of the Ozaki I device split (#123): with k digits
+# and the row exponent e' = 6 + 7 (k - 1) - mu (>= the row's own e), those
+# digits d_s are RNE(x 2^mu) = sum_s d_s 2^(7 (k - 1 - s)), exactly: every
+# digit but the last is exact and the last rounds half to even, which is
+# the parity of the whole. A residue is then a short dot product of digits
+# and constants, sum_j P_j c_j with P_j two digits joined (14 bits) and
+# c_j the balanced residue of 2^(14 j) (single digits for the wider moduli),
+# every partial sum an integer below 2^22, and one canonical reduction:
+# q = rint(t fl(1/m)) is the nearest integer to t / m (t / m is at least
+# 1 / (2m) from a half-integer for odd m, and the rounding error is below
+# that), so t - q m is the balanced residue. The result is a function of
+# the integers alone, so it equals `residues_of(rint(x 2^mu))` bit for bit.
+
+PAIR_LIMIT = 4190000  # |t| below this: q = rint(t fl(1/m)) is exact (< 2^22 (1 - 2^-10))
+
+
+def residue_terms(k: int, m_max: int) -> tuple:
+    """(pairs, terms) of the digit dot product for k digits and moduli up
+    to m_max: terms is [(s_hi, s_lo, weight exponent)] from the least
+    significant digit (s_hi None for a single digit), pairs whether two
+    digits are joined (when the partial sums stay below PAIR_LIMIT)."""
+    rmax = m_max // 2
+    npair = -(-k // 2)
+    pairs = npair * (64 * 128 + 64) * rmax < PAIR_LIMIT
+    terms = []
+    if pairs:
+        for j in range(npair):
+            lo = k - 1 - 2 * j
+            terms.append((lo - 1 if lo >= 1 else None, lo, 2 * _oz.SLICE_BITS * j))
+    else:
+        assert k * 64 * rmax < PAIR_LIMIT
+        terms = [(None, s, _oz.SLICE_BITS * (k - 1 - s)) for s in range(k - 1, -1, -1)]
+    return pairs, terms
+
+
+def residue_weight(x: int, m: int) -> int:
+    """The balanced residue of 2^x modulo odd m."""
+    r = pow(2, x, m)
+    return r - m if r > (m - 1) // 2 else r
+
+
+def residues_from_digits(D: np.ndarray, moduli) -> np.ndarray:
+    """Balanced residues (float32 (n, ...)) of sum_s D_s 2^(7 (k - 1 - s))
+    for float32 digits D (k, ...), by the device split's arithmetic
+    (`residue_terms`): exact, so int64 here."""
+    k = D.shape[0]
+    _, terms = residue_terms(k, max(moduli))
+    Di = D.astype(np.int64)
+    P = [Di[lo] if hi is None else Di[hi] * 128 + Di[lo] for hi, lo, _ in terms]
+    out = np.empty((len(moduli), *D.shape[1:]), dtype=np.float32)
+    for l, m in enumerate(moduli):
+        t = sum(Pj * residue_weight(x, m) for Pj, (_, _, x) in zip(P, terms, strict=True))
+        q = np.rint(t / m).astype(np.int64)
+        out[l] = t - q * m
+    return out
+
+
+def split_from_bits(X: np.ndarray, n: int, fam=DEFAULT_FAMILY, per: str = "row"):
+    """The device split (#132) on the host: (residues float32 (n, Rp, Cp) in
+    X's own layout, mu) from the raw bits of a finite fp64 X (R, C), per
+    row or per column: exponents and the exact norm bound, the scale
+    exponents (`scale_from_sums`), the Ozaki I digits on the scaled grid
+    (`ozaki.split_from_bits` with row exponents e'), and the residues from
+    the digits. Equals `split` (the fp64 route) bit for bit, residues and
+    exponents. Rows / columns whose largest element is subnormal are the
+    host's on the device route; here they are handled the same as others."""
+    f = family(fam)
+    n = check_moduli(n, f)
+    X = np.ascontiguousarray(X, dtype=np.float64)
+    Xr = X if per == "row" else np.ascontiguousarray(X.T)
+    R, C = Xr.shape
+    e, nz = exponents_of(Xr, 1)
+    mu = scale_from_sums(norm_sums(Xr, e, 1), e, nz, C, bound(n, f))
+    k = digits_for(mu, e, nz)
+    ep = (_oz.SLICE_BITS - 1) + _oz.SLICE_BITS * (k - 1) - mu
+    D, _ = _oz.split_from_bits(Xr, k, e=ep)
+    res = residues_from_digits(D, f.moduli[:n])
+    Rp, Cp = _oz._round_up(max(R, 1), TILE_K), _oz._round_up(max(C, 1), TILE_K)
+    out = np.zeros((n, Rp, Cp), dtype=np.float32)
+    out[:, :R, :C] = res
+    if per == "col":
+        out = np.ascontiguousarray(out.transpose(0, 2, 1))
+    return out, mu
 
 
 # ── residue GEMM: exact reference and the kernel's arithmetic ────────────────
@@ -479,6 +689,192 @@ def unscale(X: np.ndarray, eA: np.ndarray, eB: np.ndarray, shift: int = 0) -> np
     return np.ldexp(X, ea[:, None] + eb[None, :])
 
 
+# ── the combine: RN64 of the packed CRT output, on the device (#132) ─────────
+#
+# The device CRT leaves X' = sum_p P_p 2^(2 beta p) (the kept packed digit
+# pairs, `crt_device`; X' is X to within the dropped low digits), so
+# C = X' 2^(shift - eA_i - eB_j). The result is RN64(X') times that power of
+# two: one rounding (the host's Horner of `unpack_device` rounds once per
+# packed value after the second). For 2 beta = 24 the device builds the
+# float64 words from exact fp32 and bitvec ops (`packed_to_fp64_bits` is
+# the arithmetic, op for op):
+#   1. sign: that of the top nonzero P_p (the lower part is below half a
+#      unit of it); U_p = sign P_p, then borrows bottom up, so every
+#      U_p in [0, 2^24) and |X'| = sum_p U_p 2^(24 p);
+#   2. the top limb made nonzero by shifting limbs up (at most K - 1 steps,
+#      each lowering the exponent by 24);
+#   3. with A, B, C, D the top four limbs and lambda the bit length of A,
+#      the 72-bit window from the leading bit: S = A 2^(24 - lambda) +
+#      floor(B / 2^lambda), T and W the next 24 bits, sticky = the rest;
+#   4. significand S 2^29 + T 2^5 + q with q = RNE(W / 2^19 + sticky)
+#      (only a tie in W alone can be moved by the sticky bit), carries into
+#      T and S, and the exponent 1023 + 24 (K - 1) + lambda - 1 + E.
+# Elements whose result leaves the normal float64 range are flagged and
+# computed on the host. Other 2 beta (b8 beyond 16 moduli, b9 beyond 8) are
+# repacked to 24-bit limbs exactly on the host (`packed24`).
+
+PACK_BITS = 24  # the device combine's packed width (2 beta)
+
+
+def packed24(P: np.ndarray, g: int) -> np.ndarray:
+    """Packed values P (K, ...) of width g as float32 24-bit packed values of
+    the same integer (sign times nonnegative limbs), exact (int64)."""
+    if g == PACK_BITS:
+        return np.asarray(P, dtype=np.float32)
+    Pi = np.asarray(P).astype(np.int64)
+    K = Pi.shape[0]
+    sg = np.zeros(Pi.shape[1:], dtype=np.int64)
+    for p in range(K - 1, -1, -1):
+        sg = np.where(sg == 0, np.sign(Pi[p]), sg)
+    U = Pi * sg
+    for p in range(K - 1):
+        b = U[p] < 0
+        U[p] += b << g
+        U[p + 1] -= b
+    out, buf, nb = [], np.zeros_like(sg), 0
+    for p in range(K):
+        buf = buf + (U[p] << nb)
+        nb += g
+        while nb >= PACK_BITS:
+            out.append(buf & ((1 << PACK_BITS) - 1))
+            buf >>= PACK_BITS
+            nb -= PACK_BITS
+    out.append(buf)
+    return (np.stack(out) * sg).astype(np.float32)
+
+
+def combine_offset(K: int) -> int:
+    """The static part of the device combine's exponent: E64 =
+    E + COMBINE_OFFSET + lambda-field - 24 shifts, for K packed values."""
+    return 872 + PACK_BITS * K
+
+
+def packed_to_fp64_bits(P: np.ndarray, Eab: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """float64 bits of RN64(sum_p P_p 2^(24 p)) 2^E, by the device's
+    arithmetic (`_ozaki2_combine_kernel`, op for op in float32 / uint32).
+    `P` (K, ...) float32 24-bit packed values (balanced or not, |P_p| <
+    2^24, the sign that of the top nonzero), `Eab` = E + combine_offset(K)
+    (float32-exact integers, the kernel's ea + eb). Returns (uint64 bits,
+    flag): flag where the result leaves the normal float64 range (the bits
+    are then meaningless)."""
+    f, u = np.float32, np.uint32
+    P = [np.asarray(p, dtype=f) for p in P]
+    K = len(P)
+    Eab = np.broadcast_to(np.asarray(Eab, dtype=f), P[0].shape)
+
+    def sign(x):
+        return (x > 0).astype(f) - (x < 0).astype(f)
+
+    def floor(x):  # the device's: cast, then correct (x in [0, 2^23))
+        c = np.rint(x).astype(f)
+        return c - ((x - c) < 0).astype(f)
+
+    def pow2(field):  # 2^(field - 127) from an exponent field (float)
+        return (field.astype(u) << u(23)).view(f)
+
+    with np.errstate(all="ignore"):
+        sg = sign(P[K - 1])
+        for p in range(K - 2, -1, -1):
+            sg = (sg == 0).astype(f) * sign(P[p]) + sg
+        U = [p * sg for p in P]
+        for p in range(K - 1):
+            b = (U[p] < 0).astype(f)
+            U[p] = b * f(2.0**24) + U[p]
+            U[p + 1] = U[p + 1] - b
+        ns = np.zeros_like(sg)
+        for _ in range(K - 1):
+            z = (U[K - 1] == 0).astype(f)
+            nzf = f(1) - z
+            for p in range(K - 1, 0, -1):
+                U[p] = U[p] * nzf + U[p - 1] * z
+            U[0] = U[0] * nzf
+            ns = ns + z
+        zero = np.zeros_like(sg)
+        A = U[K - 1]
+        B, C, D = (U[K - 1 - i] if K - 1 - i >= 0 else zero for i in (1, 2, 3))
+        rest = zero
+        for p in range(K - 4):
+            rest = np.maximum(rest, (U[p] > 0).astype(f))
+        Ea = ((A.view(u) >> u(23)) & u(0xFF)).astype(f)
+        Eac = np.maximum(Ea, f(127))
+        p_sh = pow2(f(277) - Eac)  # 2^(24 - lambda)
+        p_inv = pow2(f(253) - Eac)  # 2^-lambda
+        p_lam = pow2(Eac + f(1))  # 2^lambda
+        fB = floor(B * p_inv)
+        s24 = A * p_sh + fB
+        fC = floor(C * p_inv)
+        t24 = (fB * -p_lam + B) * p_sh + fC
+        fD = floor(D * p_inv)
+        w24 = (fC * -p_lam + C) * p_sh + fD
+        mD = fD * -p_lam + D
+        sticky = np.maximum((mD > 0).astype(f), rest)
+        w1 = w24 * f(2.0**-19)
+        r = (w1 + f(MAGIC)) - f(MAGIC)
+        d = w1 - r
+        q = (d == f(0.5)).astype(f) * sticky + r
+        c1 = (q == f(32)).astype(f)
+        q = c1 * f(-32) + q
+        t24 = t24 + c1
+        c2 = (t24 == f(2.0**24)).astype(f)
+        t24 = c2 * f(-(2.0**24)) + t24
+        s24 = s24 + c2
+        c3 = (s24 == f(2.0**24)).astype(f)
+        s24 = c3 * f(-(2.0**23)) + s24
+        nz = (A != 0).astype(f)
+        E64 = ((Eab + Eac) - ns * f(PACK_BITS)) + c3
+        flag = (nz > 0) & ((E64 < 1) | (E64 > 2046))
+        E64c = np.minimum(np.maximum(E64 * nz, f(0)), f(2047))
+        Su = ((s24 - f(2.0**23)) * nz).astype(u)
+        hw = ((sg < 0).astype(u) << u(31)) | (E64c.astype(u) << u(20)) | (Su >> u(3))
+        lw = ((Su & u(7)) << u(29)) | (t24.astype(u) << u(5)) | q.astype(u)
+    bits = (hw.astype(np.uint64) << np.uint64(32)) | lw.astype(np.uint64)
+    return bits, flag
+
+
+def combine_kernel_reference(packed, ea, eb) -> np.ndarray:
+    """What `_ozaki2_combine_kernel(packed, ea, eb)` returns, on the host:
+    int32 (R + 128, 2 N), the float64 words of `packed_to_fp64_bits(packed,
+    ea + eb)` in rows 0 .. R - 1 and the row flags in out[R + p, b] (row
+    128 b + p). The words of a flagged row are unspecified. For the CPU
+    stand-in of the kernel."""
+
+    def host(x):
+        return np.asarray(x.detach().to("cpu") if isinstance(x, torch.Tensor) else x)
+
+    P, ea, eb = host(packed), host(ea), host(eb)
+    _, R, N = P.shape
+    if R % 128:
+        raise ValueError(f"rows must be a multiple of 128, got {R}")
+    Eab = ea.reshape(R, 1).astype(np.float32) + eb.reshape(1, N).astype(np.float32)
+    bits, bad = packed_to_fp64_bits(P, Eab)
+    out = np.zeros((R + 128, 2 * N), dtype=np.int32)
+    out[:R] = bits.view(np.int32).reshape(R, 2 * N)
+    out[R:, : R // 128] = bad.any(axis=1).astype(np.int32).reshape(R // 128, 128).T
+    return out
+
+
+def combine_packed(packed, eA, eB, c: Crt, rows: int, N: int, shift: int) -> np.ndarray:
+    """float64 (rows, N): RN64(X') 2^(shift - eA_i - eB_j) from the packed CRT
+    output (keep, >= rows, >= N) of one launch block: the device combine's
+    bits (`packed_to_fp64_bits`), with flagged elements as
+    ldexp(RN64(X'), E) on the host. The host reference of the combine."""
+    P = packed24(np.asarray(packed)[:, :rows, :N], 2 * c.beta)
+    K = P.shape[0]
+    E = (shift - np.asarray(eA[:rows], np.int64))[:, None] - np.asarray(eB[:N], np.int64)[None, :]
+    if rows == 0 or N == 0:
+        return np.zeros((rows, N))
+    if np.abs(E).max() >= 1 << 22:
+        raise ValueError("scale exponents out of range")
+    bits, flag = packed_to_fp64_bits(P, (E + combine_offset(K)).astype(np.float32))
+    out = bits.view(np.float64)
+    if flag.any():
+        i, j = np.nonzero(flag)
+        zero_e = np.full(len(i), combine_offset(K), dtype=np.float32)
+        b0, _ = packed_to_fp64_bits(P[:, i, j], zero_e)
+        out[i, j] = np.ldexp(b0.view(np.float64), E[i, j].astype(np.int32))
+    return out
+
+
 # ── blocking and the driver ──────────────────────────────────────────────────
 
 
@@ -512,12 +908,18 @@ def run(
     max_m=None,
     max_n=None,
     split_fn=None,
+    device_combine=None,
 ) -> torch.Tensor:
     """C = A @ B in fp64 by Ozaki II. A (M, K), B (K, N) finite fp64 on the
-    host. `launch(ra, rb, (m0, mb), (k0, kb), (n0, nb))` returns host fp32:
-    the packed CRT output (keep, mb, nb) when crt_mode == "device", the
-    residues (n, mb, nb) when "host". Narrow B (N < SWAP_N < M) computes
-    C^T = B^T A^T. K blocks (K > ~1M) are summed in fp64, in order."""
+    host. `launch(ra, rb, (m0, mb), (k0, kb), (n0, nb))` returns fp32: the
+    packed CRT output (keep, mb, nb) when crt_mode is "device" or "fused",
+    the residues (n, mb, nb) when "host". Narrow B (N < SWAP_N < M) computes
+    C^T = B^T A^T. K blocks (K > ~1M) are summed in fp64, in order.
+
+    The packed output is combined as RN64(X') times the scales
+    (`combine_packed`). `device_combine(packed, ea, eb, n, rows, N, out)`
+    (optional, the device route's `_ozaki2_combine_kernel`, same bits) does
+    it on the device band by band, as `ozaki.run` (`ozaki._run_bands`)."""
     f = family(fam)
     n = check_moduli(n, f)
     if crt_mode not in CRT_MODES:
@@ -529,13 +931,21 @@ def run(
         return torch.zeros((M, N), dtype=torch.float64)
     empty = empty or _oz._torch_empty
     ra, rb = (split_fn or split_ab)(A, B, n, f, empty)
-    C = empty((M, N), torch.float64)
-    out = C.numpy()
-    if N < _oz.SWAP_N and M > N:
-        ra, rb, M, N, out = rb, ra, N, M, out.T
+    swap = N < _oz.SWAP_N and M > N
+    if swap:
+        ra, rb, M, N = rb, ra, N, M
     mbs, kbs, nbs = plan(ra.xp, ra.kp, N, n, limit, max_m, max_n)
     dev = crt_mode != "host"
     shift = 2 * c.beta * c.j0 if dev else 0
+    if (
+        dev
+        and device_combine is not None
+        and _oz.bands_fit(mbs, kbs, N, limit, in_bytes=4 * c.keep)
+    ):
+        Ct = _oz._run_bands(ra, rb, n, M, N, mbs, nbs, kbs[0], launch, device_combine, empty)
+        return empty((N, M), torch.float64).copy_(Ct.mT) if swap else Ct
+    C = empty((N, M) if swap else (M, N), torch.float64)
+    out = C.numpy().T if swap else C.numpy()
     for m0, mb in mbs:
         mr = min(mb, M - m0)
         if mr <= 0:
@@ -544,20 +954,24 @@ def run(
             nr = min(nb, N - n0)
             acc = None
             for k0, kb in kbs:
-                got = launch(ra, rb, (m0, mb), (k0, kb), (n0, nb)).numpy()
+                got = launch(ra, rb, (m0, mb), (k0, kb), (n0, nb))
+                got = got.detach().to("cpu").numpy()
+                ea, eb = ra.e[m0 : m0 + mr], rb.e[n0 : n0 + nr]
                 if dev:
-                    X = unpack_device(got[:, :mr, :nr], c)
+                    part = combine_packed(got, ea, eb, c, mr, nr, shift)
                 else:
-                    X = crt_host(got[:, :mr, :nr], c)
-                part = unscale(X, ra.e[m0 : m0 + mr], rb.e[n0 : n0 + nr], shift)
+                    part = unscale(crt_host(got[:, :mr, :nr], c), ea, eb)
                 acc = part if acc is None else acc + part
             out[m0 : m0 + mr, n0 : n0 + nr] = acc
     return C
 
 
 def host_blocks(ra: Residues, rb: Residues, m, kk, nn):
+    """One launch's K-major (n, kb, mb) and (n, kb, nb) residues, on the host."""
     (m0, mb), (k0, kb), (n0, nb) = m, kk, nn
-    return ra.block(k0, k0 + kb, m0, m0 + mb), rb.block(k0, k0 + kb, n0, n0 + nb)
+    a = _oz.kmajor(ra.block(k0, k0 + kb, m0, m0 + mb), ra.kmajor)
+    b = _oz.kmajor(rb.block(k0, k0 + kb, n0, n0 + nb), rb.kmajor)
+    return a, b
 
 
 def reference_launch(fam=DEFAULT_FAMILY, crt_mode: str = "device"):

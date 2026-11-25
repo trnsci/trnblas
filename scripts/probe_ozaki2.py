@@ -30,7 +30,12 @@ bitwise equality of the whole result between routes of one scheme:
     NEURON_RT_VISIBLE_CORES=0 python scripts/probe_ozaki2.py e2e --out o2_e2e.json
 
 Routes: `ozaki1` (k = 8, the default route: device split and device
-combine, #125), `ozaki1_host_combine` (TRNBLAS_OZAKI_DEVICE_COMBINE=0).
+combine, #125), `ozaki1_host_combine` (TRNBLAS_OZAKI_DEVICE_COMBINE=0),
+`ozaki2` (b7, 17 moduli, all on the device: device split, fused residue
+GEMM + CRT, device combine, #132), `ozaki2_host_split` (the same with the
+host split, the route before #132). The `ozaki2` route also records its
+stages: the device split of A and of B (raw upload included), the fused
+kernel on resident residues, and the device combine with its download.
 
 Every run writes its JSON after each case and stops scheduling new cases
 once `--budget-s` (default 1080 s) has passed, so one run stays under 20 min.
@@ -238,8 +243,58 @@ def _route_ozaki1(device_combine):
     return run
 
 
+def _route_ozaki2(device_split):
+    def run(A, B):
+        return K2.gemm(A, B, 17, "b7", "fused", device_split=device_split)
+
+    return run
+
+
+def ozaki2_stages(A, B, n=17, fam="b7"):
+    """ms of the all-device route's stages (each synchronized): the split of
+    A and of B, the fused kernel on the resident residues, the combine."""
+    c = ozaki2.crt(fam, n)
+    split = K2._split_fn(True)
+    out = {}
+    t = time.perf_counter()
+    ra, _ = split(A, B[:, :1], n, ozaki2.family(fam), D._ozaki_host_empty)
+    sync()
+    out["split_a_ms"] = (time.perf_counter() - t) * 1e3
+    t = time.perf_counter()
+    _, rb = split(A[:1], B, n, ozaki2.family(fam), D._ozaki_host_empty)
+    sync()
+    out["split_b_ms"] = (time.perf_counter() - t) * 1e3
+    M, N = A.shape[0], B.shape[1]
+    if N < ozaki.SWAP_N and M > N:
+        ra, rb, M, N = rb, ra, N, M
+    mbs, kbs, nbs = ozaki2.plan(ra.xp, ra.kp, N, n)
+    launch = K2._launcher(fam, "fused", keep_on_device=True)
+    parts = [[launch(ra, rb, m, kbs[0], nn) for nn in nbs] for m in mbs]
+    sync()
+    out["fused_ms"] = timed(
+        lambda: [launch(ra, rb, m, kbs[0], nn) for m in mbs for nn in nbs], reps=2
+    )
+    bands = [p[0] if len(p) == 1 else torch.cat(p, dim=2) for p in parts]
+    sync()
+    shift = 2 * c.beta * c.j0
+
+    def comb():
+        for (m0, mb), P in zip(mbs, bands, strict=True):
+            mr = min(mb, M - m0)
+            K2.combine_packed_device(P, ra.e[m0 : m0 + mr], rb.e[:N], c, mr, N, shift)
+
+    out["combine_ms"] = timed(comb, reps=2)
+    return out
+
+
 # route -> (scheme, gemm_fp64 call, host reference of 256 sampled rows)
 E2E_ROUTES = {
+    "ozaki2": ("ozaki2", _route_ozaki2(True), lambda a, b: ozaki2.reference_gemm(a, b, 17)),
+    "ozaki2_host_split": (
+        "ozaki2",
+        _route_ozaki2(False),
+        lambda a, b: ozaki2.reference_gemm(a, b, 17),
+    ),
     "ozaki1": ("ozaki1", _route_ozaki1(True), lambda a, b: ozaki.reference_gemm(a, b, 8)),
     "ozaki1_host_combine": (
         "ozaki1",
@@ -266,6 +321,11 @@ def e2e_case(name, shape, routes, reps):
             out["bitwise_vs_" + first[scheme][0]] = bool(torch.equal(C, first[scheme][1]))
         else:
             first[scheme] = (r, C)
+        if r == "ozaki2":
+            try:
+                out.update(ozaki2_stages(A, B))
+            except Exception as exc:  # the stages are for the record
+                out["stages_error"] = repr(exc)
         rec["routes"][r] = out
         print(json.dumps({name: {r: out}}), flush=True)
     rec.update(host_ms(A, B))

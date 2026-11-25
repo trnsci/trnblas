@@ -201,6 +201,51 @@ _KERNELS = {
     },
 }
 
+# Ozaki II device split and combine (#132), verified at trn2 LNC=1 and LNC=2
+# (`test_ozaki2_device_kernels_verify`): the norm sums per row (column tiles
+# plus a tail, a partial lane fold) and per column (two partition-reduce
+# groups, a narrow matrix), the split per row and per column for every
+# family (12 digits for b7, single digits for b8 / b9, the narrow column
+# case), and the combine (column tiles plus a tail, an odd row-tile count,
+# K = 3, 4, 6 packed values).
+_O2_DEVICE = {
+    "ozaki2_norm": (lambda: _k2()._ozaki2_norm_kernel, lambda: (_i32(300, 2 * 1100), _f32(384, 1))),
+    "ozaki2_norm_wide": (
+        lambda: _k2()._ozaki2_norm_kernel,
+        lambda: (_i32(129, 2 * (64 * 512 + 7)), _f32(256, 1)),
+    ),
+    "ozaki2_norm_col": (
+        lambda: _k2()._ozaki2_norm_col_kernel,
+        lambda: (_i32(300, 2 * 1100), _f32(1, 1152)),
+    ),
+    "ozaki2_norm_col_tall": (
+        lambda: _k2()._ozaki2_norm_col_kernel,
+        lambda: (_i32(256 * 128 + 5, 2 * 241), _f32(1, 256)),
+    ),
+    **{
+        f"ozaki2_split_{f}": (
+            lambda f=f: _k2().SPLIT_KERNELS[f],
+            lambda k=k, n=n: (_i32(300, 2 * 600), _f32(384, k), _f32(1, n)),
+        )
+        for f, k, n in (("b7", 12, 24), ("b8", 8, 14), ("b9", 9, 13))
+    },
+    **{
+        f"ozaki2_split_col_{f}{tag}": (
+            lambda f=f: _k2().SPLIT_COL_KERNELS[f],
+            lambda k=k, n=n, R=R, C=C: (_i32(R, 2 * C), _f32(k, -(-C // 128) * 128), _f32(1, n)),
+        )
+        for f, k, n in (("b7", 9, 17), ("b8", 8, 14), ("b9", 9, 13))
+        for tag, R, C in (("", 300, 1100), ("_narrow", 8400, 241))
+    },
+    **{
+        f"ozaki2_combine_k{K}": (
+            lambda: _k2()._ozaki2_combine_kernel,
+            lambda K=K: (_f32(K, 384, 1100), _f32(384, 1), _f32(1, 1100)),
+        )
+        for K in (3, 4, 6)
+    },
+}
+
 
 def _k2():
     from trnblas.nki import ozaki2_kernels
@@ -291,6 +336,7 @@ def test_every_ozaki2_kernel_is_covered():
     from trnblas.nki import dispatch, ozaki2_kernels
 
     covered = {id(get(dispatch)) for get, _ in _KERNELS.values()}
+    covered |= {id(get()) for get, _ in _O2_DEVICE.values()}  # verified at LNC=1 and 2
     kernels = {
         name
         for name, obj in vars(ozaki2_kernels).items()
@@ -299,3 +345,13 @@ def test_every_ozaki2_kernel_is_covered():
     assert kernels, "no Ozaki II kernels found"
     missing = {k for k in kernels if id(getattr(ozaki2_kernels, k)) not in covered}
     assert not missing, missing
+
+
+@pytest.mark.parametrize("lnc", [1, 2])
+@pytest.mark.parametrize("kernel_id", sorted(_O2_DEVICE))
+def test_ozaki2_device_kernels_verify(kernel_id, lnc):
+    get_kernel, make_inputs = _O2_DEVICE[kernel_id]
+    result = source_to_mlir(
+        get_kernel(), *make_inputs(), target="trn2", lnc=lnc, frontend=FrontendKind.TRACER
+    )
+    result.verify()

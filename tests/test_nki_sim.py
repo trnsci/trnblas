@@ -413,3 +413,170 @@ class TestOzaki2FusedSim:
         B = torch.randn(400, 80, generator=g, dtype=torch.float64)
         C = ozaki2_kernels.gemm(A, B, 17, "b7", "fused")
         assert torch.equal(C, ozaki2.reference_gemm(A, B, 17, "b7", "device"))
+
+
+class TestOzaki2DeviceSplitSim:
+    """The Ozaki II device split and combine kernels (#132) under
+    nki.simulate, at LNC=1 and LNC=2: each kernel's raw output equals its CPU
+    stand-in (`_ozaki_ref.ozaki2_kernel_refs`, built on the host arithmetic
+    of `trnblas.ozaki2`) bit for bit, the split equals the fp64 host split,
+    and gemm_fp64(scheme="ozaki2") run all on the device equals
+    `ozaki2.reference_gemm`."""
+
+    @staticmethod
+    def _data(kind, shape, seed, per="row"):
+        import numpy as np
+
+        rng = np.random.default_rng(seed)
+        if kind == "normal":
+            return rng.standard_normal(shape)
+        if kind == "wide":
+            return rng.standard_normal(shape) * 10.0 ** rng.uniform(-30, 30, shape)
+        bits = rng.integers(0, 2**63, shape, dtype=np.uint64)
+        # subnormal / zero elements, across each row (column): no row (column)
+        # maximum is subnormal, which the device route leaves to the host
+        sub = (slice(None), slice(1, None, 3)) if per == "row" else (slice(1, None, 3), slice(None))
+        bits[sub] &= ~np.uint64(0x7FF0000000000000)
+        X = bits.view(np.float64).copy()
+        X[~np.isfinite(X)] = 1.0
+        X[::2] *= -1
+        X[1] = 0.0
+        return X
+
+    @staticmethod
+    def _refs():
+        import sys
+        from pathlib import Path
+
+        sys.path.insert(0, str(Path(__file__).parent))
+        from _ozaki_ref import ozaki2_kernel_refs
+
+        return ozaki2_kernel_refs()
+
+    @pytest.mark.parametrize("lnc", ["1", "2"])
+    @pytest.mark.parametrize(
+        "kind,shape,per",
+        [
+            ("wide", (300, 1100), "row"),
+            ("bits", (130, 513), "row"),
+            ("normal", (129, 64 * 512 + 7), "row"),  # 65 column tiles: a partial lane fold
+            ("wide", (300, 1100), "col"),
+            ("bits", (700, 241), "col"),
+            ("normal", (256 * 128 + 5, 3), "col"),  # two partition-reduce groups
+        ],
+    )
+    def test_norm_kernels_equal_reference(self, kind, shape, per, lnc, monkeypatch):
+        import nki
+        import numpy as np
+
+        from trnblas import ozaki, ozaki2
+        from trnblas.nki import ozaki2_kernels as K2
+
+        monkeypatch.setenv("NEURON_LOGICAL_NC_CONFIG", lnc)
+        X = self._data(kind, shape, sum(shape), per)
+        xw = np.ascontiguousarray(X).view(np.int32).copy()
+        axis = 1 if per == "row" else 0
+        e, _ = ozaki2.exponents_of(X, axis)
+        rc = np.full(ozaki._round_up(len(e), 128), 1003.0, np.float32)
+        rc[: len(e)] = 1003 + e
+        rc = rc[:, None] if per == "row" else np.ascontiguousarray(rc[None, :])
+        k = K2._ozaki2_norm_kernel if per == "row" else K2._ozaki2_norm_col_kernel
+        got = np.asarray(nki.simulate(k)(xw, rc))
+        name = "ozaki2_norm" if per == "row" else "ozaki2_norm_col"
+        ref = self._refs()[name](torch.from_numpy(xw), torch.from_numpy(rc)).numpy()
+        assert np.array_equal(got, ref)
+
+    @pytest.mark.parametrize("lnc", ["1", "2"])
+    @pytest.mark.parametrize(
+        "fam,n,kind,shape,per",
+        [
+            ("b7", 17, "normal", (130, 600), "row"),
+            ("b7", 17, "wide", (700, 241), "col"),
+            ("b7", 24, "bits", (128, 513), "row"),  # 12 digits
+            ("b7", 13, "bits", (300, 130), "col"),
+            ("b8", 14, "wide", (70, 129), "row"),  # single digits in the dot product
+            ("b9", 13, "normal", (129, 600), "col"),
+            ("b7", 17, "normal", (1, 1), "row"),
+        ],
+    )
+    def test_split_kernels_equal_host_split(self, fam, n, kind, shape, per, lnc, monkeypatch):
+        import numpy as np
+
+        from trnblas import ozaki2
+        from trnblas.nki import ozaki2_kernels as K2
+
+        monkeypatch.setenv("NEURON_LOGICAL_NC_CONFIG", lnc)
+        X = torch.from_numpy(self._data(kind, shape, n, per))
+        got = K2._oz2_device_split(X, n, fam, per)
+        assert got is not None
+        d, mu = got
+        ref, mu_ref = ozaki2.split_from_bits(X.numpy(), n, fam, per)
+        assert np.array_equal(d.float().numpy(), ref) and np.array_equal(mu, mu_ref)
+        r = ozaki2.split(X, n, fam, per=per)
+        host = r.d.float().numpy()
+        assert np.array_equal(ref, host.transpose(0, 2, 1) if per == "row" else host)
+
+    @pytest.mark.parametrize("lnc", ["1", "2"])
+    @pytest.mark.parametrize("K", [3, 4, 6])
+    def test_combine_kernel_equals_reference(self, K, lnc, monkeypatch):
+        """Ties, sticky bits, carries into the exponent, zero, negative and
+        small values, and rows out of the float64 range (flagged)."""
+        import random
+
+        import nki
+        import numpy as np
+
+        from trnblas import ozaki2
+        from trnblas.nki import ozaki2_kernels as K2
+
+        monkeypatch.setenv("NEURON_LOGICAL_NC_CONFIG", lnc)
+        R, N = 384, 600
+        rnd = random.Random(K)
+        top = 24 * K - 2
+        xs = [0, 1, -1, (1 << 53) + 1, (1 << 54) - 1]
+        for b in range(54, top, 5):
+            xs += [(1 << b) + (1 << (b - 53)), (1 << b) + (1 << (b - 53)) + 1, (1 << (b + 1)) - 1]
+        xs += [rnd.randrange(-(1 << top), 1 << top) >> rnd.randrange(0, top) for _ in range(5000)]
+        vals = [xs[rnd.randrange(len(xs))] for _ in range(R * N)]
+        P = np.zeros((K, R * N), np.float32)
+        for j, x in enumerate(vals):
+            for p in range(K - 1):
+                lo = x & 0xFFFFFF
+                lo -= (lo >= 1 << 23) << 24
+                P[p, j] = lo
+                x = (x - lo) >> 24
+            P[K - 1, j] = x
+        P = P.reshape(K, R, N)
+        ea = np.array([[rnd.randrange(-300, 300)] for _ in range(R)], np.float32)
+        ea += ozaki2.combine_offset(K)
+        ea[7] += 900  # overflow
+        ea[200] -= 1300  # below the normal range
+        eb = np.array([[rnd.randrange(-300, 300) for _ in range(N)]], np.float32)
+        got = np.asarray(nki.simulate(K2._ozaki2_combine_kernel)(P, ea, eb))
+        ref = ozaki2.combine_kernel_reference(P, ea, eb)
+        assert np.array_equal(got[R:], ref[R:])
+        ok = ref[R:, : R // 128].T.reshape(-1) == 0
+        assert not ok[7] and not ok[200] and ok.sum() >= R - 4
+        assert np.array_equal(got[:R][ok], ref[:R][ok])
+
+    @pytest.mark.parametrize("lnc", ["1", "2"])
+    @pytest.mark.parametrize(
+        "M,K,N,trans", [(150, 500, 90, (False, False)), (300, 200, 700, (True, True))]
+    )
+    def test_gemm_fp64_all_device(self, M, K, N, trans, lnc, monkeypatch):
+        """Device split, fused residue GEMM + CRT, device combine (over two
+        bands and N blocks for the wide product), bitwise the reference."""
+        from trnblas import gemm_fp64, ozaki, ozaki2
+
+        monkeypatch.setenv("NEURON_LOGICAL_NC_CONFIG", lnc)
+        monkeypatch.setattr(ozaki, "LAUNCH_M", 256)
+        monkeypatch.setattr(ozaki, "LAUNCH_N", 512)
+        g = torch.Generator().manual_seed(M + N)
+        A = torch.randn(M, K, generator=g, dtype=torch.float64)
+        B = torch.randn(K, N, generator=g, dtype=torch.float64)
+        a = A.T.contiguous() if trans[0] else A
+        b = B.T.contiguous() if trans[1] else B
+        C = gemm_fp64(a, b, transA=trans[0], transB=trans[1], scheme="ozaki2")
+        assert torch.equal(C, ozaki2.reference_gemm(A, B, max_m=256, max_n=512))
+        err = ((C - A @ B).abs() / (A.abs() @ B.abs())).max().item()
+        assert err < 2e-15

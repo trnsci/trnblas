@@ -27,7 +27,7 @@ trnblas/
 │   ├── level3.py            # gemm, gemm_fp64, batched_gemm, symm, syrk, trsm, trmm, metric_inv_half
 │   ├── ozaki.py             # gemm_fp64 host half: split (+ device-split twin), schedule, plan, combine, bitwise reference
 │   ├── fp64.py              # fp64-class vector ops (trnsci#169): float-float sum/dot/nrm2/axpy/combine, exact int-limb path, CPU reference
-│   ├── ozaki2.py            # gemm_fp64(scheme="ozaki2") prototype (#132): scaling, residues, CRT (host + device twin), reference
+│   ├── ozaki2.py            # gemm_fp64(scheme="ozaki2") prototype (#132): exact norm-bound scaling, residues, CRT, RN64 combine (host + device twins), reference
 │   ├── parallel.py          # SPMD multi-core GEMM + DF-MP2 (torchrun)
 │   └── nki/
 │       ├── __init__.py
@@ -36,7 +36,7 @@ trnblas/
 │       ├── fp64_kernels.py  # trnblas.fp64 NKI kernels (reductions + E0 probe kernels)
 │       ├── _native_fp64.py  # their trnblas::fp64_* nki_op registrations
 │       ├── fp64_probe.py    # E0 / E2 / LNC device-probe logic (scripts/probe_fp64.py)
-│       ├── ozaki2_kernels.py # Ozaki II residue-GEMM + device-CRT kernels and launcher (#132)
+│       ├── ozaki2_kernels.py # Ozaki II kernels (#132): device split (norm sums, residues), residue GEMM + CRT (fused), combine; the all-device route
 │       └── multicore.py     # opt-in single-process pair-energy split (set_cores)
 ├── tests/
 │   ├── conftest.py          # Fixtures: random matrices, SPD matrices
@@ -98,6 +98,14 @@ since it's reused across all auxiliary basis indices P.
   `ozaki.split_from_bits`), ~0.55 ns per element, against ~11 ns for the host
   split on one host core; the kernel runs at ~87-96 TFLOP/s of bf16 slice
   products on squares.
+
+- **Ozaki II (`gemm_fp64(scheme="ozaki2")`, #132) runs all on the device:**
+  scale exponents from an exact integer norm bound (order-, layout- and
+  LNC-free; the host split uses the same rule), residues from the Ozaki I
+  digits on the scaled grid, the fused residue GEMM + CRT, and an RN64
+  combine on the device. All bitwise `ozaki2.reference_gemm`. `ozaki1` stays
+  the default until the device e2e timing shows a win; `scheme="auto"` by
+  shape is the follow-up.
 
 - **fp64-class vector ops (`trnblas.fp64`, trnsci/trnsci#169).** Float-float
   (double-word fp32, ~48 bits, fp32 exponent range) reductions with a fixed,

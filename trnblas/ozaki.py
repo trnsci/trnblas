@@ -219,7 +219,7 @@ def split(
     return digits, e
 
 
-def split_from_bits(X: np.ndarray, slices: int) -> tuple[np.ndarray, np.ndarray]:
+def split_from_bits(X: np.ndarray, slices: int, e=None) -> tuple[np.ndarray, np.ndarray]:
     """The device split's algorithm (`_ozaki_split_kernel`, #123) on the host,
     op for op in float32 and uint32: digits of a per-row split from the raw
     fp64 bits of X (R, C), as float32 (k, R, C), and the row exponents (R,).
@@ -230,6 +230,11 @@ def split_from_bits(X: np.ndarray, slices: int) -> tuple[np.ndarray, np.ndarray]
     `e` comes from the bit length, which the device route leaves to the host.
     Non-finite X is not representable. For tests and documentation; the
     host split (`split`) is faster on the host.
+
+    `e` (optional, int (R,)): the row exponents to split with instead of the
+    rows' own, each at least the row's own (|x| < 2^e_i). The digits are
+    then those of RNE(x 2^(6 - e_i + 7 (k - 1))) on the same grid: the Ozaki
+    II device split (#132) uses this to cut its scaled integers.
     """
     k = check_slices(slices)
     f32 = np.float32
@@ -242,8 +247,11 @@ def split_from_bits(X: np.ndarray, slices: int) -> tuple[np.ndarray, np.ndarray]
         return np.asarray(u, dtype=np.uint32).view(np.float32)
 
     E = (hi >> 20) & 0x7FF
-    emax = E.max(axis=1) if C else np.zeros(R, dtype=np.uint32)
-    e = np.where(emax > 0, emax.astype(np.int64) - 1022, 0)
+    if e is None:
+        emax = E.max(axis=1) if C else np.zeros(R, dtype=np.uint32)
+        e = np.where(emax > 0, emax.astype(np.int64) - 1022, 0)
+    else:
+        e = np.asarray(e, dtype=np.int64).reshape(R)
     # |x| 2^(20 - e) = P1 + P2 + P3 (disjoint bits); exponent clamped at -70
     Xe = np.maximum(E, 1).astype(f32) - (1003 + e).astype(f32)[:, None]
     S1 = as_f32((np.maximum(Xe, f32(-70)) + f32(127)).astype(np.uint32) << 23)
@@ -577,12 +585,13 @@ def run(
     return C
 
 
-def bands_fit(mbs: list, kbs: list, N: int, limit: int = BLOCK_BYTES) -> bool:
+def bands_fit(mbs: list, kbs: list, N: int, limit: int = BLOCK_BYTES, in_bytes: int = 8) -> bool:
     """True when `_run_bands` applies: one K block, and every row band's
-    (hi, lo) (8 mb N bytes) and float64 words with flag rows
-    (8 (mb + 128) N bytes) stay within `limit` (#112)."""
+    kernel output (`in_bytes` per element: 8 for the (hi, lo) pair) and
+    float64 words with flag rows (8 (mb + 128) N bytes) stay within
+    `limit` (#112)."""
     mb = max(b for _, b in mbs)
-    return len(kbs) == 1 and 8 * (mb + TILE_K) * N <= limit
+    return len(kbs) == 1 and max(8 * (mb + TILE_K), in_bytes * mb) * N <= limit
 
 
 def _run_bands(da, db, k, M, N, mbs, nbs, kk, launch, device_combine, empty):

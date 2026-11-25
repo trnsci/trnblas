@@ -21,6 +21,8 @@ from typing import Any
 import numpy as np
 import torch
 
+from .. import ozaki2 as _o2_host  # pure host code (the Ozaki II split's constants)
+
 try:
     import nki
     import nki.isa as nisa
@@ -1328,6 +1330,16 @@ _KERNEL_DTYPES: dict[str, frozenset] = {
     **{f"ozaki2_gemm_{f}": frozenset({torch.bfloat16}) for f in ("b7", "b8", "b9")},
     **{f"ozaki2_crt_{f}": frozenset({torch.float32}) for f in ("b7", "b8", "b9")},
     **{f"ozaki2_fused_{f}": frozenset({torch.bfloat16}) for f in ("b7", "b8", "b9")},
+    # Ozaki II device split and combine (#132): raw fp64 bits + exponent
+    # constants; packed CRT output + exponents
+    **{
+        f"ozaki2_split{c}_{f}": frozenset({torch.int32, torch.float32})
+        for f in ("b7", "b8", "b9")
+        for c in ("", "_col")
+    },
+    "ozaki2_norm": frozenset({torch.int32, torch.float32}),
+    "ozaki2_norm_col": frozenset({torch.int32, torch.float32}),
+    "ozaki2_combine": frozenset({torch.float32}),
 }
 
 
@@ -4068,10 +4080,12 @@ if HAS_NKI:
     def _ozs_u(W):
         return nl.ndarray((128, W), dtype=nl.uint32, buffer=nl.sbuf)
 
-    def _ozs_split_tile(t, rc, out, r0, c0, ws, k, W):
+    def _ozs_split_tile(t, rc, out, r0, c0, ws, k, W, rmods=None):
         """Digits of one (128, W) tile of fp64 bits `t` into
         out[:, r0 : r0 + 128, c0 : c0 + ws]; `rc` = 1003 + e, (128, 1) per
-        row or (128, W) per column."""
+        row or (128, W) per column. With `rmods` (a tuple of odd moduli, the
+        Ozaki II device split, #132) the balanced residues of the digits'
+        integer modulo each go to out[l] instead (`_ozs_residues`)."""
         f, u = _ozs_f, _ozs_u
         lo = t[:, 0 : 2 * W : 2]
         hi = t[:, 1 : 2 * W : 2]
@@ -4264,6 +4278,9 @@ if HAS_NKI:
         nisa.tensor_scalar(
             dst=sg, data=sb, op0=nl.multiply, operand0=-2.0, op1=nl.add, operand1=1.0
         )
+        if rmods is not None:
+            _ozs_residues(Rr, F, sg, out, r0, c0, ws, k, W, rmods)
+            return
         for s in range(k):
             d = nl.ndarray((128, W), dtype=nl.bfloat16, buffer=nl.sbuf)
             if s:
@@ -4278,7 +4295,75 @@ if HAS_NKI:
                 nisa.tensor_tensor(dst=d, data1=Rr[0], data2=sg, op=nl.multiply)
             nl.store(out[s, r0 : r0 + 128, c0 : c0 + ws], value=d[:, 0:ws])
 
-    def _ozs_split_rows(xw, rcs, out, r0, n, k):
+    def _ozs_digit(Rr, F, s, W):
+        """|digit s| (fp32, before the sign): Rr[0], or
+        (Rr[s - 1] - F[s - 1]) (-128) + Rr[s]."""
+        if s == 0:
+            return Rr[0]
+        r = _ozs_f(W)
+        nisa.tensor_tensor(dst=r, data1=Rr[s - 1], data2=F[s - 1], op=nl.subtract)
+        dd = _ozs_f(W)
+        nisa.scalar_tensor_tensor(
+            dst=dd, data=r, op0=nl.multiply, operand0=-128.0, op1=nl.add, operand1=Rr[s]
+        )
+        return dd
+
+    def _ozs_residues(Rr, F, sg, out, r0, c0, ws, k, W, rmods):
+        """Ozaki II device split (#132, `ozaki2.residues_from_digits`): the
+        integer sum_s d_s 2^(7 (k - 1 - s)) of one tile's digits, as signed
+        terms P_j (two digits joined, or single ones; `ozaki2.residue_terms`),
+        then per modulus t = sum_j P_j c_j (exact: every partial sum an
+        integer below 2^22), q = rint(t fl(1/m)) (the nearest integer to
+        t / m) and the balanced residue t - q m, stored as bf16 into
+        out[l, r0 : r0 + 128, c0 : c0 + ws]."""
+        f = _ozs_f
+        _pairs, terms = _o2_host.residue_terms(k, max(rmods))
+        P = []
+        for hi, lo, _x in terms:
+            v = _ozs_digit(Rr, F, lo, W)
+            if hi is not None:
+                v2 = f(W)
+                nisa.scalar_tensor_tensor(
+                    dst=v2,
+                    data=_ozs_digit(Rr, F, hi, W),
+                    op0=nl.multiply,
+                    operand0=128.0,
+                    op1=nl.add,
+                    operand1=v,
+                )
+                v = v2
+            p = f(W)
+            nisa.tensor_tensor(dst=p, data1=v, data2=sg, op=nl.multiply)
+            P.append(p)
+        for l in range(len(rmods)):
+            m = rmods[l]
+            acc = f(W)
+            for j in range(len(terms)):
+                cj = float(_o2_host.residue_weight(terms[j][2], m))
+                if j == 0:
+                    nisa.tensor_scalar(dst=acc, data=P[0], op0=nl.multiply, operand0=cj)
+                else:
+                    nisa.scalar_tensor_tensor(
+                        dst=acc, data=P[j], op0=nl.multiply, operand0=cj, op1=nl.add, operand1=acc
+                    )
+            u1 = f(W)
+            nisa.tensor_scalar(
+                dst=u1,
+                data=acc,
+                op0=nl.multiply,
+                operand0=1.0 / m,
+                op1=nl.add,
+                operand1=12582912.0,
+            )
+            q = f(W)  # rint(t / m), exact (|t| < 2^22: see ozaki2.PAIR_LIMIT)
+            nisa.tensor_scalar(dst=q, data=u1, op0=nl.subtract, operand0=12582912.0)
+            d = nl.ndarray((128, W), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.scalar_tensor_tensor(
+                dst=d, data=q, op0=nl.multiply, operand0=-float(m), op1=nl.add, operand1=acc
+            )
+            nl.store(out[l, r0 : r0 + 128, c0 : c0 + ws], value=d[:, 0:ws])
+
+    def _ozs_split_rows(xw, rcs, out, r0, n, k, rmods=None):
         """All column tiles of the 128-row tile from r0 (n real rows)."""
         C = xw.shape[1] // 2
         Cp = out.shape[2]
@@ -4287,10 +4372,11 @@ if HAS_NKI:
         rc = nl.load(rcs[r0 : r0 + 128, 0:1])
         if CF:
             for c in nl.affine_range(CF):
-                _ozs_split_tile(_ozs_tile(xw, r0, n, c * W, W, W), rc, out, r0, c * W, W, k, W)
+                t = _ozs_tile(xw, r0, n, c * W, W, W)
+                _ozs_split_tile(t, rc, out, r0, c * W, W, k, W, rmods)
         if Cp - CF * W:
             t = _ozs_tile(xw, r0, n, CF * W, C - CF * W, W)
-            _ozs_split_tile(t, rc, out, r0, CF * W, Cp - CF * W, k, W)
+            _ozs_split_tile(t, rc, out, r0, CF * W, Cp - CF * W, k, W, rmods)
 
     @nki.jit
     def _ozaki_split_kernel(xw, rcs):
@@ -4366,7 +4452,7 @@ if HAS_NKI:
             _ozs_emax_cols(xw, out, ct, tail, W)
         return out
 
-    def _ozs_split_cols(xw, rcs, out, c0, cw, ws, k, W, rows):
+    def _ozs_split_cols(xw, rcs, out, c0, cw, ws, k, W, rows, rmods=None):
         """The W-column tile from c0 (cw real columns, ws stored), for the row
         tiles `rows` = (first row, full tiles, tail start, tail rows)."""
         r0, RTn, rt, tail = rows
@@ -4377,9 +4463,11 @@ if HAS_NKI:
         if RTn:
             for r in nl.affine_range(RTn):
                 rr = r0 + r * 128
-                _ozs_split_tile(_ozs_tile(xw, rr, 128, c0, cw, W), rc, out, rr, c0, ws, k, W)
+                t = _ozs_tile(xw, rr, 128, c0, cw, W)
+                _ozs_split_tile(t, rc, out, rr, c0, ws, k, W, rmods)
         if tail:
-            _ozs_split_tile(_ozs_tile(xw, rt, tail, c0, cw, W), rc, out, rt, c0, ws, k, W)
+            t = _ozs_tile(xw, rt, tail, c0, cw, W)
+            _ozs_split_tile(t, rc, out, rt, c0, ws, k, W, rmods)
 
     @nki.jit
     def _ozaki_split_col_kernel(xw, rcs):
