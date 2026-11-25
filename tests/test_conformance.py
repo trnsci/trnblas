@@ -46,6 +46,7 @@ c64 and not c128"``.
 
 from __future__ import annotations
 
+import math
 import warnings
 
 import pytest
@@ -103,11 +104,12 @@ DEVICE_KNOWN = {
     "complex128-fp32": (
         "trnsci/trnblas#130",
         "device complex128 computes at fp32 precision (fp64 tolerance), and complex "
-        "mv / triu / tril are unsupported on device",
+        "mv / triu / tril / right-side solve_triangular are unsupported on device",
     ),
     "complex64-unsupported": (
         "trnsci/trnblas#127",
-        "complex aten.mv / triu / tril are unsupported on the neuron device",
+        "complex aten.mv / triu / tril and right-side solve_triangular are unsupported "
+        "on the neuron device, even when the output is empty",
     ),
     "fp64-tolerance-syrk": (
         "trnsci/trnblas#100",
@@ -119,41 +121,57 @@ DEVICE_KNOWN = {
     ),
 }
 
-# complex64 ops that reach complex mv / triu / tril (or a complex reduction)
-# in device aten. gemm / syrk / ger / axpy / scal compute correctly.
-_C64_UNSUPPORTED = {
-    "test_gemv",
-    "test_symv",
-    "test_trmv",
-    "test_symm",
-    "test_triangular",
-    "test_iamax",
-    "test_asum_complex_blas",
-    "test_iamax_complex_blas",
-}
-_C64_UNSUPPORTED_LEVEL1 = {"dot", "nrm2", "asum"}
+# The rules below match the device runs case for case (trnsci/trnsci#35,
+# windows 6 and 7: the same 2022 failures, NEW 0, XPASS 0).
 
 
-def _empty_output(name, p):
-    """True when the case's output has no elements (it passes on any device)."""
-    trans = p.get("trans") in (True, "T")
+def _complex_unsupported(name, p):
+    """The case reaches complex aten mv / triu / tril, or a right-side
+    solve_triangular, with a non-empty operand. That fails on device for
+    complex64 and complex128 alike, even when the output is empty (the square
+    A of a symm / trmm / trsm with m == 0 or n == 0 is still triangularised).
+    gemm / ger / axpy / scal / dot / nrm2 / asum / iamax and left-side trsm
+    (the blocked path) compute complex64 correctly."""
+    if name == "test_gemv":
+        return 0 not in p["mn"]
+    if name in ("test_symv", "test_trmv"):
+        return p["n"] > 0
+    if name == "test_symm":
+        m, n = p["mn"]
+        return (m if CANON_SIDE[p["side"]] == "left" else n) > 0
+    if name == "test_triangular":
+        m, n = p["mn"]
+        side = p["flags"][0]
+        na = m if side == "left" else n
+        if p["op"] == "trsm":
+            return side == "right" and na > 0
+        return na > 0
+    if name == "test_syrk":  # beta * C reads the uplo triangle of C (triu / tril)
+        return p["Ckind"] == "symmetric" and p["nk"][0] > 0
+    return False
+
+
+def _complex128_inexact(name, p):
+    """A complex128 case with a non-empty output that is not exact at fp32
+    precision. With an empty inner dimension the product is exact zeros, so
+    only a beta * C (or beta * y) term can miss the fp64 tolerance.
+    nrm2 / asum / iamax and left-side trsm pass at fp64 tolerance on device."""
     if name == "test_level1":
-        return p["op"] in ("axpy", "scal") and 0 in p["shape"]
+        return p["op"] in ("axpy", "scal", "dot") and math.prod(p["shape"]) > 0
     if name == "test_gemv":
         m, n = p["mn"]
-        return (n if trans else m) == 0
-    if name in ("test_symv", "test_trmv"):
-        return p["n"] == 0
-    if name in ("test_ger", "test_symm", "test_triangular"):
-        return 0 in p["mn"]
+        out, inner = (n, m) if p["trans"] in (True, "T") else (m, n)
+        return out > 0 and (inner > 0 or p["by"] == "beta0.5")
+    if name == "test_ger":
+        return 0 not in p["mn"]
     if name == "test_gemm":
-        m, _, n = p["mkn"]
-        return m == 0 or n == 0
+        m, k, n = p["mkn"]
+        return m > 0 and n > 0 and (k > 0 or p["bc"] in ("beta0.5", "beta1"))
     if name == "test_batched":
-        return p["case"] == "batch0"
-    if name == "test_syrk":
+        return p["case"] != "batch0"
+    if name == "test_syrk":  # the output is n x n for either trans
         n, k = p["nk"]
-        return (k if trans else n) == 0
+        return n > 0 and (k > 0 or p["Ckind"] == "symmetric")
     return False
 
 
@@ -169,12 +187,10 @@ def _device_known_category(node):
     ):
         return "stride0-harness"
     dtype = p.get("dtype")
-    if dtype not in (C64, C128) or _empty_output(name, p):
-        return None
-    if dtype == C128:
+    if dtype == C64:
+        return "complex64-unsupported" if _complex_unsupported(name, p) else None
+    if dtype == C128 and (_complex_unsupported(name, p) or _complex128_inexact(name, p)):
         return "complex128-fp32"
-    if name in _C64_UNSUPPORTED or (name == "test_level1" and p["op"] in _C64_UNSUPPORTED_LEVEL1):
-        return "complex64-unsupported"
     return None
 
 

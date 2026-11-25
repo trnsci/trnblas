@@ -58,6 +58,10 @@ ALLOWED = {
     "ozaki_emax_col": frozenset({torch.int32}),
     "ozaki_split": frozenset({torch.int32, F32}),
     "ozaki_split_col": frozenset({torch.int32, F32}),
+    # Ozaki II (#132): bf16 residues into the residue GEMM, fp32 residues into the CRT
+    **{f"ozaki2_gemm_{f}": frozenset({BF16}) for f in ("b7", "b8", "b9")},
+    **{f"ozaki2_crt_{f}": FP32 for f in ("b7", "b8", "b9")},
+    **{f"ozaki2_fused_{f}": frozenset({BF16}) for f in ("b7", "b8", "b9")},
 }
 
 # Raw kernel attribute on `dispatch` for each op (XLA / simulator paths).

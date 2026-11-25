@@ -27,6 +27,7 @@ trnblas/
 │   ├── level3.py            # gemm, gemm_fp64, batched_gemm, symm, syrk, trsm, trmm, metric_inv_half
 │   ├── ozaki.py             # gemm_fp64 host half: split (+ device-split twin), schedule, plan, combine, bitwise reference
 │   ├── fp64.py              # fp64-class vector ops (trnsci#169): float-float sum/dot/nrm2/axpy/combine, exact int-limb path, CPU reference
+│   ├── ozaki2.py            # gemm_fp64(scheme="ozaki2") prototype (#132): scaling, residues, CRT (host + device twin), reference
 │   ├── parallel.py          # SPMD multi-core GEMM + DF-MP2 (torchrun)
 │   └── nki/
 │       ├── __init__.py
@@ -35,6 +36,7 @@ trnblas/
 │       ├── fp64_kernels.py  # trnblas.fp64 NKI kernels (reductions + E0 probe kernels)
 │       ├── _native_fp64.py  # their trnblas::fp64_* nki_op registrations
 │       ├── fp64_probe.py    # E0 / E2 / LNC device-probe logic (scripts/probe_fp64.py)
+│       ├── ozaki2_kernels.py # Ozaki II residue-GEMM + device-CRT kernels and launcher (#132)
 │       └── multicore.py     # opt-in single-process pair-energy split (set_cores)
 ├── tests/
 │   ├── conftest.py          # Fixtures: random matrices, SPD matrices

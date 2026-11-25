@@ -141,6 +141,8 @@ def gemm_fp64(
     slices: int = 8,
     transA: bool = False,
     transB: bool = False,
+    scheme: str = "ozaki1",
+    moduli: int | None = None,
 ) -> torch.Tensor:
     """fp64-class matrix product op(A) @ op(B) on the bf16 Tensor Engine (#22).
 
@@ -170,10 +172,29 @@ def gemm_fp64(
     device. The kernel runs on the native TorchNeuron path (Trn2/Trn3);
     elsewhere, under set_backend("pytorch"), and for non-finite operands the
     result is host fp64 `A @ B`. For alpha / beta, scale the fp64 result.
+
+    `scheme="ozaki2"` (prototype, #132) uses the Ozaki scheme II instead:
+    integer scaling, balanced residues modulo `moduli` coprime moduli below
+    2^7 (default 17: about 53 bits, the level of slices=8), one bf16 GEMM per
+    modulus with a modular reduction at each 4096-term PSUM group, and the
+    CRT on the device. `moduli` is then the precision knob (about 3.3 bits
+    per modulus; `slices` is ignored); the result is deterministic and equals
+    `trnblas.ozaki2.reference_gemm` bit for bit. The operands are scaled and
+    reduced on the host. `scheme="ozaki1"` (the default) is unchanged.
     """
     from .nki.dispatch import nki_gemm_fp64
     from .ozaki import check_slices
 
+    if scheme not in ("ozaki1", "ozaki2"):
+        raise ValueError(f"gemm_fp64: scheme must be 'ozaki1' or 'ozaki2', got {scheme!r}")
+    if scheme == "ozaki2":
+        from . import ozaki2
+
+        moduli = ozaki2.check_moduli(
+            ozaki2.DEFAULT_MODULI if moduli is None else moduli, ozaki2.DEFAULT_FAMILY
+        )
+    elif moduli is not None:
+        raise ValueError("gemm_fp64: moduli applies to scheme='ozaki2' only")
     slices = check_slices(slices)
     transA, transB = trans_flag(transA, "transA"), trans_flag(transB, "transB")
     for name, X in (("A", A), ("B", B)):
@@ -190,6 +211,10 @@ def gemm_fp64(
     device = A.device
     a = a.detach().to("cpu", torch.float64)
     b = b.detach().to("cpu", torch.float64)
+    if scheme == "ozaki2":
+        from .nki.ozaki2_kernels import gemm as ozaki2_gemm
+
+        return ozaki2_gemm(a, b, moduli).to(device)
     return nki_gemm_fp64(a, b, slices).to(device)
 
 
