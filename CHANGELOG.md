@@ -7,10 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] — 2026-11-25
+
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.1, native TorchNeuron) — see trnsci/trnsci#35.
+
+Headline: `gemm_fp64(..., scheme="ozaki2")`, an Ozaki scheme II prototype (#132, #133): about 53 bits from 17 bf16 GEMMs in one launch, bitwise equal to its host reference on Trn2 at LNC=1 and LNC=2, at 0.53–0.57× Ozaki I's kernel time (end to end slower than Ozaki I until the operand split moves to the device; `scheme="ozaki1"` stays the default). `trnblas.fp64`, fp64-class sums, dots and norms on the device (trnsci/trnsci#169, #134): bitwise equal to the CPU reference and LNC-invariant, and 32× faster than the host fp64 round trip for a 1e7 dot.
+
 ### Added
 
 - **`trnblas.fp64`: fp64-class vector arithmetic on the device**
-  (trnsci/trnsci#169, step 1; draft, device measurement pending). Reductions,
+  (trnsci/trnsci#169, step 1; #134). Reductions,
   dot products, norms, axpy and the `gemm_fp64` combine step at better than
   fp32 precision, three ways:
   - **float-float** (double-word fp32, `fp64.FF`): Knuth TwoSum, Dekker
@@ -44,6 +50,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   groups whose terms leave the window to the host exact path). In `nki.simulate` every kernel equals the reference bit for bit at
   LNC=1 and LNC=2, and all verify (`source_to_mlir(...).verify()`) at trn2
   LNC=1 and LNC=2. Policies: inf or nan in, nan out.
+  On Trn2 (window 7, #134) every kernel is bitwise equal to the CPU
+  reference and LNC=1 equals LNC=2 bit for bit. A double-word dot of 1e7
+  elements takes 2.5 ms end to end, against 81 ms for the host fp64 round
+  trip; at 1e5 the host round trip is faster (0.25 against 0.52 ms).
 - **The `gemm_fp64` combine on the device** (`fp64.ff_to_fp64_bits`,
   `fp64_kernels.combine_bits_device`, `_fp64_ff_bits_kernel`): the float64
   bits of RN64(hi + lo) 2^(eA_i + eB_j + off) built from exact fp32 and
