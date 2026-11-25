@@ -9,6 +9,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`trnblas.fp64`: fp64-class vector arithmetic on the device**
+  (trnsci/trnsci#169, step 1; draft, device measurement pending). Reductions,
+  dot products, norms, axpy and the `gemm_fp64` combine step at better than
+  fp32 precision, three ways:
+  - **float-float** (double-word fp32, `fp64.FF`): Knuth TwoSum, Dekker
+    FastTwoSum and FMA-free Dekker TwoProd (Veltkamp split), with the
+    double-word additions and products of Joldes, Muller and Popescu (2017).
+    About 48 significant bits in fp32's exponent range. `from_fp64` builds
+    the canonical (hi, lo) from the raw fp64 bits, with range checks
+    (OverflowError past fp32, optional ValueError below 2^-102);
+  - **integer-emulated, exact** (`exact_sum`, `exact_dot`, `combine_exact`):
+    fixed-point digits cut from the raw fp64 bits (21-bit for sums, 12-bit
+    for dot products) and accumulated in int32 limbs with explicit carries,
+    exactly rounded at any condition number (CPU reference of the device
+    algorithm);
+  - **hybrid** (the default): float-float partials per (partition, chunk)
+    on the device, then an exactly rounded host fp64 sum of the 1024 fp32
+    partials, the `reduction="pairwise"` pattern of trnsolver#140 raised in
+    precision.
+
+  `sum`, `dot` and `nrm2` take float32, float64 or FF operands and an
+  `accumulate` arm (`"plain"`, `"comp"` (Sum2 / Dot2), `"sloppy"`,
+  `"accurate"`, the default) for measurement. `nrm2` scales each lane group
+  by a power of two, so it neither overflows nor underflows. One fixed
+  order that depends only on n (4 chunks of (128, W) lanes, then fixed
+  halving trees) makes every result LNC-invariant and bitwise reproducible.
+  The `pytorch` backend is a CPU reference doing the device's fp32
+  operations one for one; the `nki` backend runs 15 new reduction kernels
+  (`trnblas/nki/fp64_kernels.py`, registered as `trnblas::fp64_*` native
+  ops), including an exact arm (`accumulate="exact"`, float32 sum and dot):
+  21-bit digits in a 126-bit window per lane group, GpSimd int32 lanes,
+  shift-and-mask carries, exactly rounded on the host (a sticky flag sends
+  groups whose terms leave the window to the host exact path). In `nki.simulate` every kernel equals the reference bit for bit at
+  LNC=1 and LNC=2, and all verify (`source_to_mlir(...).verify()`) at trn2
+  LNC=1 and LNC=2. Policies: inf or nan in, nan out.
+- **The `gemm_fp64` combine on the device** (`fp64.ff_to_fp64_bits`,
+  `fp64_kernels.combine_bits_device`, `_fp64_ff_bits_kernel`): the float64
+  bits of RN64(hi + lo) 2^(eA_i + eB_j + off) built from exact fp32 and
+  bitvec ops, bitwise equal to `ozaki.combine` (rows with non-finite or
+  out-of-range elements are flagged and recomputed on the host). Not wired
+  into `gemm_fp64` yet.
+- **Device probes for the hardware window** (`scripts/probe_fp64.py`,
+  `tests/test_fp64_neuron.py`): E0 tests per engine (VectorE, GpSimd,
+  ScalarE) whether fp32 add / subtract / multiply round to nearest even on
+  ties, near-overflow, subnormal and cancelling inputs, whether TwoSum and
+  TwoProd are exact, whether any two-op instruction is a single-rounding
+  FMA, and how TensorE + PSUM round fp32 products and accumulation; E2
+  measures correct bits and ns per element of every arm at n = 1e5, 1e6
+  and 1e7 against the host fp64 round trip it replaces; E3 times the device
+  combine against download + host combine; an LNC digest run compares
+  LNC=1 and LNC=2 bit for bit.
+- **`scripts/fp64_accuracy.py`**: the CPU accuracy table (correct bits
+  against mpmath) on CG vectors, Ogita-Rump-Oishi ill-conditioned dots
+  (cond 1e4 to 1e30), wide exponent ranges, a DFT grid quadrature, energy
+  sums and gemm_fp64-combine-shaped partials.
 - **`gemm_fp64(..., scheme="ozaki2")`: an Ozaki scheme II prototype** (#132;
   Ozaki, Uchino and Imamura, arXiv:2504.08009). Integer scaling by the
   Cauchy–Schwarz bound, balanced residues modulo `moduli` (default 17)

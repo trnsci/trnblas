@@ -26,12 +26,16 @@ trnblas/
 │   ├── level2.py            # gemv, symv, trmv, ger
 │   ├── level3.py            # gemm, gemm_fp64, batched_gemm, symm, syrk, trsm, trmm, metric_inv_half
 │   ├── ozaki.py             # gemm_fp64 host half: split (+ device-split twin), schedule, plan, combine, bitwise reference
+│   ├── fp64.py              # fp64-class vector ops (trnsci#169): float-float sum/dot/nrm2/axpy/combine, exact int-limb path, CPU reference
 │   ├── ozaki2.py            # gemm_fp64(scheme="ozaki2") prototype (#132): scaling, residues, CRT (host + device twin), reference
 │   ├── parallel.py          # SPMD multi-core GEMM + DF-MP2 (torchrun)
 │   └── nki/
 │       ├── __init__.py
 │       ├── dispatch.py      # auto/pytorch/nki dispatch, NKI kernels, native/XLA path selection
 │       ├── _native.py       # TorchNeuron custom ops (nki_op), loaded lazily
+│       ├── fp64_kernels.py  # trnblas.fp64 NKI kernels (reductions + E0 probe kernels)
+│       ├── _native_fp64.py  # their trnblas::fp64_* nki_op registrations
+│       ├── fp64_probe.py    # E0 / E2 / LNC device-probe logic (scripts/probe_fp64.py)
 │       ├── ozaki2_kernels.py # Ozaki II residue-GEMM + device-CRT kernels and launcher (#132)
 │       └── multicore.py     # opt-in single-process pair-energy split (set_cores)
 ├── tests/
@@ -92,6 +96,16 @@ since it's reused across all auxiliary basis indices P.
   `ozaki.split_from_bits`), ~0.55 ns per element, against ~11 ns for the host
   split on one host core; the kernel runs at ~87-96 TFLOP/s of bf16 slice
   products on squares.
+
+- **fp64-class vector ops (`trnblas.fp64`, trnsci/trnsci#169).** Float-float
+  (double-word fp32, ~48 bits, fp32 exponent range) reductions with a fixed,
+  LNC-invariant order (4 chunks of (128, W) lanes, halving trees, exact host
+  finish of the 1024 partials), plus an exact int32-limb path from raw fp64
+  bits. The `pytorch` backend is op-for-op the kernels' arithmetic, so device
+  results must equal it bitwise; that assumes RN-even fp32 on VectorE, which
+  `scripts/probe_fp64.py e0` checks first in a window. Double-word is ~5 bits
+  worse than an fp64 sum (2^-48 cond): use the exact path for ill-conditioned
+  dots and for the gemm_fp64 combine.
 
 - **Level 3 dominates.** Level 1/2 are included for API completeness but
   won't get NKI kernels initially. The Tensor Engine is wasted on vector ops.
