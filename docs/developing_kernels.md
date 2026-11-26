@@ -134,7 +134,14 @@ which of these features it uses:
 - **Persistent operands** — load once, reuse across many ops.
 - **PSUM accumulator** — 32-bit accumulator tile independent of
   SBUF, sized for systolic-array output. Use the `accumulate=True`
-  path on `nc_matmul` to keep results there.
+  path on `nc_matmul` to keep results there, and open every
+  accumulation group with an `accumulate=False` matmul: peel the first
+  K step out of the `nl.affine_range` loop (its index is symbolic), or
+  use `accumulate=(k > 0)` over a static `range`. Allocate the tile with
+  `nl.ndarray(..., buffer=nl.psum)`; do not zero it with `nl.zeros` and
+  accumulate onto that, which the `nc_matmul` docs call undefined
+  behaviour on NeuronCore-v3 (Trn2) (trnsci/trnsci#185;
+  `tests/test_psum_accumulate_lint.py` checks this).
 - **Fused non-matmul reductions** — patterns like
   `T * (2T − Tᵀ) / denom .sum()` have no cuBLAS equivalent. NKI
   lets us express them.

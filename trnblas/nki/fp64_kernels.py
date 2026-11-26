@@ -669,23 +669,24 @@ if HAS_NKI:
     def _fp64_probe_pe_kernel(at, b):
         """TensorE + PSUM: (2, M, N) of at^T b for at (K, M), b (K, N) fp32,
         K a multiple of 128 (unrolled: keep K small). Output 0: one nc_matmul per 128-row K tile, all
-        accumulated in one PSUM tile (accumulate=True). Output 1: each K tile
-        into a fresh PSUM tile, evicted and summed on VectorE in order (so
-        products and in-PSUM sums of one tile can be told apart from the
-        cross-tile accumulation)."""
+        accumulated in one PSUM tile (K tile 0 overwrites, the rest
+        accumulate). Output 1: each K tile into a fresh PSUM tile, evicted and
+        summed on VectorE in order (so products and in-PSUM sums of one tile
+        can be told apart from the cross-tile accumulation). Every PSUM tile
+        is opened by an accumulate=False matmul (trnsci#185)."""
         K, M = at.shape
         N = b.shape[1]
         KT = K // 128
         out = nl.ndarray((2, M, N), dtype=nl.float32, buffer=nl.shared_hbm)
-        ps = nl.zeros((M, N), dtype=nl.float32, buffer=nl.psum)
+        ps = nl.ndarray((M, N), dtype=nl.float32, buffer=nl.psum)
         acc = _fv_t((M, N))
         nisa.memset(dst=acc, value=0.0)
         for kt in range(KT):
             a_t = nl.load(at[kt * 128 : (kt + 1) * 128, 0:M])
             b_t = nl.load(b[kt * 128 : (kt + 1) * 128, 0:N])
-            nisa.nc_matmul(dst=ps, stationary=a_t, moving=b_t, accumulate=True)
-            p1 = nl.zeros((M, N), dtype=nl.float32, buffer=nl.psum)
-            nisa.nc_matmul(dst=p1, stationary=a_t, moving=b_t, accumulate=True)
+            nisa.nc_matmul(dst=ps, stationary=a_t, moving=b_t, accumulate=kt > 0)
+            p1 = nl.ndarray((M, N), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(dst=p1, stationary=a_t, moving=b_t, accumulate=False)
             t = _fv_t((M, N))
             nisa.tensor_copy(dst=t, src=p1)
             nisa.tensor_tensor(dst=acc, data1=acc, data2=t, op=nl.add)
