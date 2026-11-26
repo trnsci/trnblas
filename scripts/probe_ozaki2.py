@@ -256,14 +256,14 @@ def ozaki2_stages(A, B, n=17, fam="b7"):
     c = ozaki2.crt(fam, n)
     split = K2._split_fn(True)
     out = {}
-    t = time.perf_counter()
-    ra, _ = split(A, B[:, :1], n, ozaki2.family(fam), D._ozaki_host_empty)
-    sync()
-    out["split_a_ms"] = (time.perf_counter() - t) * 1e3
-    t = time.perf_counter()
-    _, rb = split(A[:1], B, n, ozaki2.family(fam), D._ozaki_host_empty)
-    sync()
-    out["split_b_ms"] = (time.perf_counter() - t) * 1e3
+    f = ozaki2.family(fam)
+    # Each split is warmed before it is timed: the partner operand is a
+    # one-row (one-column) slice, whose split is a new shape and compiles on
+    # the first call.
+    ra, _ = split(A, B[:, :1], n, f, D._ozaki_host_empty)
+    out["split_a_ms"] = timed(lambda: split(A, B[:, :1], n, f, D._ozaki_host_empty), reps=2)
+    _, rb = split(A[:1], B, n, f, D._ozaki_host_empty)
+    out["split_b_ms"] = timed(lambda: split(A[:1], B, n, f, D._ozaki_host_empty), reps=2)
     M, N = A.shape[0], B.shape[1]
     if N < ozaki.SWAP_N and M > N:
         ra, rb, M, N = rb, ra, N, M
