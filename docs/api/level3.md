@@ -127,34 +127,86 @@ The Ozaki scheme II (Ozaki, Uchino and Imamura, arXiv:2504.08009) in place
 of the slicing above; `scheme="ozaki1"` stays the default. Host half:
 `trnblas/ozaki2.py`; kernels: `trnblas/nki/ozaki2_kernels.py`.
 
-1. **Scale (host).** Row i of A by 2^mu_i and column j of B by 2^nu_j, then
-   round to integers. The exponents come from the Cauchy–Schwarz bound
-   ||Ā_i||·||B̄_j|| ≤ M/4, with M the product of the moduli.
-2. **Residues (host).** Balanced residues modulo `moduli` (n) pairwise
-   coprime odd moduli below 2^7 (127, 125, 123, ...), |r| ≤ 63, exact in bf16.
+1. **Scale (device, #132).** Row i of A by 2^mu_i and column j of B by
+   2^nu_j, then round to integers. The exponents come from the
+   Cauchy–Schwarz bound ||Ā_i||·||B̄_j|| ≤ M/4, with M the product of the
+   moduli. The norm bound is an exact integer sum, so it does not depend on
+   the order of summation, the operand's layout or the LNC split. Each
+   element contributes τ = ⌊w²/2⁶⌋, where w is |x|·2^(20−e) taken from the
+   bit fields, cut to 12 significant bits, and rounded up by one unit. w²
+   is then exact in fp32. The device sums τ in 9-bit limbs, and every
+   partial sum is an integer below 2²⁴ (`_ozaki2_norm_kernel`,
+   `_ozaki2_norm_col_kernel`). The host finishes the sums in int64 and
+   computes the exponents (`trnblas.ozaki2.scale_from_sums`). The host
+   split uses the same rule. The bound is within about 2⁻¹⁰ of the fp64
+   norm's square. So the exponents equal those of an fp64-norm rule, except
+   within that distance of a power-of-two boundary, and they are never
+   larger. On 12,000 test rows they were all equal.
+2. **Residues (device).** These are balanced residues modulo `moduli` (n)
+   pairwise coprime odd moduli below 2^7 (127, 125, 123, ...), with |r| ≤ 63,
+   exact in bf16. The split kernels (`_ozaki2_split_<fam>_kernel`, and
+   `_col` for columns) reuse the Ozaki I device split (#123) on a scaled
+   grid. With k digits and the row exponent e' = 6 + 7(k−1) − mu, the
+   balanced base-128 digits are RNE(x·2^mu), exactly. Every digit but the
+   last is exact, and the last rounds half to even, which sets the parity
+   of the whole. A residue is then a short dot product of digits and the
+   balanced residues of powers of two. Two digits are joined into 14-bit
+   terms where that keeps every partial sum below 2²², and single digits
+   are used for the wider b8/b9 moduli. One rounding,
+   q = rint(t·fl(1/m)), follows. It gives the nearest integer to t/m,
+   because t/m is at least 1/(2m) from a half-integer and the rounding
+   error is smaller than that. The result is then t − q·m. The residues
+   are a function of the integers alone, so they equal the host split's
+   (`trnblas.ozaki2.split_from_bits` is the device arithmetic on the
+   host). The host split still runs:
+   - for a row or column whose largest element is subnormal;
+   - for an operand whose raw bits or residues reach 2 GiB (#112);
+   - for more than 12 digits (b8 beyond about 22 moduli);
+   - under `TRNBLAS_OZAKI2_DEVICE_SPLIT=0`.
 3. **Residue GEMMs (device, one launch for all moduli).** One bf16 GEMM per
    modulus with fp32 PSUM groups of 4096 terms (4096·63² < 2^24, exact),
    and a 4-instruction VectorE modular reduction at each group close, then
    a canonical residue.
-4. **CRT (device).** Exact fp32 integer ops: limb sums of the CRT weights,
-   the quotient by M, carries to balanced digits, packed digit pairs; the
-   host sums the top few in fp64 and unscales.
+4. **CRT (device, in the same launch: `crt_mode="fused"`, the default).**
+   Exact fp32 integer ops: limb sums of the CRT weights, the quotient by M,
+   carries to balanced digits, packed digit pairs.
+5. **Combine (device).** C = RN64(X')·2^(shift − mu_i − nu_j), where X' is
+   the kept packed integer. This is one correctly rounded rounding; the
+   earlier host Horner rounded once per packed value. The float64 words are
+   built on the device by `_ozaki2_combine_kernel` from exact fp32 and
+   bitvec ops:
+   - the sign of the top nonzero packed value, borrows to nonnegative
+     24-bit limbs, and shifts that make the top limb nonzero;
+   - the 72-bit window from the leading bit, and a sticky bit;
+   - round to nearest even, with carries into the exponent.
+
+   `trnblas.ozaki2.packed_to_fp64_bits` is the same arithmetic on the host.
+   It is checked against exact rational rounding, ties and carries
+   included. Results outside the normal float64 range are flagged and
+   computed on the host as ldexp(RN64(X'), E). Packed widths other than 24
+   bits (b8 beyond 16 moduli, b9 beyond 8) are combined on the host by the
+   same rule (`trnblas.ozaki2.combine_packed`), and so is
+   `TRNBLAS_OZAKI_DEVICE_COMBINE=0`.
 
 `moduli` is the precision knob, about 3.3 bits per modulus (n GEMMs, against
 k(k+1)/2 for Ozaki I). The default of 17 gives about 53 bits of |A||B|, the
 level of `slices=8` (36 GEMMs). The result is deterministic: residues are
 canonical, so every bit is a function of the scaled integers only,
-independent of the tiling and the LNC split, and equals
+independent of the tiling, the layout and the LNC split, and equals
 `trnblas.ozaki2.reference_gemm`.
 
 On Trn2 (one logical core, LNC=2, kernel time on resident operands, #132),
-the device result is bitwise equal to `reference_gemm` at LNC=1 and LNC=2.
+the device result was bitwise equal to `reference_gemm` at LNC=1 and LNC=2.
 At 53 bits, the fused kernel (`crt_mode="fused"`) takes 0.57× Ozaki I's
 kernel time at 4096³ and 0.53× at 8192³. On the DF-MP2 shapes
 (3267, 8400, 241) and (8192, 3508, 241) it takes 0.53× and 0.57×. At
-2048³ and below it is no faster (1.0× at 2048³, 2.0× at 1024³). End to
-end, the prototype loses to Ozaki I, because it still scales and reduces
-the operands on the host.
+2048³ and below it is no faster (1.0× at 2048³, 2.0× at 1024³).
+
+Until #132 the operands were scaled and reduced on the host, at about 46 to
+155 ns per element, so the prototype lost end to end. The device split and
+combine are new, and their Trn2 timing (`scripts/probe_ozaki2.py e2e`) is
+pending. `scheme="ozaki1"` stays the default until that timing shows an
+end-to-end win. A `scheme="auto"` choice by shape is the follow-up.
 
 ## `symm(alpha, A, B, beta=0.0, C=None, side="left", uplo="upper")`
 

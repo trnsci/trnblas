@@ -17,7 +17,7 @@ import warnings
 
 import pytest
 import torch
-from _ozaki_ref import DEVICE_SPLIT_KERNELS, device_split_ops
+from _ozaki_ref import DEVICE_SPLIT_KERNELS, device_split_ops, ozaki2_kernel_refs
 
 import trnblas
 import trnblas.nki
@@ -42,7 +42,14 @@ EXPECTED_OPS = GEMM_OPS | {
     "ozaki_emax_col",
     "ozaki_split",
     "ozaki_split_col",
-    *(f"ozaki2_{kind}_{fam}" for kind in ("gemm", "crt", "fused") for fam in ("b7", "b8", "b9")),
+    *(
+        f"ozaki2_{kind}_{fam}"
+        for kind in ("gemm", "crt", "fused", "split", "split_col")
+        for fam in ("b7", "b8", "b9")
+    ),
+    "ozaki2_norm",
+    "ozaki2_norm_col",
+    "ozaki2_combine",
 }
 
 
@@ -500,6 +507,8 @@ def native_stub(monkeypatch):
     )
     for name, fn in device_split_ops().items():
         ops[name] = rec(name, fn)
+    for name, fn in ozaki2_kernel_refs().items():  # Ozaki II device split / combine (#132)
+        ops[name] = rec(name, fn)
     # the gemm_fp64 device combine (#125) launches through fp64_kernels.call
     ff_bits = rec("fp64_ff_bits", lambda *t: torch.from_numpy(fp64.ff_bits_kernel_reference(*t)))
 
@@ -582,11 +591,25 @@ class TestHostWrappersOnNativePath:
         assert native_stub == [*split, "ozaki_gemm", "fp64_ff_bits"]
         assert torch.equal(out, ozaki.reference_gemm(A, B))
 
-    def test_gemm_fp64_ozaki2_uses_residue_and_crt_ops(self, native_stub):
+    def test_gemm_fp64_ozaki2_runs_all_on_the_device(self, native_stub):
+        """Ozaki II (#132): A split per row and B per column on the device
+        (exponents, norm sums, residues), the fused residue GEMM + CRT, and
+        the device combine."""
         A = torch.randn(130, 300, dtype=torch.float64)
         B = torch.randn(300, 70, dtype=torch.float64)
         out = trnblas.gemm_fp64(A, B, scheme="ozaki2", moduli=12)
-        assert native_stub == ["ozaki2_gemm_b7", "ozaki2_crt_b7"]
+        split_a = ["ozaki_emax", "ozaki2_norm", "ozaki2_split_b7"]
+        split_b = ["ozaki_emax_col", "ozaki2_norm_col", "ozaki2_split_col_b7"]
+        assert native_stub == [*split_a, *split_b, "ozaki2_fused_b7", "ozaki2_combine"]
+        assert torch.equal(out, ozaki2.reference_gemm(A, B, 12))
+
+    def test_gemm_fp64_ozaki2_two_launch_crt(self, native_stub):
+        from trnblas.nki import ozaki2_kernels
+
+        A = torch.randn(130, 300, dtype=torch.float64)
+        B = torch.randn(300, 70, dtype=torch.float64)
+        out = ozaki2_kernels.gemm(A, B, 12, "b7", "device", device_split=False)
+        assert native_stub == ["ozaki2_gemm_b7", "ozaki2_crt_b7", "ozaki2_combine"]
         assert torch.equal(out, ozaki2.reference_gemm(A, B, 12))
 
     def test_trsm_rides_gemm_op(self, native_stub):

@@ -62,6 +62,15 @@ ALLOWED = {
     **{f"ozaki2_gemm_{f}": frozenset({BF16}) for f in ("b7", "b8", "b9")},
     **{f"ozaki2_crt_{f}": FP32 for f in ("b7", "b8", "b9")},
     **{f"ozaki2_fused_{f}": frozenset({BF16}) for f in ("b7", "b8", "b9")},
+    # Ozaki II device split and combine (#132): raw bits + fp32 constants; fp32 packed CRT
+    **{
+        f"ozaki2_split{c}_{f}": frozenset({torch.int32, F32})
+        for f in ("b7", "b8", "b9")
+        for c in ("", "_col")
+    },
+    "ozaki2_norm": frozenset({torch.int32, F32}),
+    "ozaki2_norm_col": frozenset({torch.int32, F32}),
+    "ozaki2_combine": FP32,
 }
 
 # Raw kernel attribute on `dispatch` for each op (XLA / simulator paths).

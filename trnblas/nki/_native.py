@@ -132,6 +132,49 @@ def ozaki_split_col(xw: torch.Tensor, rcs: torch.Tensor) -> torch.Tensor:
 
 
 # ── Ozaki II prototype (#132) ────────────────────────────────────────────────
+# The device split's norm sums and the device combine (family-independent).
+
+
+def _norm_fake(xw, rcs):
+    C = xw.shape[1] // 2
+    T = -(-C // 512)
+    levels = 0
+    while levels < 9 and T * 2 ** (9 + levels + 1) <= 2**24:
+        levels += 1
+    return xw.new_empty((xw.shape[0], 4 * (512 >> levels)), dtype=torch.float32)
+
+
+@nki_op("trnblas::ozaki2_norm", mutates_args={}, fake_fn=_norm_fake)
+def ozaki2_norm(xw: torch.Tensor, rcs: torch.Tensor) -> torch.Tensor:
+    from . import ozaki2_kernels as _k2
+
+    return _k2._ozaki2_norm_kernel(xw, rcs)
+
+
+def _norm_col_fake(xw, rcs):
+    nt = -(-xw.shape[0] // 128)
+    ng = max(1, -(-nt // 255))
+    return xw.new_empty((4 * ng, xw.shape[1] // 2), dtype=torch.float32)
+
+
+@nki_op("trnblas::ozaki2_norm_col", mutates_args={}, fake_fn=_norm_col_fake)
+def ozaki2_norm_col(xw: torch.Tensor, rcs: torch.Tensor) -> torch.Tensor:
+    from . import ozaki2_kernels as _k2
+
+    return _k2._ozaki2_norm_col_kernel(xw, rcs)
+
+
+@nki_op(
+    "trnblas::ozaki2_combine",
+    mutates_args={},
+    fake_fn=lambda p, ea, eb: p.new_empty((p.shape[1] + 128, 2 * p.shape[2]), dtype=torch.int32),
+)
+def ozaki2_combine(packed: torch.Tensor, ea: torch.Tensor, eb: torch.Tensor) -> torch.Tensor:
+    from . import ozaki2_kernels as _k2
+
+    return _k2._ozaki2_combine_kernel(packed, ea, eb)
+
+
 # One residue-GEMM op and one device-CRT op per moduli family; the kernels
 # live in `ozaki2_kernels.py`.
 
@@ -160,9 +203,26 @@ def _register_ozaki2(fam: str):
         keep = _o2.crt(fam, at.shape[0]).keep
         return at.new_empty((keep, at.shape[2], b.shape[2]), dtype=torch.float32)
 
+    def split(xw: torch.Tensor, rcs: torch.Tensor, mods: torch.Tensor) -> torch.Tensor:
+        return _k2.SPLIT_KERNELS[fam](xw, rcs, mods)
+
+    def split_col(xw: torch.Tensor, rcs: torch.Tensor, mods: torch.Tensor) -> torch.Tensor:
+        return _k2.SPLIT_COL_KERNELS[fam](xw, rcs, mods)
+
+    def split_fake(xw, rcs, mods):
+        rp, cp = (-(-x // 128) * 128 for x in (xw.shape[0], xw.shape[1] // 2))
+        return xw.new_empty((mods.shape[1], rp, cp), dtype=torch.bfloat16)
+
     gemm.__name__, crt.__name__ = f"ozaki2_gemm_{fam}", f"ozaki2_crt_{fam}"
     fused.__name__ = f"ozaki2_fused_{fam}"
+    split.__name__, split_col.__name__ = f"ozaki2_split_{fam}", f"ozaki2_split_col_{fam}"
     return {
+        split.__name__: nki_op(
+            f"trnblas::{split.__name__}", split, mutates_args={}, fake_fn=split_fake
+        ),
+        split_col.__name__: nki_op(
+            f"trnblas::{split_col.__name__}", split_col, mutates_args={}, fake_fn=split_fake
+        ),
         gemm.__name__: nki_op(
             f"trnblas::{gemm.__name__}", gemm, mutates_args={}, fake_fn=gemm_fake
         ),
@@ -299,6 +359,9 @@ OPS = {
     "ozaki_emax_col": ozaki_emax_col,
     "ozaki_split_col": ozaki_split_col,
     **{k: v for fam in ("b7", "b8", "b9") for k, v in _register_ozaki2(fam).items()},
+    "ozaki2_norm": ozaki2_norm,
+    "ozaki2_norm_col": ozaki2_norm_col,
+    "ozaki2_combine": ozaki2_combine,
 }
 
 

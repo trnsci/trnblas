@@ -7,7 +7,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`gemm_fp64(scheme="ozaki2")` runs all on the device** (#132). The
+  operands are no longer scaled and reduced on the host, which cost 46–155
+  ns per element and made the prototype lose end to end.
+  - **Device split.** Each operand is uploaded as its raw fp64 bits and
+    split in its own layout, as in Ozaki I (#123):
+    - the Ozaki I exponent maxima;
+    - the exact norm sums (`_ozaki2_norm_kernel`,
+      `_ozaki2_norm_col_kernel`), finished on the host into the scale
+      exponents;
+    - the residues (`_ozaki2_split_<fam>_kernel`, `_col`). These are the
+      Ozaki I digits of RNE(x·2^mu) on the scaled grid, with a digit dot
+      product and one exact canonical reduction per modulus.
+
+    `trnblas.ozaki2.split_from_bits` is that arithmetic on the host. Its
+    residues and exponents equal the host split's.
+  - **Fused kernel.** The residue GEMMs and the CRT run in one launch.
+    `crt_mode="fused"` is now the default of `ozaki2_kernels.gemm`.
+  - **Device combine** (`_ozaki2_combine_kernel`). RN64 of the packed CRT
+    integer, times the scales, is built on the device from exact fp32 and
+    bitvec ops. It runs band by band and is downloaded straight into the
+    result, as in the Ozaki I combine (#125).
+  - **Fallbacks.** The host split (the same residues) runs for:
+    - a subnormal row or column maximum;
+    - operands of 2 GiB and more;
+    - more than 12 digits;
+    - `TRNBLAS_OZAKI2_DEVICE_SPLIT=0`.
+
+    The host combine (the same bits) runs for:
+    - flagged out-of-range results;
+    - packed widths other than 24 bits (b8 beyond 16 moduli, b9 beyond 8);
+    - a failing combine launch;
+    - `TRNBLAS_OZAKI_DEVICE_COMBINE=0`.
+  - **Checks.** Every new kernel's MLIR verifies at trn2 LNC=1 and LNC=2.
+    Under `nki.simulate` at both LNCs, each kernel's raw output equals its
+    CPU stand-in, and `gemm_fp64(scheme="ozaki2")` equals
+    `ozaki2.reference_gemm` bit for bit.
+  - **Still pending.** The Trn2 timing (`scripts/probe_ozaki2.py e2e`:
+    4096³, 8192³ and the DF-MP2 shapes, against Ozaki I and host fp64 on 2
+    and 12 threads) has not run yet. `scheme="ozaki1"` stays the default
+    until it shows the end-to-end win. A `scheme="auto"` choice by shape is
+    a follow-up.
+
 ### Changed
+
+- **Ozaki II reference: exact norm bound and one rounding** (#132).
+  `ozaki2.scale_exponents` now takes the Cauchy–Schwarz norm bound from an
+  exact integer sum of per-element terms τ = ⌊w²/2⁶⌋, with w an upper bound
+  of |x|·2^(20−e) at 12 bits, built from the bit fields
+  (`ozaki2.norm_terms`). The device and the host give the same bits, in any
+  order, layout or LNC split. The fp64 norm was order-dependent. The bound
+  is within about 2⁻¹⁰ of the fp64 norm's square, and the exponents are
+  never larger. On 12,000 test rows (normal, ±10⁴ and sparse data) they
+  equal the old rule's. The combine of the device CRT output is now
+  RN64(X') times the scales (`ozaki2.combine_packed`): one rounding,
+  against one per packed value for the earlier Horner (`unpack_device`,
+  kept). `ozaki2.reference_gemm` results can change in the last bit.
+  `ozaki.split_from_bits` takes optional row exponents `e`, and
+  `ozaki2.Residues` takes `kmajor`.
 
 - **`gemm_fp64`: the combine runs on the device** (#125). The kernel's
   (hi, lo) blocks no longer come down to the host: `_fp64_ff_bits_kernel`

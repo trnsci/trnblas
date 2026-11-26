@@ -182,8 +182,11 @@ def gemm_fp64(
     modulus with a modular reduction at each 4096-term PSUM group, and the
     CRT on the device. `moduli` is then the precision knob (about 3.3 bits
     per modulus; `slices` is ignored); the result is deterministic and equals
-    `trnblas.ozaki2.reference_gemm` bit for bit. The operands are scaled and
-    reduced on the host. `scheme="ozaki1"` (the default) is unchanged.
+    `trnblas.ozaki2.reference_gemm` bit for bit. It runs all on the device:
+    the operands are scaled (exact norm bound) and reduced to residues from
+    their raw bits, the residue GEMMs and the CRT run in one kernel, and
+    the combine (one rounding, RN64) builds the float64 words on the
+    device. `scheme="ozaki1"` (the default) is unchanged.
     """
     from .nki.dispatch import nki_gemm_fp64
     from .ozaki import check_slices

@@ -121,3 +121,88 @@ DEVICE_SPLIT_KERNELS = (
     "_ozaki_split_kernel",
     "_ozaki_split_col_kernel",
 )
+
+
+def ozaki2_kernel_refs() -> dict:
+    """CPU stand-ins for the Ozaki II device-split and combine ops (#132):
+    each returns its kernel's raw output (layout included), built on the
+    host arithmetic of `trnblas.ozaki2` (`norm_terms`, `ozaki.split_from_bits`
+    with given exponents, `residues_from_digits`, `combine_kernel_reference`).
+    For tests that run the native route on the host, and to check the
+    kernels' raw outputs under the simulator."""
+    from trnblas import ozaki, ozaki2
+
+    def x_of(xw):
+        xw = xw.detach().cpu() if isinstance(xw, torch.Tensor) else torch.from_numpy(xw)
+        return xw.contiguous().view(torch.float64).numpy()
+
+    def arr(t):
+        return t.detach().cpu().numpy() if isinstance(t, torch.Tensor) else np.asarray(t)
+
+    def limbs(tau):
+        t = tau.astype(np.int64)
+        return [(t >> (9 * i)) & 511 if i < 3 else t >> 27 for i in range(4)]
+
+    def norm(xw, rcs):
+        X = x_of(xw)
+        R, C = X.shape
+        e = arr(rcs)[:R, 0].astype(np.int64) - 1003
+        tau = ozaki2.norm_terms(X, e, 1)
+        T = -(-C // 512)
+        levels = 0
+        while levels < 9 and T * 2 ** (9 + levels + 1) <= 2**24:
+            levels += 1
+        Wo = 512 >> levels
+        pad = np.zeros((R, T * 512))
+        pad[:, :C] = tau
+        out = [l.reshape(R, -1, Wo).sum(axis=1) for l in limbs(pad)]
+        return torch.from_numpy(np.concatenate(out, axis=1).astype(np.float32))
+
+    def norm_col(xw, rcs):
+        X = x_of(xw)
+        R, C = X.shape
+        e = arr(rcs)[0, :C].astype(np.int64) - 1003
+        tau = ozaki2.norm_terms(X, e, 0)
+        NT = -(-R // 128)
+        NG = max(1, -(-NT // 255))
+        out = np.zeros((4, NG, C))
+        for i, l in enumerate(limbs(tau)):
+            for g in range(NG):
+                out[i, g] = l[g * 255 * 128 : (g + 1) * 255 * 128].sum(axis=0)
+        return torch.from_numpy(out.reshape(4 * NG, C).astype(np.float32))
+
+    def split(fam, per):
+        def op(xw, rcs, mods):
+            X = x_of(xw)
+            n = arr(mods).shape[1]
+            rc = arr(rcs)
+            if per == "col":
+                X = np.ascontiguousarray(X.T)
+                rc = rc.T
+            R, C = X.shape
+            k = rc.shape[1]
+            ep = rc[:R, 0].astype(np.int64) - 1003
+            D, _ = ozaki.split_from_bits(X, k, e=ep)
+            res = ozaki2.residues_from_digits(D, ozaki2.family(fam).moduli[:n])
+            out = np.zeros((n, ozaki._round_up(R, 128), ozaki._round_up(C, 128)), np.float32)
+            out[:, :R, :C] = res
+            if per == "col":
+                out = np.ascontiguousarray(out.transpose(0, 2, 1))
+            return torch.from_numpy(out).to(torch.bfloat16)
+
+        return op
+
+    ops = {
+        "ozaki2_norm": norm,
+        "ozaki2_norm_col": norm_col,
+        "ozaki2_combine": lambda p, ea, eb: torch.from_numpy(
+            ozaki2.combine_kernel_reference(p, ea, eb)
+        ),
+    }
+    for fam in ("b7", "b8", "b9"):
+        ops[f"ozaki2_split_{fam}"] = split(fam, "row")
+        ops[f"ozaki2_split_col_{fam}"] = split(fam, "col")
+    return ops
+
+
+OZAKI2_DEVICE_KERNELS = ("_ozaki_emax_kernel", "_ozaki_emax_col_kernel")
