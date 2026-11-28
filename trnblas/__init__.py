@@ -9,7 +9,7 @@ Target workloads: DF-MP2 tensor contractions, Fock matrix builds,
 Cholesky-based density fitting, and general scientific linear algebra.
 """
 
-__version__ = "0.14.0"
+__version__ = "0.15.0"
 
 # fp64-class vector arithmetic (float-float and exact integer paths)
 from . import fp64

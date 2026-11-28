@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] — 2026-11-28
+
 ### Changed
 
 - **`gemm_fp64`: the combine runs on the device** (#125). The kernel's
@@ -30,6 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   output (words and flag rows) on the host. The end-to-end device timing is
   pending a Trn2 window (`scripts/probe_ozaki2.py e2e`,
   `tests/test_ozaki_neuron.py`).
+
 ### Fixed
 
 - **Every PSUM accumulation group now opens with an `accumulate=False`
