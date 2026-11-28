@@ -21,6 +21,17 @@ host fp64 at 2 and 12 threads, max_cw on 256 sampled rows against an
 independent near-exact reference, and bitwise equality of those rows with
 the host reference (`ozaki2.reference_gemm` / `ozaki.reference_gemm`).
 
+`e2e` (the end-to-end table): gemm_fp64 wall time per shape (default
+4096^3, 8192^3, 3267x8400x241, 8192x3508x241) for each route in `--routes`,
+with host fp64 at `--host-threads` (2 and 12), the first-call time, max_cw
+and bitwise equality of 256 sampled rows with the host reference, and
+bitwise equality of the whole result between routes of one scheme:
+
+    NEURON_RT_VISIBLE_CORES=0 python scripts/probe_ozaki2.py e2e --out o2_e2e.json
+
+Routes: `ozaki1` (k = 8, the default route: device split and device
+combine, #125), `ozaki1_host_combine` (TRNBLAS_OZAKI_DEVICE_COMBINE=0).
+
 Every run writes its JSON after each case and stops scheduling new cases
 once `--budget-s` (default 1080 s) has passed, so one run stays under 20 min.
 """
@@ -212,6 +223,55 @@ def case(name, shape, arm, c):
     return rec
 
 
+E2E_SHAPES = ["4096^3", "8192^3", "3267x8400x241", "8192x3508x241"]
+
+
+def _route_ozaki1(device_combine):
+    def run(A, B):
+        prev = D._OZ_DEVICE_COMBINE
+        D._OZ_DEVICE_COMBINE = device_combine
+        try:
+            return trnblas.gemm_fp64(A, B, slices=8)
+        finally:
+            D._OZ_DEVICE_COMBINE = prev
+
+    return run
+
+
+# route -> (scheme, gemm_fp64 call, host reference of 256 sampled rows)
+E2E_ROUTES = {
+    "ozaki1": ("ozaki1", _route_ozaki1(True), lambda a, b: ozaki.reference_gemm(a, b, 8)),
+    "ozaki1_host_combine": (
+        "ozaki1",
+        _route_ozaki1(False),
+        lambda a, b: ozaki.reference_gemm(a, b, 8),
+    ),
+}
+
+
+def e2e_case(name, shape, routes, reps):
+    """One shape: every route's e2e ms and checks, and the host baselines."""
+    M, K, N = shape
+    A, B = inputs(M, K, N)
+    rec = {"shape": shape, "name": name, "routes": {}}
+    first: dict = {}
+    for r in routes:
+        scheme, fn, ref = E2E_ROUTES[r]
+        t = time.perf_counter()
+        C = fn(A, B)
+        out = {"first_call_s": time.perf_counter() - t}
+        out["e2e_ms"] = timed(lambda fn=fn: fn(A, B), reps=reps)
+        out.update(check_rows(C, A, B, ref))
+        if scheme in first:
+            out["bitwise_vs_" + first[scheme][0]] = bool(torch.equal(C, first[scheme][1]))
+        else:
+            first[scheme] = (r, C)
+        rec["routes"][r] = out
+        print(json.dumps({name: {r: out}}), flush=True)
+    rec.update(host_ms(A, B))
+    return rec
+
+
 def micro():
     """Q1: per-GEMM cost of each family's group close at 2048 x 16384 x 2048."""
     M = N = 2048
@@ -259,12 +319,12 @@ def micro():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["micro", "shapes"])
+    ap.add_argument("mode", choices=["micro", "shapes", "e2e"])
+    ap.add_argument("--routes", nargs="*", default=list(E2E_ROUTES), choices=list(E2E_ROUTES))
+    ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--arms", nargs="*", default=["ozaki1", "b7"])
     ap.add_argument("--counts", nargs="*", type=int, help="override the configs' counts")
-    ap.add_argument(
-        "--shapes", nargs="*", default=[s for s in SHAPES if s != "8192^3"], choices=list(SHAPES)
-    )
+    ap.add_argument("--shapes", nargs="*", choices=list(SHAPES))
     ap.add_argument("--out", default="probe_ozaki2.json")
     ap.add_argument("--budget-s", type=float, default=1080)
     ap.add_argument(
@@ -291,7 +351,20 @@ def main():
         out.write_text(json.dumps({"meta": meta, "micro": micro()}, indent=1))
         return
     recs = []
-    for name in a.shapes:
+    if a.mode == "e2e":
+        for name in a.shapes or E2E_SHAPES:
+            if time.time() - t0 > a.budget_s:
+                print(f"budget reached, skipping {name}", flush=True)
+                continue
+            try:
+                recs.append(e2e_case(name, SHAPES[name], a.routes, a.reps))
+            except Exception as exc:  # record and go on
+                recs.append({"name": name, "error": repr(exc)})
+            out.write_text(json.dumps({"meta": meta, "e2e": recs}, indent=1))
+        meta["seconds"] = time.time() - t0
+        out.write_text(json.dumps({"meta": meta, "e2e": recs}, indent=1))
+        return
+    for name in a.shapes or [s for s in SHAPES if s != "8192^3"]:
         for arm in a.arms:
             for c in a.counts or CONFIGS[arm]:
                 if time.time() - t0 > a.budget_s:

@@ -1148,6 +1148,31 @@ def ff_to_fp64_bits(hi, lo, E) -> tuple[np.ndarray, np.ndarray]:
     return bits, bad
 
 
+def ff_bits_kernel_reference(hilo, ea, eb) -> np.ndarray:
+    """What `_fp64_ff_bits_kernel(hilo, ea, eb)` returns, on the host: int32
+    (R + 128, 2 N). Rows 0 .. R - 1 are the words of the float64
+    RN64(hi + lo) 2^(ea_i + eb_j) (`ff_to_fp64_bits`), and out[R + p, b] = 1
+    where an element of row 128 b + p is flagged; the rest of the flag rows
+    are 0. The words of a flagged row are unspecified (the caller recombines
+    it on the host); at a non-finite element they differ from the kernel's. `hilo` (2, R, N) float32 with R a multiple of 128, `ea` (R, 1)
+    and `eb` (1, N) float32 integers. The CPU stand-in of the kernel (tests,
+    and the host-only native route)."""
+
+    def host(x):
+        return np.asarray(x.detach().to("cpu") if isinstance(x, torch.Tensor) else x)
+
+    hl, ea, eb = host(hilo), host(ea), host(eb)
+    _, R, N = hl.shape
+    if R % 128:
+        raise ValueError(f"rows must be a multiple of 128, got {R}")
+    E = ea.reshape(R, 1).astype(np.float32) + eb.reshape(1, N).astype(np.float32)
+    bits, bad = ff_to_fp64_bits(hl[0], hl[1], E)
+    out = np.zeros((R + 128, 2 * N), dtype=np.int32)
+    out[:R] = bits.view(np.int32).reshape(R, 2 * N)
+    out[R:, : R // 128] = bad.any(axis=1).astype(np.int32).reshape(R // 128, 128).T
+    return out
+
+
 def combine_bits(hilo, eA, eB, slices: int, M: int, N: int) -> torch.Tensor:
     """`ozaki.combine` (one launch block) through `ff_to_fp64_bits`, with the
     flagged elements computed on the host: float64 (M, N), equal to
@@ -1188,6 +1213,7 @@ __all__ = [
     "exact_dot",
     "exact_sum",
     "fast_two_sum",
+    "ff_bits_kernel_reference",
     "ff_to_fp64_bits",
     "ff_add",
     "ff_add_fp",

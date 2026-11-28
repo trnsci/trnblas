@@ -188,3 +188,59 @@ def test_device_resident_operands(require_nki):
     C = trnblas.gemm_fp64(Ad, Bd)
     assert C.device.type == "neuron" and C.dtype == torch.float64
     assert torch.equal(C.cpu(), ozaki.reference_gemm(A, B, 8))
+
+
+# ── device combine (#125) ────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "shape,k",
+    [((2100, 1000, 1500), 6), ((3267, 2000, 241), 8), ((300, 700, 2600), 4)],
+    ids=["bands", "narrow", "wide"],
+)
+def test_device_combine_equals_host_combine(require_nki, monkeypatch, shape, k):
+    """The combine on the device (`_fp64_ff_bits_kernel`, one launch per band
+    of output rows) gives the host combine's bits, at any LNC; rows with
+    results outside the normal float64 range are flagged and recombined on
+    the host."""
+    A, B = inputs(*shape, seed=8)
+    A[3] *= 1e300
+    B[:, 8] *= 1e10  # C[3, 8] overflows
+    A[4] *= 1e-300
+    B[:, 9] *= 1e-12  # C[4, 9] is subnormal
+    with np.errstate(all="ignore"):
+        dev = trnblas.gemm_fp64(A, B, slices=k)
+        monkeypatch.setattr(D, "_OZ_DEVICE_COMBINE", False)
+        host = trnblas.gemm_fp64(A, B, slices=k)
+        ref = ozaki.reference_gemm(A, B, k)
+    assert torch.equal(dev.view(torch.int64), host.view(torch.int64))
+    assert torch.equal(dev.view(torch.int64), ref.view(torch.int64))
+    assert dev[3, 8].isinf() and 0 < dev[4, 9].abs() < 2.2e-308
+    _digest_check(
+        f"ozaki_device_combine_{'x'.join(map(str, shape))}",
+        hashlib.sha256(dev.numpy().tobytes()).hexdigest(),
+    )
+
+
+def test_device_combine_time(require_nki, monkeypatch):
+    """End to end at 4096^3 (k = 8), device combine against the host combine
+    (printed; the full timing table is `scripts/probe_ozaki2.py e2e`). The
+    gate is equality; the times are for the record."""
+    import time
+
+    A, B = inputs(4096, 4096, 4096, seed=9)
+
+    def best(reps=3):
+        trnblas.gemm_fp64(A, B)
+        t = float("inf")
+        for _ in range(reps):
+            t0 = time.perf_counter()
+            C = trnblas.gemm_fp64(A, B)
+            t = min(t, time.perf_counter() - t0)
+        return C, t * 1e3
+
+    dev, t_dev = best()
+    monkeypatch.setattr(D, "_OZ_DEVICE_COMBINE", False)
+    host, t_host = best()
+    print(f"\n4096^3 k=8 e2e: device combine {t_dev:.1f} ms, host combine {t_host:.1f} ms")
+    assert torch.equal(dev, host)

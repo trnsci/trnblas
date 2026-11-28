@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`gemm_fp64`: the combine runs on the device** (#125). The kernel's
+  (hi, lo) blocks no longer come down to the host: `_fp64_ff_bits_kernel`
+  (from `trnblas.fp64`, #134) builds the float64 words of
+  RN64(hi + lo) · 2^(e_i + e_j + offset) on the device, from exact fp32 and
+  bitvec ops, bitwise equal to the host combine `ozaki.combine`. On Trn2
+  this measured 14.5 ms against 79.4 ms for the download plus host combine
+  of a 4096 × 4096 block (5.45×), and 2.1× and 1.8× on the DF-MP2 blocks
+  (256 × 3267, 256 × 8192). The (hi, lo) blocks of each band of output rows
+  are joined along N on the device, and one launch per band writes the
+  band's words, which are downloaded straight into the result's storage
+  (no host copy; narrow products, computed as Cᵀ, take one transposing
+  copy). The host combine still runs for rows the kernel flags (a
+  non-finite element, or a result outside the normal float64 range), for
+  products with several K blocks (K beyond ~1M at k = 8), for a band
+  whose words would pass 2 GiB (#112), for a band whose combine launch
+  fails (with a warning; it raises under `TRNBLAS_REQUIRE_NKI`), and under
+  `TRNBLAS_OZAKI_DEVICE_COMBINE=0`. `ozaki.run` takes the combine as
+  `device_combine=`; `fp64.ff_bits_kernel_reference` is the kernel's raw
+  output (words and flag rows) on the host. The end-to-end device timing is
+  pending a Trn2 window (`scripts/probe_ozaki2.py e2e`,
+  `tests/test_ozaki_neuron.py`).
 ### Fixed
 
 - **Every PSUM accumulation group now opens with an `accumulate=False`

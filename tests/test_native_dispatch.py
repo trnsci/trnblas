@@ -21,8 +21,8 @@ from _ozaki_ref import DEVICE_SPLIT_KERNELS, device_split_ops
 
 import trnblas
 import trnblas.nki
-from trnblas import ozaki, ozaki2
-from trnblas.nki import dispatch
+from trnblas import fp64, ozaki, ozaki2
+from trnblas.nki import dispatch, fp64_kernels
 
 _REAL_FIND_SPEC = importlib.util.find_spec
 
@@ -500,6 +500,14 @@ def native_stub(monkeypatch):
     )
     for name, fn in device_split_ops().items():
         ops[name] = rec(name, fn)
+    # the gemm_fp64 device combine (#125) launches through fp64_kernels.call
+    ff_bits = rec("fp64_ff_bits", lambda *t: torch.from_numpy(fp64.ff_bits_kernel_reference(*t)))
+
+    def fp64_call(name, *t, simulate=False):
+        assert name == "_fp64_ff_bits_kernel" and not simulate
+        return ff_bits(*t)
+
+    monkeypatch.setattr(fp64_kernels, "call", fp64_call)
     for fam in ("b7", "b8", "b9"):  # Ozaki II (#132): the kernels' host references
         ops[f"ozaki2_gemm_{fam}"] = rec(
             f"ozaki2_gemm_{fam}",
@@ -571,7 +579,7 @@ class TestHostWrappersOnNativePath:
         out = trnblas.gemm_fp64(A, B)
         # A split per row and B per column on the device (#123), then the GEMM
         split = ["ozaki_emax", "ozaki_split", "ozaki_emax_col", "ozaki_split_col"]
-        assert native_stub == [*split, "ozaki_gemm"]
+        assert native_stub == [*split, "ozaki_gemm", "fp64_ff_bits"]
         assert torch.equal(out, ozaki.reference_gemm(A, B))
 
     def test_gemm_fp64_ozaki2_uses_residue_and_crt_ops(self, native_stub):
