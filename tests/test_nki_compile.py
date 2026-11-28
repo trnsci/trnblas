@@ -103,6 +103,15 @@ _KERNELS = {
         )
         for tm, tk, tn in _TILE_CANDIDATES
     },
+    # One K tile: the PSUM group is opened by the peeled first K step alone
+    # (trnsci#185), and the accumulate loop has no trips.
+    **{
+        f"gemm_{tm}_{tk}_{tn}_one_k_tile": (
+            lambda d, t=(tm, tk, tn): d._get_gemm_kernel(*t),
+            lambda: (_f32(256, 128), _f32(128, 1024)),
+        )
+        for tm, tk, tn in _TILE_CANDIDATES
+    },
     # Every remainder branch (M, K and N edge tiles plus the corner).
     "gemm_ragged": (lambda d: d._gemm_kernel_ragged, lambda: (_f32(300, 200), _f32(200, 600))),
     "gemm_ragged_small": (lambda d: d._gemm_kernel_ragged, lambda: (_f32(1, 1), _f32(1, 1))),

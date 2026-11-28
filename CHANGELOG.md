@@ -30,6 +30,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   output (words and flag rows) on the host. The end-to-end device timing is
   pending a Trn2 window (`scripts/probe_ozaki2.py e2e`,
   `tests/test_ozaki_neuron.py`).
+### Fixed
+
+- **Every PSUM accumulation group now opens with an `accumulate=False`
+  matmul** (trnsci/trnsci#185). The kernels zeroed PSUM with
+  `nl.zeros(..., buffer=nl.psum)` and then ran every K step with
+  `nisa.nc_matmul(..., accumulate=True)`. The `nc_matmul` docs say that on
+  NeuronCore-v3 (Trn2), a matmul that accumulates onto PSUM set by a
+  non-matmul instruction is undefined behaviour, and that the first write
+  must use `accumulate=False`. Device results matched the references, but
+  that depended on undefined behaviour. The first K step is now peeled out
+  with `accumulate=False` (or uses `accumulate=kt > 0` over a static range),
+  and the PSUM tiles are `nl.ndarray` with no memset. This covers the six
+  GEMM tile kernels, the ragged GEMM (all four edge-tile bodies), the LNC
+  GEMM (`_lnc_ntile`: K tile 0 opens the group, or the K remainder when
+  K < 128), SYRK, the DF-MP2 energy kernels (`_fused_gemm_energy_kernel`,
+  `_batched_pair_kernel`, `_j_batched_kernel`, `_pair_energy_sym_kernel`),
+  the Ozaki I and II PSUM groups (new `_oz_run` helper; `_oz_mm` takes the
+  accumulate flag), and the fp64 TensorE probe kernel. Under `nki.simulate`
+  the results are bitwise equal to the old ones (0 + x = x exactly). A
+  static lint (`tests/test_psum_accumulate_lint.py`) fails on any PSUM tile
+  that is accumulated into before a matmul opens it.
 
 ## [0.14.0] — 2026-11-25
 

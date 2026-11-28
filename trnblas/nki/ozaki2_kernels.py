@@ -18,7 +18,8 @@ b9: 256); the moduli are the family's first n = at.shape[0], as static
 constants. Both are gridless and split row tiles between the programs of an
 LNC=2 core by program_id; every output element sees a fixed op sequence, so
 the result is LNC-invariant. The matmul helpers are Ozaki I's
-(`dispatch._oz_mm`, `_oz_psum`), unchanged.
+(`dispatch._oz_run`, `_oz_psum`): each PSUM group opens with an
+accumulate=False matmul (trnsci#185).
 """
 
 from __future__ import annotations
@@ -35,7 +36,7 @@ except ImportError:
     _HAS_NKI = False
 
 if _HAS_NKI:
-    from .dispatch import _lnc_sizes, _oz_mm, _oz_psum, _ozs_range
+    from .dispatch import _lnc_sizes, _oz_psum, _oz_run, _ozs_range
 
     _OZ2_MAGIC = _o2.MAGIC
 
@@ -110,13 +111,11 @@ if _HAS_NKI:
             if G:
                 for g in nl.sequential_range(G):
                     ps = _oz_psum(TM, nsizes)
-                    for kk in nl.affine_range(GT):
-                        _oz_mm(at, b, ps, l, l, (g * GT + kk) * 128, m0, TM, n0, nsizes)
+                    _oz_run(at, b, ps, l, l, g * GT * 128, GT, m0, TM, n0, nsizes, True)
                     _oz2_reduce(ps, acc, m, TM, nsizes)
             if R:
                 ps = _oz_psum(TM, nsizes)
-                for kk in nl.affine_range(R):
-                    _oz_mm(at, b, ps, l, l, (G * GT + kk) * 128, m0, TM, n0, nsizes)
+                _oz_run(at, b, ps, l, l, G * GT * 128, R, m0, TM, n0, nsizes, True)
                 _oz2_reduce(ps, acc, m, TM, nsizes)
             _oz2_canon(acc, m, TM, nsizes)
             for i in range(TM):

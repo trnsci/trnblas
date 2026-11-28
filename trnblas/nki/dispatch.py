@@ -3389,9 +3389,13 @@ if HAS_NKI:
             for n in nl.affine_range(N // TILE_N):
                 m_off = m * TILE_M
                 n_off = n * TILE_N
-                psum = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
-                for k in nl.affine_range(K // TILE_K):
-                    k_off = k * TILE_K
+                psum = nl.ndarray((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
+                # The first K step opens the accumulation group (trnsci#185).
+                a_0 = nl.load_transpose2d(a[m_off : m_off + TILE_M, 0:TILE_K])
+                b_0 = nl.load(b[0:TILE_K, n_off : n_off + TILE_N])
+                nisa.nc_matmul(dst=psum, stationary=a_0, moving=b_0, accumulate=False)
+                for k in nl.affine_range(K // TILE_K - 1):
+                    k_off = (k + 1) * TILE_K
                     a_t = nl.load_transpose2d(a[m_off : m_off + TILE_M, k_off : k_off + TILE_K])
                     b_tile = nl.load(b[k_off : k_off + TILE_K, n_off : n_off + TILE_N])
                     nisa.nc_matmul(dst=psum, stationary=a_t, moving=b_tile, accumulate=True)
@@ -3412,9 +3416,13 @@ if HAS_NKI:
             for n in nl.affine_range(N // TILE_N):
                 m_off = m * TILE_M
                 n_off = n * TILE_N
-                psum = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
-                for k in nl.affine_range(K // TILE_K):
-                    k_off = k * TILE_K
+                psum = nl.ndarray((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
+                # The first K step opens the accumulation group (trnsci#185).
+                a_0 = nl.load_transpose2d(a[m_off : m_off + TILE_M, 0:TILE_K])
+                b_0 = nl.load(b[0:TILE_K, n_off : n_off + TILE_N])
+                nisa.nc_matmul(dst=psum, stationary=a_0, moving=b_0, accumulate=False)
+                for k in nl.affine_range(K // TILE_K - 1):
+                    k_off = (k + 1) * TILE_K
                     a_t = nl.load_transpose2d(a[m_off : m_off + TILE_M, k_off : k_off + TILE_K])
                     b_tile = nl.load(b[k_off : k_off + TILE_K, n_off : n_off + TILE_N])
                     nisa.nc_matmul(dst=psum, stationary=a_t, moving=b_tile, accumulate=True)
@@ -3435,9 +3443,13 @@ if HAS_NKI:
             for n in nl.affine_range(N // TILE_N):
                 m_off = m * TILE_M
                 n_off = n * TILE_N
-                psum = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
-                for k in nl.affine_range(K // TILE_K):
-                    k_off = k * TILE_K
+                psum = nl.ndarray((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
+                # The first K step opens the accumulation group (trnsci#185).
+                a_0 = nl.load_transpose2d(a[m_off : m_off + TILE_M, 0:TILE_K])
+                b_0 = nl.load(b[0:TILE_K, n_off : n_off + TILE_N])
+                nisa.nc_matmul(dst=psum, stationary=a_0, moving=b_0, accumulate=False)
+                for k in nl.affine_range(K // TILE_K - 1):
+                    k_off = (k + 1) * TILE_K
                     a_t = nl.load_transpose2d(a[m_off : m_off + TILE_M, k_off : k_off + TILE_K])
                     b_tile = nl.load(b[k_off : k_off + TILE_K, n_off : n_off + TILE_N])
                     nisa.nc_matmul(dst=psum, stationary=a_t, moving=b_tile, accumulate=True)
@@ -3458,9 +3470,13 @@ if HAS_NKI:
             for n in nl.affine_range(N // TILE_N):
                 m_off = m * TILE_M
                 n_off = n * TILE_N
-                psum = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
-                for k in nl.affine_range(K // TILE_K):
-                    k_off = k * TILE_K
+                psum = nl.ndarray((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
+                # The first K step opens the accumulation group (trnsci#185).
+                a_0 = nl.load_transpose2d(a[m_off : m_off + TILE_M, 0:TILE_K])
+                b_0 = nl.load(b[0:TILE_K, n_off : n_off + TILE_N])
+                nisa.nc_matmul(dst=psum, stationary=a_0, moving=b_0, accumulate=False)
+                for k in nl.affine_range(K // TILE_K - 1):
+                    k_off = (k + 1) * TILE_K
                     a_t = nl.load_transpose2d(a[m_off : m_off + TILE_M, k_off : k_off + TILE_K])
                     b_tile = nl.load(b[k_off : k_off + TILE_K, n_off : n_off + TILE_N])
                     nisa.nc_matmul(dst=psum, stationary=a_t, moving=b_tile, accumulate=True)
@@ -3481,9 +3497,13 @@ if HAS_NKI:
             for n in nl.affine_range(N // TILE_N):
                 m_off = m * TILE_M
                 n_off = n * TILE_N
-                psum = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
-                for k in nl.affine_range(K // TILE_K):
-                    k_off = k * TILE_K
+                psum = nl.ndarray((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
+                # The first K step opens the accumulation group (trnsci#185).
+                a_0 = nl.load_transpose2d(a[m_off : m_off + TILE_M, 0:TILE_K])
+                b_0 = nl.load(b[0:TILE_K, n_off : n_off + TILE_N])
+                nisa.nc_matmul(dst=psum, stationary=a_0, moving=b_0, accumulate=False)
+                for k in nl.affine_range(K // TILE_K - 1):
+                    k_off = (k + 1) * TILE_K
                     a_t = nl.load_transpose2d(a[m_off : m_off + TILE_M, k_off : k_off + TILE_K])
                     b_tile = nl.load(b[k_off : k_off + TILE_K, n_off : n_off + TILE_N])
                     nisa.nc_matmul(dst=psum, stationary=a_t, moving=b_tile, accumulate=True)
@@ -3504,9 +3524,13 @@ if HAS_NKI:
             for n in nl.affine_range(N // TILE_N):
                 m_off = m * TILE_M
                 n_off = n * TILE_N
-                psum = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
-                for k in nl.affine_range(K // TILE_K):
-                    k_off = k * TILE_K
+                psum = nl.ndarray((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
+                # The first K step opens the accumulation group (trnsci#185).
+                a_0 = nl.load_transpose2d(a[m_off : m_off + TILE_M, 0:TILE_K])
+                b_0 = nl.load(b[0:TILE_K, n_off : n_off + TILE_N])
+                nisa.nc_matmul(dst=psum, stationary=a_0, moving=b_0, accumulate=False)
+                for k in nl.affine_range(K // TILE_K - 1):
+                    k_off = (k + 1) * TILE_K
                     a_t = nl.load_transpose2d(a[m_off : m_off + TILE_M, k_off : k_off + TILE_K])
                     b_tile = nl.load(b[k_off : k_off + TILE_K, n_off : n_off + TILE_N])
                     nisa.nc_matmul(dst=psum, stationary=a_t, moving=b_tile, accumulate=True)
@@ -3526,6 +3550,8 @@ if HAS_NKI:
         accumulated into the same PSUM tile as a shorter matmul whose
         stationary and moving operands both have ``KR`` partitions, starting
         at partition 0. M/N remainder tiles are narrower PSUM/SBUF tiles.
+        The first full K tile opens each PSUM tile with ``accumulate=False``
+        (trnsci#185); ``KF >= 1`` because ``TK <= K``.
         The body is written out once per (M-tile kind, N-tile kind) because
         the frontend resolves names from source and does not support kernel
         helper closures.
@@ -3552,9 +3578,12 @@ if HAS_NKI:
             # Full M x full N.
             for n in nl.affine_range(NF):
                 n_off = n * TN
-                psum = nl.zeros((TM, TN), dtype=nl.float32, buffer=nl.psum)
-                for k in nl.affine_range(KF):
-                    k_off = k * TK
+                psum = nl.ndarray((TM, TN), dtype=nl.float32, buffer=nl.psum)
+                a_0 = nl.load_transpose2d(a[m_off : m_off + TM, 0:TK])
+                b_0 = nl.load(b[0:TK, n_off : n_off + TN])
+                nisa.nc_matmul(dst=psum, stationary=a_0, moving=b_0, accumulate=False)
+                for k in nl.affine_range(KF - 1):
+                    k_off = (k + 1) * TK
                     a_t = nl.load_transpose2d(a[m_off : m_off + TM, k_off : k_off + TK])
                     b_t = nl.load(b[k_off : k_off + TK, n_off : n_off + TN])
                     nisa.nc_matmul(dst=psum, stationary=a_t, moving=b_t, accumulate=True)
@@ -3567,9 +3596,12 @@ if HAS_NKI:
                 nl.store(c[m_off : m_off + TM, n_off : n_off + TN], value=c_sbuf)
             # Full M x N remainder.
             if NR > 0:
-                psum_n = nl.zeros((TM, NR), dtype=nl.float32, buffer=nl.psum)
-                for k in nl.affine_range(KF):
-                    k_off = k * TK
+                psum_n = nl.ndarray((TM, NR), dtype=nl.float32, buffer=nl.psum)
+                a_0 = nl.load_transpose2d(a[m_off : m_off + TM, 0:TK])
+                b_0 = nl.load(b[0:TK, N0:N])
+                nisa.nc_matmul(dst=psum_n, stationary=a_0, moving=b_0, accumulate=False)
+                for k in nl.affine_range(KF - 1):
+                    k_off = (k + 1) * TK
                     a_t = nl.load_transpose2d(a[m_off : m_off + TM, k_off : k_off + TK])
                     b_t = nl.load(b[k_off : k_off + TK, N0:N])
                     nisa.nc_matmul(dst=psum_n, stationary=a_t, moving=b_t, accumulate=True)
@@ -3586,9 +3618,12 @@ if HAS_NKI:
             # M remainder x full N.
             for n in nl.affine_range(NF):
                 n_off = n * TN
-                psum_m = nl.zeros((MR, TN), dtype=nl.float32, buffer=nl.psum)
-                for k in nl.affine_range(KF):
-                    k_off = k * TK
+                psum_m = nl.ndarray((MR, TN), dtype=nl.float32, buffer=nl.psum)
+                a_0 = nl.load_transpose2d(a[M0:M, 0:TK])
+                b_0 = nl.load(b[0:TK, n_off : n_off + TN])
+                nisa.nc_matmul(dst=psum_m, stationary=a_0, moving=b_0, accumulate=False)
+                for k in nl.affine_range(KF - 1):
+                    k_off = (k + 1) * TK
                     a_t = nl.load_transpose2d(a[M0:M, k_off : k_off + TK])
                     b_t = nl.load(b[k_off : k_off + TK, n_off : n_off + TN])
                     nisa.nc_matmul(dst=psum_m, stationary=a_t, moving=b_t, accumulate=True)
@@ -3601,9 +3636,12 @@ if HAS_NKI:
                 nl.store(c[M0:M, n_off : n_off + TN], value=c_m)
             # M remainder x N remainder (corner).
             if NR > 0:
-                psum_mn = nl.zeros((MR, NR), dtype=nl.float32, buffer=nl.psum)
-                for k in nl.affine_range(KF):
-                    k_off = k * TK
+                psum_mn = nl.ndarray((MR, NR), dtype=nl.float32, buffer=nl.psum)
+                a_0 = nl.load_transpose2d(a[M0:M, 0:TK])
+                b_0 = nl.load(b[0:TK, N0:N])
+                nisa.nc_matmul(dst=psum_mn, stationary=a_0, moving=b_0, accumulate=False)
+                for k in nl.affine_range(KF - 1):
+                    k_off = (k + 1) * TK
                     a_t = nl.load_transpose2d(a[M0:M, k_off : k_off + TK])
                     b_t = nl.load(b[k_off : k_off + TK, N0:N])
                     nisa.nc_matmul(dst=psum_mn, stationary=a_t, moving=b_t, accumulate=True)
@@ -3636,11 +3674,29 @@ if HAS_NKI:
     # offsets, and read no module or closure state (aws-neuron-sdk#1454).
     # ---------------------------------------------------------------------------
 
+    def _lnc_kmm(aT, b, ps, kt, n0, msizes, nsizes, acc):
+        """K tile `kt` of `_lnc_ntile`: one B load, then the matmul of every
+        (M tile, N sub-tile) PSUM tile, accumulating iff `acc`."""
+        TM = len(msizes)
+        W = sum(nsizes)
+        noff = [sum(nsizes[:j]) for j in range(len(nsizes))]
+        b_t = nl.load(b[kt * 128 : (kt + 1) * 128, n0 : n0 + W])
+        for mt in range(TM):
+            col = (kt * TM + mt) * 128
+            for j in range(len(nsizes)):
+                nisa.nc_matmul(
+                    dst=ps[mt][j],
+                    stationary=aT[0:128, col : col + msizes[mt]],
+                    moving=b_t[0:128, noff[j] : noff[j] + nsizes[j]],
+                    accumulate=acc,
+                )
+
     def _lnc_ntile(aT, aTr, b, c, m0, msizes, n0, nsizes):
         """One M block x one N super-tile (sub-tiles `nsizes`, each <= 512)
         of C, accumulated over K in PSUM. Each B load covers the whole
         super-tile (wide DMAs), and each B sub-tile is used by every M tile's
-        stationary A^T."""
+        stationary A^T. K tile 0 (the K remainder when K < 128) opens every
+        PSUM tile with accumulate=False (trnsci#185)."""
         K = b.shape[0]
         NKF = K // 128
         KR = K - NKF * 128
@@ -3648,19 +3704,13 @@ if HAS_NKI:
         W = sum(nsizes)
         noff = [sum(nsizes[:j]) for j in range(len(nsizes))]
         ps = [
-            [nl.zeros((ms, ns), dtype=nl.float32, buffer=nl.psum) for ns in nsizes] for ms in msizes
+            [nl.ndarray((ms, ns), dtype=nl.float32, buffer=nl.psum) for ns in nsizes]
+            for ms in msizes
         ]
-        for kt in nl.affine_range(NKF):
-            b_t = nl.load(b[kt * 128 : (kt + 1) * 128, n0 : n0 + W])
-            for mt in range(TM):
-                col = (kt * TM + mt) * 128
-                for j in range(len(nsizes)):
-                    nisa.nc_matmul(
-                        dst=ps[mt][j],
-                        stationary=aT[0:128, col : col + msizes[mt]],
-                        moving=b_t[0:128, noff[j] : noff[j] + nsizes[j]],
-                        accumulate=True,
-                    )
+        if NKF > 0:
+            _lnc_kmm(aT, b, ps, 0, n0, msizes, nsizes, False)
+            for kt in nl.affine_range(NKF - 1):
+                _lnc_kmm(aT, b, ps, kt + 1, n0, msizes, nsizes, True)
         if KR > 0:
             b_r = nl.load(b[K - KR : K, n0 : n0 + W])
             for mt in range(TM):
@@ -3669,7 +3719,7 @@ if HAS_NKI:
                         dst=ps[mt][j],
                         stationary=aTr[0:KR, mt * 128 : mt * 128 + msizes[mt]],
                         moving=b_r[0:KR, noff[j] : noff[j] + nsizes[j]],
-                        accumulate=True,
+                        accumulate=NKF > 0,
                     )
         for mt in range(TM):
             c_sb = nl.ndarray((msizes[mt], W), dtype=c.dtype, buffer=nl.sbuf)
@@ -3847,13 +3897,16 @@ if HAS_NKI:
                 nisa.tensor_copy(src=s, dst=h)
 
     def _oz_psum(TM, nsizes):
+        """One PSUM group: TM x len(nsizes) fp32 tiles, left uninitialised.
+        `_oz_run(..., first=True)` opens each with a matmul write."""
         return [
-            [nl.zeros((128, ns), dtype=nl.float32, buffer=nl.psum) for ns in nsizes]
+            [nl.ndarray((128, ns), dtype=nl.float32, buffer=nl.psum) for ns in nsizes]
             for _ in range(TM)
         ]
 
-    def _oz_mm(at, b, ps, s, t, k0, m0, TM, n0, nsizes):
-        """One K tile (rows k0 .. k0 + 127) of slice pair (s, t) into PSUM."""
+    def _oz_mm(at, b, ps, s, t, k0, m0, TM, n0, nsizes, acc):
+        """One K tile (rows k0 .. k0 + 127) of slice pair (s, t) into PSUM,
+        accumulating iff `acc`."""
         W = sum(nsizes)
         a_t = nl.load(at[s, k0 : k0 + 128, m0 : m0 + 128 * TM])
         b_t = nl.load(b[t, k0 : k0 + 128, n0 : n0 + W])
@@ -3864,9 +3917,23 @@ if HAS_NKI:
                     dst=ps[i][j],
                     stationary=a_t[0:128, i * 128 : (i + 1) * 128],
                     moving=b_t[0:128, off : off + nsizes[j]],
-                    accumulate=True,
+                    accumulate=acc,
                 )
             off += nsizes[j]
+
+    def _oz_run(at, b, ps, s, t, k0, n, m0, TM, n0, nsizes, first):
+        """n K tiles (static n >= 1) of slice pair (s, t) from row k0 into PSUM
+        group `ps`, in K order. With `first` the run opens the group: its
+        first K tile overwrites PSUM (accumulate=False) and the rest
+        accumulate; on NeuronCore-v3 a matmul may not accumulate onto PSUM
+        set by a non-matmul instruction (trnsci#185)."""
+        if first:
+            _oz_mm(at, b, ps, s, t, k0, m0, TM, n0, nsizes, False)
+            for kk in nl.affine_range(n - 1):
+                _oz_mm(at, b, ps, s, t, k0 + (kk + 1) * 128, m0, TM, n0, nsizes, True)
+        else:
+            for kk in nl.affine_range(n):
+                _oz_mm(at, b, ps, s, t, k0 + kk * 128, m0, TM, n0, nsizes, True)
 
     def _oz_tile(at, b, out, m0, TM, n0, nsizes):
         """TM M tiles (128 rows each) x N sub-tiles `nsizes` (each <= 512) of
@@ -3898,13 +3965,11 @@ if HAS_NKI:
                 for jp in nl.sequential_range(d + 1):
                     for g in nl.sequential_range(G):
                         ps = _oz_psum(TM, nsizes)
-                        for kk in nl.affine_range(32):
-                            _oz_mm(at, b, ps, jp, d - jp, (g * 32 + kk) * 128, m0, TM, n0, nsizes)
+                        _oz_run(at, b, ps, jp, d - jp, g * 32 * 128, 32, m0, TM, n0, nsizes, True)
                         _oz_evict(ps, hi, lo, scale, TM, nsizes)
                     if R:
                         ps = _oz_psum(TM, nsizes)
-                        for kk in nl.affine_range(R):
-                            _oz_mm(at, b, ps, jp, d - jp, (G * 32 + kk) * 128, m0, TM, n0, nsizes)
+                        _oz_run(at, b, ps, jp, d - jp, G * 32 * 128, R, m0, TM, n0, nsizes, True)
                         _oz_evict(ps, hi, lo, scale, TM, nsizes)
             else:
                 P = 32 // KT
@@ -3912,17 +3977,19 @@ if HAS_NKI:
                 RP = d + 1 - NG * P
                 for g in nl.sequential_range(NG):
                     ps = _oz_psum(TM, nsizes)
-                    for jj in nl.affine_range(P):
-                        for kk in nl.affine_range(KT):
-                            jp = g * P + jj
-                            _oz_mm(at, b, ps, jp, d - jp, kk * 128, m0, TM, n0, nsizes)
+                    jp0 = g * P
+                    _oz_run(at, b, ps, jp0, d - jp0, 0, KT, m0, TM, n0, nsizes, True)
+                    for jj in nl.affine_range(P - 1):
+                        jp = jp0 + jj + 1
+                        _oz_run(at, b, ps, jp, d - jp, 0, KT, m0, TM, n0, nsizes, False)
                     _oz_evict(ps, hi, lo, scale, TM, nsizes)
                 if RP:
                     ps = _oz_psum(TM, nsizes)
-                    for jj in nl.affine_range(RP):
-                        for kk in nl.affine_range(KT):
-                            jp = NG * P + jj
-                            _oz_mm(at, b, ps, jp, d - jp, kk * 128, m0, TM, n0, nsizes)
+                    jp0 = NG * P
+                    _oz_run(at, b, ps, jp0, d - jp0, 0, KT, m0, TM, n0, nsizes, True)
+                    for jj in nl.affine_range(RP - 1):
+                        jp = jp0 + jj + 1
+                        _oz_run(at, b, ps, jp, d - jp, 0, KT, m0, TM, n0, nsizes, False)
                     _oz_evict(ps, hi, lo, scale, TM, nsizes)
         for i in range(TM):
             r = m0 + i * 128
@@ -4573,10 +4640,14 @@ if HAS_NKI:
                 m_off = m * TILE_M
                 n_off = n * TILE_N
 
-                psum = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
+                psum = nl.ndarray((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
 
-                for k in nl.affine_range(K // TILE_K):
-                    k_off = k * TILE_K
+                # The first K step opens the accumulation group (trnsci#185).
+                a_stat0 = nl.load_transpose2d(a[m_off : m_off + TILE_M, 0:TILE_K])
+                a_mov0 = nl.load_transpose2d(a[n_off : n_off + TILE_N, 0:TILE_K])
+                nisa.nc_matmul(dst=psum, stationary=a_stat0, moving=a_mov0, accumulate=False)
+                for k in nl.affine_range(K // TILE_K - 1):
+                    k_off = (k + 1) * TILE_K
 
                     # Stationary: a[m_off:m_off+TILE_M, k_off:k_off+TILE_K]
                     # transposed → (TILE_K, TILE_M), partition=K ≤ 128.
@@ -4663,9 +4734,13 @@ if HAS_NKI:
                 # Stationary: B_i[a_off:, k_off:] → load_transpose2d → (TILE_K, TILE).
                 # Moving:     B_j[b_off:, k_off:] → load_transpose2d → (TILE_K, TILE).
                 # PSUM result shape: (TILE, TILE).
-                psum_t = nl.zeros((TILE, TILE), dtype=nl.float32, buffer=nl.psum)
-                for k in nl.affine_range(N_K_TILES):
-                    k_off = k * TILE_K
+                # The first K step opens each accumulation group (trnsci#185).
+                psum_t = nl.ndarray((TILE, TILE), dtype=nl.float32, buffer=nl.psum)
+                bi_stat0 = nl.load_transpose2d(b_i[a_off : a_off + TILE, 0:TILE_K])
+                bj_mov0 = nl.load_transpose2d(b_j[b_off : b_off + TILE, 0:TILE_K])
+                nisa.nc_matmul(dst=psum_t, stationary=bi_stat0, moving=bj_mov0, accumulate=False)
+                for k in nl.affine_range(N_K_TILES - 1):
+                    k_off = (k + 1) * TILE_K
                     bi_stat = nl.load_transpose2d(b_i[a_off : a_off + TILE, k_off : k_off + TILE_K])
                     bj_mov = nl.load_transpose2d(b_j[b_off : b_off + TILE, k_off : k_off + TILE_K])
                     nisa.nc_matmul(dst=psum_t, stationary=bi_stat, moving=bj_mov, accumulate=True)
@@ -4676,9 +4751,12 @@ if HAS_NKI:
                 # T.T[a,b] = T[b,a] = (B_j @ B_i.T)[a,b].
                 # Stationary: B_j[a_off:, k_off:] → load_transpose2d.
                 # Moving:     B_i[b_off:, k_off:] → load_transpose2d.
-                psum_tt = nl.zeros((TILE, TILE), dtype=nl.float32, buffer=nl.psum)
-                for k in nl.affine_range(N_K_TILES):
-                    k_off = k * TILE_K
+                psum_tt = nl.ndarray((TILE, TILE), dtype=nl.float32, buffer=nl.psum)
+                bj_stat0 = nl.load_transpose2d(b_j[a_off : a_off + TILE, 0:TILE_K])
+                bi_mov0 = nl.load_transpose2d(b_i[b_off : b_off + TILE, 0:TILE_K])
+                nisa.nc_matmul(dst=psum_tt, stationary=bj_stat0, moving=bi_mov0, accumulate=False)
+                for k in nl.affine_range(N_K_TILES - 1):
+                    k_off = (k + 1) * TILE_K
                     bj_stat = nl.load_transpose2d(b_j[a_off : a_off + TILE, k_off : k_off + TILE_K])
                     bi_mov = nl.load_transpose2d(b_i[b_off : b_off + TILE, k_off : k_off + TILE_K])
                     nisa.nc_matmul(dst=psum_tt, stationary=bj_stat, moving=bi_mov, accumulate=True)
@@ -4779,9 +4857,15 @@ if HAS_NKI:
 
                         # GEMM 1: T[a_strip, b_strip] = B[i][a_strip,:] @ B[j][b_strip,:].T
                         # B[i, a_off:, k_off:] with affine_range vars i, a, k — 3D indexing.
-                        psum_t = nl.zeros((TILE, TILE), dtype=nl.float32, buffer=nl.psum)
-                        for k in nl.affine_range(N_K_TILES):
-                            k_off = k * TILE_K
+                        # The first K step opens each accumulation group (trnsci#185).
+                        psum_t = nl.ndarray((TILE, TILE), dtype=nl.float32, buffer=nl.psum)
+                        bi_stat0 = nl.load_transpose2d(B[i, a_off : a_off + TILE, 0:TILE_K])
+                        bj_mov0 = nl.load_transpose2d(B[j, b_off : b_off + TILE, 0:TILE_K])
+                        nisa.nc_matmul(
+                            dst=psum_t, stationary=bi_stat0, moving=bj_mov0, accumulate=False
+                        )
+                        for k in nl.affine_range(N_K_TILES - 1):
+                            k_off = (k + 1) * TILE_K
                             bi_stat = nl.load_transpose2d(
                                 B[i, a_off : a_off + TILE, k_off : k_off + TILE_K]
                             )  # (TILE_K, TILE)
@@ -4796,9 +4880,14 @@ if HAS_NKI:
 
                         # GEMM 2: T_T[a_strip,b_strip] = B[j][a_strip,:] @ B[i][b_strip,:].T
                         # T_T[a,b] = T[b,a] = (B[j] @ B[i].T)[a,b].
-                        psum_tt = nl.zeros((TILE, TILE), dtype=nl.float32, buffer=nl.psum)
-                        for k in nl.affine_range(N_K_TILES):
-                            k_off = k * TILE_K
+                        psum_tt = nl.ndarray((TILE, TILE), dtype=nl.float32, buffer=nl.psum)
+                        bj_stat0 = nl.load_transpose2d(B[j, a_off : a_off + TILE, 0:TILE_K])
+                        bi_mov0 = nl.load_transpose2d(B[i, b_off : b_off + TILE, 0:TILE_K])
+                        nisa.nc_matmul(
+                            dst=psum_tt, stationary=bj_stat0, moving=bi_mov0, accumulate=False
+                        )
+                        for k in nl.affine_range(N_K_TILES - 1):
+                            k_off = (k + 1) * TILE_K
                             bj_stat = nl.load_transpose2d(
                                 B[j, a_off : a_off + TILE, k_off : k_off + TILE_K]
                             )  # (TILE_K, TILE)
@@ -4900,9 +4989,15 @@ if HAS_NKI:
                     ev_row_b = nl.load(eps_vir_row[0:1, b_off : b_off + TILE])  # (1, TILE)
 
                     # GEMM 1: T[a,b] = b_i[a_strip,:] @ B[j][b_strip,:].T
-                    psum_t = nl.zeros((TILE, TILE), dtype=nl.float32, buffer=nl.psum)
-                    for k in nl.affine_range(N_K_TILES):
-                        k_off = k * TILE_K
+                    # The first K step opens each accumulation group (trnsci#185).
+                    psum_t = nl.ndarray((TILE, TILE), dtype=nl.float32, buffer=nl.psum)
+                    bi_stat0 = nl.load_transpose2d(b_i[a_off : a_off + TILE, 0:TILE_K])
+                    bj_mov0 = nl.load_transpose2d(B[j, b_off : b_off + TILE, 0:TILE_K])
+                    nisa.nc_matmul(
+                        dst=psum_t, stationary=bi_stat0, moving=bj_mov0, accumulate=False
+                    )
+                    for k in nl.affine_range(N_K_TILES - 1):
+                        k_off = (k + 1) * TILE_K
                         bi_stat = nl.load_transpose2d(
                             b_i[a_off : a_off + TILE, k_off : k_off + TILE_K]
                         )  # (TILE_K, TILE) — 2D indexing
@@ -4916,9 +5011,14 @@ if HAS_NKI:
                     nisa.tensor_copy(src=psum_t, dst=t_sbuf)
 
                     # GEMM 2: T_T[a,b] = B[j][a_strip,:] @ b_i[b_strip,:].T
-                    psum_tt = nl.zeros((TILE, TILE), dtype=nl.float32, buffer=nl.psum)
-                    for k in nl.affine_range(N_K_TILES):
-                        k_off = k * TILE_K
+                    psum_tt = nl.ndarray((TILE, TILE), dtype=nl.float32, buffer=nl.psum)
+                    bj_stat0 = nl.load_transpose2d(B[j, a_off : a_off + TILE, 0:TILE_K])
+                    bi_mov0 = nl.load_transpose2d(b_i[b_off : b_off + TILE, 0:TILE_K])
+                    nisa.nc_matmul(
+                        dst=psum_tt, stationary=bj_stat0, moving=bi_mov0, accumulate=False
+                    )
+                    for k in nl.affine_range(N_K_TILES - 1):
+                        k_off = (k + 1) * TILE_K
                         bj_stat = nl.load_transpose2d(
                             B[j, a_off : a_off + TILE, k_off : k_off + TILE_K]
                         )  # (TILE_K, TILE) — 3D with affine_range j
@@ -5016,12 +5116,20 @@ if HAS_NKI:
                 a_off = a * TILE
                 for b in nl.affine_range(NB):
                     b_off = b * TN
-                    pt = nl.zeros((TILE, TN), dtype=nl.float32, buffer=nl.psum)
-                    for k in nl.affine_range(NK):
+                    # K tile 0 opens the accumulation group (trnsci#185).
+                    pt = nl.ndarray((TILE, TN), dtype=nl.float32, buffer=nl.psum)
+                    nisa.nc_matmul(
+                        dst=pt,
+                        stationary=bi_sb[0:TILE, a_off : a_off + TILE],
+                        moving=bj_sb[0:TILE, b_off : b_off + TN],
+                        accumulate=False,
+                    )
+                    for k in nl.affine_range(NK - 1):
+                        k_off = (k + 1) * NVIR
                         nisa.nc_matmul(
                             dst=pt,
-                            stationary=bi_sb[0:TILE, k * NVIR + a_off : k * NVIR + a_off + TILE],
-                            moving=bj_sb[0:TILE, k * NVIR + b_off : k * NVIR + b_off + TN],
+                            stationary=bi_sb[0:TILE, k_off + a_off : k_off + a_off + TILE],
+                            moving=bj_sb[0:TILE, k_off + b_off : k_off + b_off + TN],
                             accumulate=True,
                         )
                     nisa.tensor_copy(
