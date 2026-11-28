@@ -478,13 +478,15 @@ def _nrm_scale(rows: list) -> tuple[torch.Tensor, torch.Tensor]:
     """Per (partition, chunk) power-of-two scale from the largest |hi|:
     s = 2^(127 - Ec), Ec = min(biased exponent of the max, 253) (so s is a
     normal fp32 number; a zero or subnormal maximum gives s = 2^127); k = Ec - 127.
-    `rows[0]` is (P, NCH, tpc, W) float32. Returns s (P, NCH, 1), k (P, NCH)."""
+    `rows[0]` is (P, NCH, tpc, W) float32. Returns s (P, NCH, 1), k (P, NCH)
+    (per column, with a trailing R axis, for (P, NCH, tpc, W, R) rows)."""
     a = (rows[0].contiguous().view(torch.int32) & 0x7FFFFFFF).view(F32)
     m = a.amax(dim=(2, 3))  # exact, order-free
     E = (m.view(torch.int32) >> 23).to(F32)
     Ec = torch.minimum(E, torch.tensor(253.0))
     s = ((254.0 - Ec).to(torch.int32) << 23).view(F32)
-    return s[:, :, None], Ec - 127.0
+    # (P, NCH, 1), or (P, NCH, 1, R) for the column-batched (P, NCH, tpc, W, R)
+    return s.unsqueeze(2), Ec - 127.0
 
 
 def reference_partials(kind: str, xs: Sequence[torch.Tensor], accumulate: str = "accurate"):
@@ -668,6 +670,170 @@ def nrm2(x, *, backend=None, accumulate: str = "accurate") -> torch.Tensor:
         raise ValueError("nrm2 has no exact arm")
     kind, xs = _operands("nrm", [x])
     return _finish(partials(kind, xs, backend, accumulate), kind, "host")
+
+
+# ── Column-batched reductions (trnblas#142) ──────────────────────────────────
+#
+# `dot_cols(X, Y)` and `nrm2_cols(X)` reduce the R columns of (n, R) operands
+# in one kernel launch, for block solvers (trnsolver `cg_block`) that need R
+# inner products or norms per iteration. Column j keeps the layout of its own
+# reduction: element (i, j) sits at lane (i // F, i % F) of plan(n), as
+# `layout(X[:, j])` puts element i, and the columns sit side by side on the
+# free axis. Every step of a reduction is elementwise over the lanes and the
+# halving tree folds over W alone, so column j gets the fp32 operations of
+# `dot(X[:, j], Y[:, j])` / `nrm2(X[:, j])` in the same order, and the same
+# bits; the host finish is the same function, per column. The nrm2 scales
+# stay per (partition, chunk, column).
+
+
+def layout_cols(X: torch.Tensor, pl: Plan | None = None) -> torch.Tensor:
+    """X (n, R) float32 -> (P, F, R) zero-padded rows (on X's device): element
+    (i, j) at (i // F, i % F, j), so [:, :, j] is `layout(X[:, j], pl)`. A
+    row-major X needs no copy beyond the padding."""
+    n, R = X.shape
+    pl = pl or plan(n)
+    pad = P * pl.F - n
+    if pad:
+        X = torch.nn.functional.pad(X, (0, 0, 0, pad))
+    return X.reshape(P, pl.F, R)
+
+
+def _ncol(kind: str) -> int:
+    return 3 if kind.startswith("nrm") else 2
+
+
+def reference_partials_cols(kind: str, xs: Sequence[torch.Tensor], accumulate: str = "accurate"):
+    """`reference_partials` of every column at once, on the host: float32
+    (P, ncol NCH, R) with [:, :, j] bitwise equal to
+    `reference_partials(kind, [x[:, j] for x in xs], accumulate)` (the same
+    fp32 operations, with a trailing column axis). Operands (n, R)."""
+    if len(xs) != _ARITY[kind]:
+        raise ValueError(f"{kind} takes {_ARITY[kind]} operands")
+    if accumulate not in ARMS:
+        raise ValueError(f"accumulate must be one of {ARMS}; got {accumulate!r}")
+    n, R = xs[0].shape
+    pl = plan(n)
+    rows = [layout_cols(t.to("cpu", F32), pl).view(P, NCH, pl.tpc, pl.W, R) for t in xs]
+    scale = k = None
+    if kind.startswith("nrm"):
+        scale, k = _nrm_scale(rows)  # (P, NCH, 1, R), (P, NCH, R)
+    zero = torch.zeros((P, NCH, pl.W, R), dtype=F32)
+    acc = FF(zero, zero.clone())
+    for t in range(pl.tpc):
+        term = _term(kind, accumulate, [r[:, :, t] for r in rows], scale)
+        acc = _accumulate(acc, term, accumulate)
+    f = _fold(acc, dim=2, mode=accumulate)
+    cols = [f.hi[:, :, 0], f.lo[:, :, 0]] + ([k] if k is not None else [])
+    return torch.stack(cols, dim=2).reshape(P, _ncol(kind) * NCH, R).contiguous()
+
+
+def reference_exact_partials_cols(kind: str, xs: Sequence[torch.Tensor]) -> torch.Tensor:
+    """`reference_exact_partials` per column: int32 (P, NCH (L + 3), R)."""
+    R = xs[0].shape[1]
+    cols = [reference_exact_partials(kind, [t[:, j] for t in xs]) for j in range(R)]
+    if not cols:
+        return torch.zeros((P, NCH * EXACT_COLS, 0), dtype=torch.int32)
+    return torch.stack(cols, dim=2).contiguous()
+
+
+def _operands_cols(kind: str, args) -> tuple[str, list]:
+    """`_operands` for (n, R) operands: the same kinds, shapes kept."""
+    ffs = [isinstance(a, (FF, tuple)) or a.dtype == F64 for a in args]
+    if not any(ffs):
+        for a in args:
+            if a.dtype != F32:
+                raise TypeError(f"trnblas.fp64 takes float32, float64 or FF; got {a.dtype}")
+        out, kind = list(args), kind + "32"
+    else:
+        out = []
+        for a in args:
+            f = as_ff(a)
+            out += [f.hi, f.lo]
+        kind = kind + "ff"
+    if out[0].dim() != 2:
+        raise ValueError(f"the column reductions take (n, R) operands; got {tuple(out[0].shape)}")
+    if len({tuple(t.shape) for t in out}) != 1:
+        raise ValueError("operands must have the same (n, R) shape")
+    return kind, out
+
+
+def partials_cols(kind: str, xs: Sequence[torch.Tensor], backend=None, accumulate="accurate"):
+    """Per-column chunk partials (P, ncol NCH, R) on the selected backend
+    ([:, :, j] equals `partials` of column j; int32 (P, NCH (L + 3), R) for
+    the exact arm). One kernel launch for all R columns."""
+    if len({tuple(t.shape) for t in xs}) != 1:
+        raise ValueError("operands must have the same (n, R) shape")
+    R = xs[0].shape[1]
+    if R == 0:
+        if accumulate == "exact":
+            return torch.zeros((P, NCH * EXACT_COLS, 0), dtype=torch.int32)
+        return torch.zeros((P, _ncol(kind) * NCH, 0), dtype=F32)
+    route = _route(xs, backend)
+    if route == "pytorch":
+        if accumulate == "exact":
+            return reference_exact_partials_cols(kind, xs)
+        return reference_partials_cols(kind, xs, accumulate)
+    from .nki import fp64_kernels as K
+
+    return K.run_partials_cols(kind, xs, accumulate, simulate=(route == "sim"))
+
+
+def _finish_cols(parts: torch.Tensor, kind: str, finish: str):
+    if finish == "partials":
+        return parts
+    R = parts.shape[2]
+    if finish == "host":
+        return torch.tensor([finish_host(parts[:, :, j], kind) for j in range(R)], dtype=F64)
+    if finish == "ff":
+        if kind.startswith("nrm"):
+            raise ValueError("nrm2 has no float-float finish (per-chunk scales); use 'host'")
+        fs = [finish_ff(parts[:, :, j]) for j in range(R)]
+        if not fs:
+            return FF(torch.zeros(0, dtype=F32), torch.zeros(0, dtype=F32))
+        return FF(torch.stack([f.hi for f in fs]), torch.stack([f.lo for f in fs]))
+    raise ValueError(f"finish must be 'host', 'ff' or 'partials'; got {finish!r}")
+
+
+def _exact_finish_cols(parts, kind, xs, finish):
+    if finish == "partials":
+        return parts
+    R = parts.shape[2]
+    vals = [
+        _exact_finish(parts[:, :, j].contiguous(), kind, [t[:, j] for t in xs], finish)
+        for j in range(R)
+    ]
+    return torch.stack(vals) if vals else torch.zeros(0, dtype=F64)
+
+
+def dot_cols(X, Y, *, backend=None, finish: str = "host", accumulate: str = "accurate"):
+    """Column-wise float-float dot products: X[:, j] . Y[:, j] for (n, R)
+    operands (float32, float64 or FF), float64 (R,) by default.
+
+    Column j is bitwise equal to `dot(X[:, j], Y[:, j], ...)` with the same
+    arguments: the same layout, fp32 operations and order (see the section
+    comment above), and the same host finish. All R columns take one kernel
+    launch (`dot` takes one each) and one download of the partials.
+    finish="ff": an FF of shape (R,); "partials": the raw (P, 2 NCH, R).
+    `accumulate` as for `dot`, including "exact" (float32 operands), whose
+    columns finish as `dot`'s: exactly rounded, a column whose window did not
+    hold every term recomputed on the host."""
+    _check_arm(accumulate)
+    kind, xs = _operands_cols("dot", [X, Y])
+    parts = partials_cols(kind, xs, backend, accumulate)
+    if accumulate == "exact":
+        return _exact_finish_cols(parts, kind, xs, finish)
+    return _finish_cols(parts, kind, finish)
+
+
+def nrm2_cols(X, *, backend=None, accumulate: str = "accurate") -> torch.Tensor:
+    """Column 2-norms of an (n, R) operand (float32, float64 or FF), float64
+    (R,): column j bitwise equal to `nrm2(X[:, j])`, with its own power-of-two
+    scale per (partition, chunk). One kernel launch for all R columns."""
+    _check_arm(accumulate)
+    if accumulate == "exact":
+        raise ValueError("nrm2 has no exact arm")
+    kind, xs = _operands_cols("nrm", [X])
+    return _finish_cols(partials_cols(kind, xs, backend, accumulate), kind, "host")
 
 
 def axpy(alpha, x, y, *, backend=None) -> FF:
@@ -1210,6 +1376,7 @@ __all__ = [
     "combine_bits",
     "combine_exact",
     "dot",
+    "dot_cols",
     "exact_dot",
     "exact_sum",
     "fast_two_sum",
@@ -1226,11 +1393,16 @@ __all__ = [
     "from_fp64",
     "int_limbs_needed",
     "layout",
+    "layout_cols",
     "nrm2",
+    "nrm2_cols",
     "partials",
+    "partials_cols",
     "plan",
     "reference_exact_partials",
+    "reference_exact_partials_cols",
     "reference_partials",
+    "reference_partials_cols",
     "split",
     "split_bits",
     "stacked",

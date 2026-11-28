@@ -24,8 +24,15 @@ def _fake_partials(ncol, dtype=torch.float32):
     return fake
 
 
-def _register_reduce(name: str, arity: int, ncol: int, dtype=torch.float32):
-    fake = _fake_partials(ncol, dtype)
+def _fake_partials_cols(ncol, dtype=torch.float32):
+    def fake(*xs):  # operands (128, NCH tpc, G, W, rg) -> (128, ncol NCH, G rg)
+        return xs[0].new_empty((128, ncol * _NCH, xs[0].shape[2] * xs[0].shape[4]), dtype=dtype)
+
+    return fake
+
+
+def _register_reduce(name: str, arity: int, ncol: int, dtype=torch.float32, fake=None):
+    fake = fake or _fake_partials(ncol, dtype)
     if arity == 1:
 
         def op1(x: torch.Tensor) -> torch.Tensor:
@@ -68,6 +75,20 @@ OPS = {
     )
     for (kind, arm), name in _k.REDUCE_KERNELS.items()
 }
+OPS.update(
+    {
+        name: _register_reduce(
+            name,
+            _ARITY[kind],
+            _ncol(kind, arm),
+            torch.int32 if arm == "exact" else torch.float32,
+            fake=_fake_partials_cols(
+                _ncol(kind, arm), torch.int32 if arm == "exact" else torch.float32
+            ),
+        )
+        for (kind, arm), name in _k.COLS_KERNELS.items()
+    }
+)
 
 
 @nki_op(

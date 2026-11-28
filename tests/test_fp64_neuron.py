@@ -2,7 +2,7 @@
 
 Native TorchNeuron path only. Every test writes its JSON report into
 TRNBLAS_FP64_PROBE_DIR (default: the pytest tmp dir) as e0.json,
-e2_<n>.json, e3.json, lnc<L>.json. Run E0 first: the other results assume what it
+e2_<n>.json, e3.json, e5_cols.json, lnc<L>.json. Run E0 first: the other results assume what it
 checks (fp32 add / subtract / multiply round to nearest even on VectorE,
 TwoSum and Dekker TwoProd exact). Each test runs in well under 20 minutes
 on one logical core (the E2 runs stop starting new kernels after
@@ -157,3 +157,101 @@ def test_e3_combine_on_device(outdir):
     assert rep["seconds"] < 1200
     for k, r in rep["shapes"].items():
         assert r["bitwise_equal_ozaki_combine"], k
+
+
+# ── column-batched dot / nrm2 (trnblas#142) ──────────────────────────────────
+
+
+def test_cols_kernels_equal_cpu_reference_bitwise():
+    """Every column-batched kernel equals the CPU reference bit for bit at
+    the block-CG target shape (n = 1e5 + 3, R = 33: 17 groups of 2) and
+    with three tiles per chunk (n = 600001, R = 5)."""
+    rng = np.random.default_rng(3)
+    for n, R, keys in (
+        (100003, 33, sorted(K.COLS_KERNELS)),
+        (600001, 5, [("dot32", "accurate"), ("nrm32", "accurate")]),
+    ):
+        X = rng.standard_normal((n, R)) * 10.0 ** rng.integers(-6, 6, (n, R))
+        Y = rng.standard_normal((n, R))
+        fx, fy = F.from_fp64(torch.from_numpy(X)), F.from_fp64(torch.from_numpy(Y))
+        x32 = torch.from_numpy(X.astype(np.float32))
+        y32 = torch.from_numpy(Y.astype(np.float32))
+        ops = {
+            "dot32": [x32, y32],
+            "nrm32": [x32],
+            "dotff": [fx.hi, fx.lo, fy.hi, fy.lo],
+            "nrmff": [fx.hi, fx.lo],
+        }
+        for kind, arm in keys:
+            xs = ops[kind]
+            got = K.run_partials_cols(kind, [t.to("neuron") for t in xs], arm)
+            if arm == "exact":
+                ref = F.reference_exact_partials_cols(kind, xs)
+            else:
+                ref = F.reference_partials_cols(kind, xs, arm)
+            assert torch.equal(got.view(torch.int32), ref.view(torch.int32)), (n, R, kind, arm)
+
+
+def _cols_edge_block(n=3000):
+    X = torch.zeros((n, 9))
+    Y = torch.ones((n, 9))
+    X[:, 1] = -0.0
+    X[::7, 2] = 2.0**-140  # subnormal
+    X[::5, 3] = -(2.0**-149)
+    X[:, 4] = torch.from_numpy(np.ldexp(1.0, np.arange(n) % 40 - 149).astype(np.float32))
+    X[:, 5] = torch.linspace(-1, 1, n)
+    Y[:, 5] = 2.0**-130
+    X[:, 6:] = 1.0
+    X[17, 6], X[3, 7], X[999, 8] = float("inf"), float("-inf"), float("nan")
+    return X, Y
+
+
+def test_cols_public_api_on_device_tensors():
+    """On the device: dot_cols / nrm2_cols equal R separate device dot /
+    nrm2 calls bit for bit (the #142 contract), random and edge-case
+    columns (zeros, -0, subnormals, inf / nan); and, for normal data, the
+    host (CPU reference) results. Subnormal columns are outside the
+    reference contract (the engines may flush them); their per-column
+    agreement is what this asserts."""
+    rng = np.random.default_rng(4)
+    X = torch.from_numpy(rng.standard_normal((100000, 33)).astype(np.float32))
+    Y = torch.from_numpy(rng.standard_normal((100000, 33)).astype(np.float32))
+    E, EY = _cols_edge_block()
+    for A, B, normal in ((X, Y, True), (E, EY, False)):
+        Ad, Bd = A.to("neuron"), B.to("neuron")
+        R = A.shape[1]
+        for arm in F.ARMS:
+            d = F.dot_cols(Ad, Bd, accumulate=arm)
+            per = torch.stack([F.dot(Ad[:, j], Bd[:, j], accumulate=arm) for j in range(R)])
+            assert torch.equal(d.view(torch.int64), per.view(torch.int64)), arm
+            if normal:
+                host = F.dot_cols(A, B, accumulate=arm)
+                assert torch.equal(d.view(torch.int64), host.view(torch.int64)), arm
+        r = F.nrm2_cols(Ad)
+        per = torch.stack([F.nrm2(Ad[:, j]) for j in range(R)])
+        assert torch.equal(r.view(torch.int64), per.view(torch.int64))
+        if normal:
+            assert torch.equal(r.view(torch.int64), F.nrm2_cols(A).view(torch.int64))
+            e = F.dot_cols(Ad, Bd, accumulate="exact")
+            assert torch.equal(
+                e.view(torch.int64), F.dot_cols(A, B, accumulate="exact").view(torch.int64)
+            )
+
+
+def test_e5_cols_bitwise_and_timing(outdir):
+    """E5: dot_cols / nrm2_cols against the per-column loop (trnsolver
+    `_ff_cols`) and the pairwise reduction, with a column-group width sweep.
+    Asserts bitwise equality; the #142 target (ff block-CG within 5% of
+    pairwise at n = 1e5, R = 33) is reported as `target_met`, not asserted."""
+    budget = float(os.environ.get("TRNBLAS_FP64_BUDGET_S", "1080"))
+    rep = Q.cols_bench(budget_s=budget)
+    _dump(outdir, "e5_cols.json", rep)
+    print("\n" + Q.format_cols(rep))
+    assert rep["seconds"] < 1200
+    for k, r in rep["shapes"].items():
+        for key, v in r.items():
+            if key.startswith("bitwise"):
+                assert v, (k, key)
+        for free, row in r["free_sweep"].items():
+            if "bitwise_vs_default" in row:
+                assert row["bitwise_vs_default"], (k, free)

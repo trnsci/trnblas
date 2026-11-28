@@ -65,7 +65,21 @@ REDUCE_KERNELS: dict[tuple[str, str], str] = {
     ("dot32", "exact"): "_fp64_dot32_exact_kernel",
 }
 _EXACT_L = 6  # = trnblas.fp64.EXACT_LIMBS
-for _name in REDUCE_KERNELS.values():
+
+# (kind, arm) -> column-batched kernel (trnblas#142): every arm of dot and
+# nrm2, all R columns of an (n, R) operand in one launch
+COLS_KERNELS: dict[tuple[str, str], str] = {
+    k: v.replace("_kernel", "_cols_kernel")
+    for k, v in REDUCE_KERNELS.items()
+    if k[0][:3] in ("dot", "nrm")
+}
+# Default free size (elements per partition) of a column group's tiles:
+# rg columns of W lanes, rg W <= COLS_FREE (one column if W alone is wider).
+# 512 is the widest tile of the single-column kernels (W_MAX), so the SBUF
+# footprint per instruction stays the one measured there. Host-side only (it
+# sets the operand shape), so TRNBLAS_FP64_COLS_FREE can tune it per call.
+COLS_FREE = 512
+for _name in list(REDUCE_KERNELS.values()) + list(COLS_KERNELS.values()):
     KERNEL_DTYPES[_name] = frozenset({torch.float32})
 KERNEL_DTYPES["_fp64_probe_alu_kernel"] = frozenset({torch.float32})
 KERNEL_DTYPES["_fp64_probe_fma_kernel"] = frozenset({torch.float32})
@@ -164,6 +178,23 @@ if HAS_NKI:
         cl3 = _fv_op(cl1, cl2, nl.add, shape)
         return _fv_fast_two_sum(ch, cl3, shape)
 
+    def _fv_scale_mul(dst, src, scale):
+        """dst = src * scale by one fp32 multiply per element, with a (128, 1)
+        per-partition operand (tensor_scalar). In the column-batched kernels
+        `scale` is a (128, 1, rg) tile, one scale per column, and each
+        column of the (128, W, rg) tile takes its own tensor_scalar: the
+        instruction form of the single-column kernels."""
+        if len(scale.shape) == 3:
+            for j in range(scale.shape[2]):
+                nisa.tensor_scalar(
+                    dst=dst[:, :, j : j + 1],
+                    data=src[:, :, j : j + 1],
+                    op0=nl.multiply,
+                    operand0=scale[:, 0, j : j + 1],
+                )
+        else:
+            nisa.tensor_scalar(dst=dst, data=src, op0=nl.multiply, operand0=scale)
+
     # ---------------------------------------------------------------------
     # Reductions
     # ---------------------------------------------------------------------
@@ -182,14 +213,14 @@ if HAS_NKI:
         if kind == "dotff":
             return _fv_mul(tiles[0], tiles[1], tiles[2], tiles[3], shape)
         a = _fv_t(shape)
-        nisa.tensor_scalar(dst=a, data=tiles[0], op0=nl.multiply, operand0=scale)
+        _fv_scale_mul(a, tiles[0], scale)
         if kind == "nrm32":
             if mode == "plain":
                 return _fv_op(a, a, nl.multiply, shape), None
             return _fv_two_prod(a, a, shape)
         # nrmff
         b = _fv_t(shape)
-        nisa.tensor_scalar(dst=b, data=tiles[1], op0=nl.multiply, operand0=scale)
+        _fv_scale_mul(b, tiles[1], scale)
         p, e = _fv_two_prod(a, a, shape)
         t = _fv_op(a, b, nl.multiply, shape)
         t2 = _fv_op(t, t, nl.add, shape)
@@ -217,15 +248,21 @@ if HAS_NKI:
         else:
             _fv_add_into(Ah, Al, th, tl, Ah, Al, shape)
 
-    def _fv_fold(Ah, Al, W, mode):
+    def _fv_fold(Ah, Al, W, mode, rg=None):
         """Halving tree over the W lanes (fp64._fold), in place; the result
-        is in column 0."""
+        is in column 0. rg: the (128, W, rg) tiles of the column-batched
+        kernels, folded over W per column (lane 0 is [:, 0:1, :])."""
         w = W
         while w > 1:
             k = w // 2
-            sh = (128, k)
-            ah, al = Ah[:, 0:k], Al[:, 0:k]
-            bh, bl = Ah[:, w - k : w], Al[:, w - k : w]
+            if rg is None:
+                sh = (128, k)
+                ah, al = Ah[:, 0:k], Al[:, 0:k]
+                bh, bl = Ah[:, w - k : w], Al[:, w - k : w]
+            else:
+                sh = (128, k, rg)
+                ah, al = Ah[:, 0:k, :], Al[:, 0:k, :]
+                bh, bl = Ah[:, w - k : w, :], Al[:, w - k : w, :]
             if mode == "plain":
                 nisa.tensor_tensor(dst=ah, data1=ah, data2=bh, op=nl.add)
             elif mode == "comp":
@@ -336,9 +373,9 @@ if HAS_NKI:
             dst=sg, data=neg, op0=nl.multiply, operand0=-2.0, op1=nl.add, operand1=1.0
         )
         r0 = _fv_t(shape)
-        nisa.tensor_scalar(dst=r0, data=a, op0=nl.multiply, operand0=sa)
+        _fv_scale_mul(r0, a, sa)
         r = _fv_t(shape)
-        nisa.tensor_scalar(dst=r, data=r0, op0=nl.multiply, operand0=sb)
+        _fv_scale_mul(r, r0, sb)
         tiny = _fv_t(shape)
         nisa.tensor_scalar(dst=tiny, data=r, op0=nl.less, operand0=2.0**-100)
         nzv = _fv_t(shape)
@@ -561,6 +598,237 @@ if HAS_NKI:
     @nki.jit
     def _fp64_nrmff_accurate_kernel(xh, xl):
         return _fv_reduce((xh, xl), "nrmff", "accurate")
+
+    # ---------------------------------------------------------------------
+    # Column-batched reductions (trnblas#142): dot / nrm2 of the R columns
+    # of (n, R) operands in one launch. Operands arrive as
+    # (128, NCH tpc, G, W, rg) float32 (`run_partials_cols`): column
+    # j = g rg + i of lane (p, f = (c tpc + t) W + w) is x[p, c tpc + t, g,
+    # w, i], i.e. column j's `fp64.layout` rows with the columns grouped rg
+    # at a time on the innermost free axis. Each (chunk, group) runs the
+    # single-column chunk on (128, W, rg) tiles: elementwise steps are the
+    # same instructions on wider tiles, the halving tree folds over W per
+    # column, and the nrm2 / exact-arm scales are per column (tensor_scalar
+    # per column, `_fv_scale_mul`). So column j's partials are the bits of
+    # its own single-column kernel. Output (128, ncol NCH, G rg).
+    # ---------------------------------------------------------------------
+
+    def _cv_lane_max(M, W):
+        """Halving max over the W lanes of M (128, W, rg), in place, into
+        M[:, 0:1, :]. Exact and order-free; the scale exponent taken from it
+        is the single-column kernels' (tensor_reduce) for any finite data."""
+        w = W
+        while w > 1:
+            k = w // 2
+            nisa.tensor_tensor(
+                dst=M[:, 0:k, :], data1=M[:, 0:k, :], data2=M[:, w - k : w, :], op=nl.maximum
+            )
+            w -= k
+
+    def _cv_absmax(ins, i0, g, W, tpc, rg, product):
+        """(128, 1, rg) float32 tile: per column, the largest |x| (or
+        |fl(x y)| for `product`) of the chunk starting at row block i0."""
+        sh = (128, W, rg)
+        M = _fv_t(sh)
+        nisa.memset(dst=M, value=0.0)
+        for t in nl.sequential_range(tpc):
+            xt = nl.load(ins[0][0:128, i0 + t, g, 0:W, 0:rg])
+            if product:
+                yt = nl.load(ins[1][0:128, i0 + t, g, 0:W, 0:rg])
+                lead = _fv_op(xt, yt, nl.multiply, sh)
+            else:
+                lead = xt
+            a = nl.ndarray(sh, dtype=nl.uint32, buffer=nl.sbuf)
+            nisa.tensor_scalar(
+                dst=a, data=lead.view(nl.uint32), op0=nl.bitwise_and, operand0=0x7FFFFFFF
+            )
+            nisa.tensor_tensor(dst=M, data1=M, data2=a.view(nl.float32), op=nl.maximum)
+        _cv_lane_max(M, W)
+        m = _fv_t((128, 1, rg))
+        nisa.tensor_copy(dst=m, src=M[:, 0:1, :])
+        return m
+
+    def _cv_scale(x, i0, g, W, tpc, rg, out, col):
+        """`_fv_scale` per column: s (128, 1, rg) and k into
+        out[:, col, g rg : (g + 1) rg]."""
+        s1 = (128, 1, rg)
+        m = _cv_absmax((x,), i0, g, W, tpc, rg, False)
+        E = nl.ndarray(s1, dtype=nl.uint32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=E, data=m.view(nl.uint32), op0=nl.right_shift, operand0=23)
+        Ef = _fv_t(s1)
+        nisa.tensor_copy(dst=Ef, src=E)
+        Ec = _fv_t(s1)
+        nisa.tensor_scalar(dst=Ec, data=Ef, op0=nl.minimum, operand0=253.0)
+        sb = _fv_t(s1)  # 254 - Ec: a small integer, exact
+        nisa.tensor_scalar(
+            dst=sb, data=Ec, op0=nl.multiply, operand0=-1.0, op1=nl.add, operand1=254.0
+        )
+        su = nl.ndarray(s1, dtype=nl.uint32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=su, src=sb)
+        s = nl.ndarray(s1, dtype=nl.uint32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=s, data=su, op0=nl.left_shift, operand0=23)
+        k = _fv_t(s1)
+        nisa.tensor_scalar(dst=k, data=Ec, op0=nl.subtract, operand0=127.0)
+        nl.store(out[0:128, col : col + 1, g * rg : (g + 1) * rg], value=k)
+        return s.view(nl.float32)
+
+    def _cv_chunk(ins, out, c, g, W, tpc, rg, kind, mode):
+        ncol = 3 if kind[:3] == "nrm" else 2
+        i0 = c * tpc
+        shape = (128, W, rg)
+        scale = None
+        if ncol == 3:
+            scale = _cv_scale(ins[0], i0, g, W, tpc, rg, out, ncol * c + 2)
+        Ah = _fv_t(shape)
+        Al = _fv_t(shape)
+        nisa.memset(dst=Ah, value=0.0)
+        nisa.memset(dst=Al, value=0.0)
+        for t in nl.sequential_range(tpc):
+            tiles = [nl.load(v[0:128, i0 + t, g, 0:W, 0:rg]) for v in ins]
+            th, tl = _fv_term(kind, mode, tiles, scale, shape)
+            _fv_accumulate(Ah, Al, th, tl, mode, shape)
+        _fv_fold(Ah, Al, W, mode, rg)
+        j0 = g * rg
+        nl.store(out[0:128, ncol * c : ncol * c + 1, j0 : j0 + rg], value=Ah[:, 0:1, :])
+        nl.store(out[0:128, ncol * c + 1 : ncol * c + 2, j0 : j0 + rg], value=Al[:, 0:1, :])
+
+    def _cx_chunk(ins, out, c, g, W, tpc, rg, kind):
+        """`_fx_chunk` (the exact arm) on the (128, W, rg) column groups."""
+        L = _EXACT_L
+        ncol = L + 3
+        i0 = c * tpc
+        sh = (128, W, rg)
+        s1 = (128, 1, rg)
+        m = _cv_absmax(ins, i0, g, W, tpc, rg, kind == "dot32")
+        Eu = nl.ndarray(s1, dtype=nl.uint32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=Eu, data=m.view(nl.uint32), op0=nl.right_shift, operand0=23)
+        Eg = _fv_t(s1)
+        nisa.tensor_copy(dst=Eg, src=Eu)
+        fa = _fv_t(s1)  # field of 2^min(147 - Eg, 127)
+        nisa.tensor_scalar(
+            dst=fa, data=Eg, op0=nl.multiply, operand0=-1.0, op1=nl.add, operand1=274.0
+        )
+        nisa.tensor_scalar(dst=fa, data=fa, op0=nl.minimum, operand0=254.0)
+        fb = _fv_t(s1)  # field of 2^max(20 - Eg, 0)
+        nisa.tensor_scalar(
+            dst=fb, data=Eg, op0=nl.multiply, operand0=-1.0, op1=nl.add, operand1=147.0
+        )
+        nisa.tensor_scalar(dst=fb, data=fb, op0=nl.maximum, operand0=127.0)
+        sa = _fx_pow2(fa, s1)
+        sb = _fx_pow2(fb, s1)
+        acc = []
+        for _j in range(L + 1):
+            z = _fx_i(sh)
+            nisa.memset(dst=z, value=0)
+            acc.append(z)
+        zero = _fx_i(sh)
+        nisa.memset(dst=zero, value=0)
+        sticky = _fv_t(sh)
+        nisa.memset(dst=sticky, value=0.0)
+        for t in nl.sequential_range(tpc):
+            xt = nl.load(ins[0][0:128, i0 + t, g, 0:W, 0:rg])
+            if kind == "dot32":
+                yt = nl.load(ins[1][0:128, i0 + t, g, 0:W, 0:rg])
+                p, e = _fv_two_prod(xt, yt, sh)
+                _fx_digits(p, sa, sb, acc, sticky, sh)
+                _fx_digits(e, sa, sb, acc, sticky, sh)
+            else:
+                _fx_digits(xt, sa, sb, acc, sticky, sh)
+        _fx_carry(acc, zero, sh)
+        w = W
+        while w > 1:
+            k = w // 2
+            for j in range(L + 1):
+                nisa.tensor_tensor(
+                    dst=acc[j][:, 0:k, :],
+                    data1=acc[j][:, 0:k, :],
+                    data2=acc[j][:, w - k : w, :],
+                    op=nl.add,
+                    engine=nisa.gpsimd_engine,
+                )
+            nisa.tensor_tensor(
+                dst=sticky[:, 0:k, :],
+                data1=sticky[:, 0:k, :],
+                data2=sticky[:, w - k : w, :],
+                op=nl.maximum,
+            )
+            w -= k
+        j0 = g * rg
+        for j in range(L + 1):
+            nl.store(
+                out[0:128, ncol * c + j : ncol * c + j + 1, j0 : j0 + rg], value=acc[j][:, 0:1, :]
+            )
+        Tf = _fv_t(s1)
+        nisa.tensor_scalar(dst=Tf, data=Eg, op0=nl.subtract, operand0=126.0)
+        Ti = _fx_i(s1)
+        nisa.tensor_copy(dst=Ti, src=Tf)
+        nl.store(out[0:128, ncol * c + L + 1 : ncol * c + L + 2, j0 : j0 + rg], value=Ti)
+        Si = _fx_i(s1)
+        nisa.tensor_copy(dst=Si, src=sticky[:, 0:1, :])
+        nl.store(out[0:128, ncol * c + L + 2 : ncol * c + L + 3, j0 : j0 + rg], value=Si)
+
+    def _cv_reduce(ins, kind, mode):
+        _, A, G, W, rg = ins[0].shape
+        tpc = A // _NCH
+        if mode == "exact":
+            ncol, dt = _EXACT_L + 3, nl.int32
+        else:
+            ncol, dt = (3 if kind[:3] == "nrm" else 2), nl.float32
+        out = nl.ndarray((128, ncol * _NCH, G * rg), dtype=dt, buffer=nl.shared_hbm)
+
+        def chunk(c, g):
+            if mode == "exact":
+                _cx_chunk(ins, out, c, g, W, tpc, rg, kind)
+            else:
+                _cv_chunk(ins, out, c, g, W, tpc, rg, kind, mode)
+
+        n_prog = nl.num_programs() if nl.program_ndim() > 0 else 1
+        cpp = _NCH // n_prog
+        if n_prog > 1:
+            for j in nl.affine_range(cpp):
+                for g in nl.affine_range(G):
+                    chunk(nl.program_id(0) * cpp + j, g)
+        else:
+            for j in nl.affine_range(_NCH):
+                for g in nl.affine_range(G):
+                    chunk(j, g)
+        return out
+
+    @nki.jit
+    def _fp64_dot32_plain_cols_kernel(x, y):
+        return _cv_reduce((x, y), "dot32", "plain")
+
+    @nki.jit
+    def _fp64_dot32_comp_cols_kernel(x, y):
+        return _cv_reduce((x, y), "dot32", "comp")
+
+    @nki.jit
+    def _fp64_dot32_sloppy_cols_kernel(x, y):
+        return _cv_reduce((x, y), "dot32", "sloppy")
+
+    @nki.jit
+    def _fp64_dot32_accurate_cols_kernel(x, y):
+        return _cv_reduce((x, y), "dot32", "accurate")
+
+    @nki.jit
+    def _fp64_dot32_exact_cols_kernel(x, y):
+        return _cv_reduce((x, y), "dot32", "exact")
+
+    @nki.jit
+    def _fp64_dotff_accurate_cols_kernel(xh, xl, yh, yl):
+        return _cv_reduce((xh, xl, yh, yl), "dotff", "accurate")
+
+    @nki.jit
+    def _fp64_dotff_sloppy_cols_kernel(xh, xl, yh, yl):
+        return _cv_reduce((xh, xl, yh, yl), "dotff", "sloppy")
+
+    @nki.jit
+    def _fp64_nrm32_accurate_cols_kernel(x):
+        return _cv_reduce((x,), "nrm32", "accurate")
+
+    @nki.jit
+    def _fp64_nrmff_accurate_cols_kernel(xh, xl):
+        return _cv_reduce((xh, xl), "nrmff", "accurate")
 
     # ---------------------------------------------------------------------
     # Device probes (E0 of #169). Inputs a, b, c are (128, W) float32;
@@ -904,6 +1172,54 @@ def run_partials(kind: str, xs, accumulate: str, simulate: bool = False) -> torc
     rows = [fp64.layout(t, pl).contiguous() for t in xs]
     out = call(name, *rows, simulate=simulate)
     return out.to("cpu")
+
+
+def cols_groups(W: int, R: int, free: int | None = None) -> tuple[int, int]:
+    """(G, rg): the R columns in G groups of rg (the last group zero-padded
+    when rg does not divide R), with rg W <= `free` (`COLS_FREE`, or
+    TRNBLAS_FP64_COLS_FREE) and rg balanced to pad the fewest columns. The
+    grouping changes the tile shapes, never a column's arithmetic."""
+    if free is None:
+        free = int(os.environ.get("TRNBLAS_FP64_COLS_FREE", COLS_FREE))
+    rg = max(1, min(R, free // W))
+    G = -(-R // rg)
+    return G, -(-R // G)
+
+
+def layout_groups(rows: torch.Tensor, W: int, G: int, rg: int) -> torch.Tensor:
+    """(P, F, R) column rows (`fp64.layout_cols`) -> the kernels'
+    (P, NCH tpc, G, W, rg) operand: zero columns pad R to G rg, and each
+    group's rg columns are contiguous per lane block (one device copy unless
+    there is a single group)."""
+    P_, F, R = rows.shape
+    if G * rg != R:
+        rows = torch.nn.functional.pad(rows, (0, G * rg - R))
+    blocks = F // W
+    if G == 1:
+        return rows.reshape(P_, blocks, 1, W, rg)
+    return rows.reshape(P_, blocks, W, G, rg).permute(0, 1, 3, 2, 4).contiguous()
+
+
+def run_partials_cols(
+    kind: str, xs, accumulate: str, simulate: bool = False, free: int | None = None
+) -> torch.Tensor:
+    """`fp64.partials_cols` from the column-batched kernel for (kind,
+    accumulate): one launch for the R columns of the (n, R) operands, a host
+    (P, ncol NCH, R) tensor whose [:, :, j] equals `run_partials` of column j."""
+    from .. import fp64
+
+    name = COLS_KERNELS.get((kind, accumulate))
+    if name is None:
+        raise NotImplementedError(
+            f"trnblas.fp64: no column-batched NKI kernel for {kind} with "
+            f"accumulate={accumulate!r}; kernels: {sorted(COLS_KERNELS)}"
+        )
+    n, R = xs[0].shape
+    pl = fp64.plan(n)
+    G, rg = cols_groups(pl.W, R, free)
+    rows = [layout_groups(fp64.layout_cols(t, pl), pl.W, G, rg) for t in xs]
+    out = call(name, *rows, simulate=simulate)
+    return out.to("cpu")[:, :, :R].contiguous()
 
 
 def lnc() -> int:

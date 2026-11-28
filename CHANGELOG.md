@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Column-batched fp64-class reductions: `trnblas.fp64.dot_cols(X, Y)` and
+  `nrm2_cols(X)`** (#142). For (n, R) operands (float32, float64 or FF) they
+  return the R column dot products or norms as a float64 (R,) tensor, from
+  one kernel launch and one partials download for all R columns. Before
+  this, a block solver made R separate `dot` / `nrm2` calls (trnsolver
+  `cg_block` with `reduction="ff"`, trnsolver#153), so each iteration paid
+  about 3R launches and host syncs. On Trn2 (window 8) that cost ff block-CG
+  +14.3% over the pairwise reduction at n = 1e5, R = 33. Each column is
+  bitwise equal to its own `dot(X[:, j], Y[:, j])` / `nrm2(X[:, j])` call, with
+  the same arguments. Column j keeps its own `plan(n)` lanes, with the
+  columns side by side on the innermost free axis. The two-sum
+  accumulation is elementwise, the halving tree folds over W per column,
+  the nrm2 power-of-two scales stay per (partition, chunk, column), and
+  the host finish is the same function for each column. Every `dot` arm
+  is batched (`plain`, `comp`, `sloppy`, `accurate`, and `exact` for
+  float32, which falls back to the host per column when a column's window
+  does not hold every term), as is the float-float `nrm2`, with nine
+  `_fp64_*_cols_kernel` kernels. `finish="ff"` and `"partials"` work as for
+  `dot`. The kernels take (128, NCH·tpc, G, W, rg) operands: columns go in
+  G groups of rg with rg·W ≤ 512 elements, the widest tile of the
+  single-column kernels. The tile shape never changes a column's bits, and
+  `TRNBLAS_FP64_COLS_FREE` tunes the group width. The `pytorch` backend
+  (`reference_partials_cols`) runs the kernels' fp32 operations in the
+  same order. Tested bitwise against per-column `dot` / `nrm2` on CPU and
+  under `nki.simulate` (trn2, LNC=1 and 2) for R ∈ {1, 2, 33, 128, 129} and
+  n ∈ {1, 127, 128, 1e5}, including zeros, -0, subnormals and inf / nan.
+  The device check and timing (`tests/test_fp64_neuron.py -k cols`,
+  `scripts/probe_fp64.py cols`) are pending Trn2 window 9.
+
 ## [0.15.0] — 2026-11-28
 
 ### Changed
