@@ -746,6 +746,23 @@ def lnc_digests(ns=(100003, 1000000), device: str = "neuron", budget_s: float = 
             out["equal_ref"][key] = bool(
                 torch.equal(parts.view(torch.int32), ref.view(torch.int32))
             )
+    # the column-batched kernels (trnblas#142): 17 groups of 2 at n = 1e5 + 3
+    n, R = ns[0], 33
+    rng = np.random.default_rng(2)
+    X = torch.from_numpy(rng.standard_normal((n, R)).astype(np.float32))
+    Y = torch.from_numpy(rng.standard_normal((n, R)).astype(np.float32))
+    for kind, arm, xs in (("dot32", "accurate", [X, Y]), ("nrm32", "accurate", [X])):
+        if time.time() - t0 > budget_s:
+            out["truncated"] = True
+            break
+        if device == "neuron":
+            parts = K.run_partials_cols(kind, [t.to("neuron") for t in xs], arm)
+        else:
+            parts = fp64.reference_partials_cols(kind, xs, arm)
+        key = f"cols/{kind}/{arm}/n={n},R={R}"
+        out["digests"][key] = hashlib.sha256(parts.numpy().tobytes()).hexdigest()
+        ref = fp64.reference_partials_cols(kind, xs, arm)
+        out["equal_ref"][key] = bool(torch.equal(parts.view(torch.int32), ref.view(torch.int32)))
     return out
 
 
@@ -853,5 +870,218 @@ def format_e3(rep: dict) -> str:
             f"| {k} | {r['device_route_ms']:.2f} | {r['host_route_ms']:.2f} | "
             f"{r['hilo_download_ms']:.2f} | {r['speedup']:.2f} | "
             f"{r['bitwise_equal_ozaki_combine']} | {r['first_call_s']:.1f} |"
+        )
+    return "\n".join(lines)
+
+
+# ── E5: column-batched dot / nrm2 (trnblas#142) ──────────────────────────────
+
+# (n, R): the block-CG target (n = 1e5, R = 33, trnsci#173 via trnsolver#153),
+# its n = 1e6 twin, the R = 1 / 129 edges, and a short-vector shape (W = 16,
+# many columns per group).
+COLS_SHAPES = [(100000, 33), (1000000, 33), (100000, 1), (100000, 129), (2048, 33)]
+COLS_FREES = (256, 512, 1024, 2048)
+# ms per iteration of the ff block-CG baseline the target is measured on
+# (trnblas#142: GP posterior solve, pairwise reduction, Trn2 window 8)
+COLS_PAIRWISE_ITER_MS = 319.5
+FOLD_LEAF = 64  # trnsolver block._FOLD_LEAF
+
+
+def _fold_host64(t, leaf: int = FOLD_LEAF):
+    """trnsolver `block._fold_host64` (the "pairwise" reduction): device
+    halvings over dim 0 to <= leaf rows, then a host float64 sum."""
+    import torch
+
+    n = t.shape[0]
+    lev = 0
+    while -(-n >> lev) > leaf:
+        lev += 1
+    npad = (-(-n >> lev)) << lev
+    if npad != n:
+        t = torch.cat([t, t.new_zeros((npad - n, *t.shape[1:]))], 0)
+    for _ in range(lev):
+        h = t.shape[0] // 2
+        t = t[:h] + t[h:]
+    return t.to(device="cpu", dtype=torch.float64).sum(dim=0)
+
+
+def _cols_shape(n, R, *, device, reps, frees, iter_ms, sync, deadline) -> dict:
+    """One (n, R) row of `cols_bench`."""
+    import torch
+
+    from .. import fp64
+    from . import fp64_kernels as K
+
+    rng = np.random.default_rng(n + R)
+    X = torch.from_numpy(
+        (rng.standard_normal((n, R)) * 10.0 ** rng.integers(-3, 3, (n, R))).astype(np.float32)
+    )
+    Y = torch.from_numpy(rng.standard_normal((n, R)).astype(np.float32))
+    Xd, Yd = X.to(device), Y.to(device)
+    pl = fp64.plan(n)
+    G, rg = K.cols_groups(pl.W, R)
+    row = {"n": n, "R": R, "plan": list(pl), "groups": [G, rg]}
+
+    t0 = time.perf_counter()
+    d = fp64.dot_cols(Xd, Yd)
+    row["first_call_dot_s"] = time.perf_counter() - t0
+    t0 = time.perf_counter()
+    r = fp64.nrm2_cols(Xd)
+    row["first_call_nrm_s"] = time.perf_counter() - t0
+
+    def loop(Xd=Xd, Yd=Yd, R=R, norm=False):
+        Xt = Xd.T.contiguous()
+        if norm:
+            return torch.tensor([float(fp64.nrm2(Xt[j])) for j in range(R)], dtype=fp64.F64)
+        Yt = Yd.T.contiguous()
+        return torch.tensor([float(fp64.dot(Xt[j], Yt[j])) for j in range(R)], dtype=fp64.F64)
+
+    def bits(a, b):
+        return bool(torch.equal(a.view(torch.int64), b.view(torch.int64)))
+
+    row["bitwise_dot_vs_per_column"] = bits(d, loop())
+    row["bitwise_nrm_vs_per_column"] = bits(r, loop(norm=True))
+    row["bitwise_dot_vs_cpu_reference"] = bits(d, fp64.dot_cols(X, Y, backend="pytorch"))
+    row["bitwise_nrm_vs_cpu_reference"] = bits(r, fp64.nrm2_cols(X, backend="pytorch"))
+
+    t = {}
+    t["cols_dot"] = _timeit(lambda: fp64.dot_cols(Xd, Yd), reps, sync)
+    t["cols_nrm"] = _timeit(lambda: fp64.nrm2_cols(Xd), reps, sync)
+    t["loop_dot"] = _timeit(loop, max(1, reps // 2), sync)
+    t["loop_nrm"] = _timeit(lambda: loop(norm=True), max(1, reps // 2), sync)
+    t["pairwise_dot"] = _timeit(lambda: _fold_host64(Xd * Yd), reps, sync)
+    t["pairwise_dot_and_norm"] = _timeit(
+        lambda: _fold_host64(torch.cat([Xd * Yd, Xd * Xd], 1)), reps, sync
+    )
+
+    def ff_iter():
+        fp64.dot_cols(Xd, Yd)  # p . Ap
+        fp64.dot_cols(Xd, Yd)  # r . z
+        fp64.nrm2_cols(Xd)  # |r|
+
+    def pw_iter():
+        _fold_host64(Xd * Yd)
+        _fold_host64(torch.cat([Xd * Yd, Xd * Xd], 1))
+
+    t["ff_iteration"] = _timeit(ff_iter, reps, sync)
+    t["pairwise_iteration"] = _timeit(pw_iter, reps, sync)
+    if device == "neuron":
+        rows = [K.layout_groups(fp64.layout_cols(v, pl), pl.W, G, rg) for v in (Xd, Yd)]
+        name = K.COLS_KERNELS[("dot32", "accurate")]
+        t["kernel_dot"] = _timeit(lambda: K.call(name, *rows), reps, sync)
+        t["layout_dot"] = _timeit(
+            lambda: [K.layout_groups(fp64.layout_cols(v, pl), pl.W, G, rg) for v in (Xd, Yd)],
+            reps,
+            sync,
+        )
+        parts = K.call(name, *rows)
+        t["download_finish_dot"] = _timeit(
+            lambda: fp64._finish_cols(parts.to("cpu")[:, :, :R], "dot32", "host"), reps, sync
+        )
+    row["ms"] = {k: v * 1e3 for k, v in t.items()}
+    over = (t["ff_iteration"] - t["pairwise_iteration"]) * 1e3
+    row["ff_minus_pairwise_ms_per_iteration"] = over
+    row["ff_overhead_pct_of_iteration"] = 100.0 * over / iter_ms
+    row["target_met"] = 100.0 * over / iter_ms <= 5.0  # meaningful at n = 1e5, R = 33
+    sweep = {}
+    for free in frees:
+        if time.time() > deadline:
+            row["truncated"] = True
+            break
+        Gf, rgf = K.cols_groups(pl.W, R, free)
+        if device != "neuron":
+            sweep[str(free)] = {"groups": [Gf, rgf]}
+            continue
+
+        def run(free=free):
+            parts = K.run_partials_cols("dot32", [Xd, Yd], "accurate", free=free)
+            return fp64._finish_cols(parts, "dot32", "host")
+
+        try:  # a wide group may not compile (SBUF): record it, keep going
+            t0 = time.perf_counter()
+            v = run()
+            first = time.perf_counter() - t0
+            sweep[str(free)] = {
+                "groups": [Gf, rgf],
+                "first_call_s": first,
+                "ms": _timeit(run, reps, sync) * 1e3,
+                "bitwise_vs_default": bits(v, d),
+            }
+        except Exception as exc:  # noqa: BLE001 - a probe reports, never stops
+            sweep[str(free)] = {"groups": [Gf, rgf], "error": f"{type(exc).__name__}: {exc}"}
+    row["free_sweep"] = sweep
+    return row
+
+
+def cols_bench(
+    shapes=None,
+    *,
+    device: str = "neuron",
+    reps: int = 10,
+    frees=COLS_FREES,
+    iter_ms: float = COLS_PAIRWISE_ITER_MS,
+    budget_s: float = 1080.0,
+) -> dict:
+    """E5 (trnblas#142): `dot_cols` / `nrm2_cols` against the per-column loop
+    they replace (trnsolver `_ff_cols`: one transposing copy, then one
+    `dot` / `nrm2` per column) and against the "pairwise" reduction
+    (products + device halvings + host float64, trnsolver `_fold_host64`).
+
+    Per (n, R): bitwise equality of every column with its own device `dot` /
+    `nrm2` and with the CPU reference; the first-call (compile) time; warm
+    medians end to end, kernel only, and of the host layout; a sweep of the
+    column-group width (`frees`, TRNBLAS_FP64_COLS_FREE); and the block-CG
+    reduction cost per iteration: `_cdot` plus `_cdot_and_norm` is
+    2 dot_cols + 1 nrm2_cols for ff, 1 + 1 fused folds for pairwise. The
+    #142 target is ff within 5% of pairwise on the whole iteration, i.e.
+    (ff - pairwise) per iteration <= 0.05 `iter_ms` at n = 1e5, R = 33.
+    `device="cpu"` runs the pytorch reference as the "device" (dry run)."""
+    t_start = time.time()
+    if device == "neuron":
+        from . import dispatch as D
+
+        sync = D._device_synchronize
+    else:
+
+        def sync():
+            return None
+
+    rep = {"device": device, "iter_ms": iter_ms, "shapes": {}}
+    for n, R in shapes or COLS_SHAPES:
+        if time.time() - t_start > budget_s:
+            rep["truncated"] = True
+            break
+        row = _cols_shape(
+            n,
+            R,
+            device=device,
+            reps=reps,
+            frees=frees,
+            iter_ms=iter_ms,
+            sync=sync,
+            deadline=t_start + budget_s,
+        )
+        rep["truncated"] = rep.get("truncated", False) or row.pop("truncated", False)
+        rep["shapes"][f"n={n},R={R}"] = row
+    rep["seconds"] = time.time() - t_start
+    return rep
+
+
+def format_cols(rep: dict) -> str:
+    lines = [
+        f"E5: column-batched dot / nrm2 ({rep['device']}; % of a {rep['iter_ms']} ms iteration)",
+        "| n, R | groups | dot_cols ms | loop dot ms | pairwise dot ms | nrm2_cols ms | "
+        "loop nrm ms | ff iter ms | pairwise iter ms | ff - pairwise ms (%) | bitwise |",
+        "|---|---|---|---|---|---|---|---|---|---|---|",
+    ]
+    for k, r in rep["shapes"].items():
+        m = r["ms"]
+        ok = all(v for kk, v in r.items() if kk.startswith("bitwise"))
+        lines.append(
+            f"| {k} | {r['groups'][0]} x {r['groups'][1]} | {m['cols_dot']:.2f} | "
+            f"{m['loop_dot']:.2f} | {m['pairwise_dot']:.2f} | {m['cols_nrm']:.2f} | "
+            f"{m['loop_nrm']:.2f} | {m['ff_iteration']:.2f} | {m['pairwise_iteration']:.2f} | "
+            f"{r['ff_minus_pairwise_ms_per_iteration']:.2f} "
+            f"({r['ff_overhead_pct_of_iteration']:.1f}%) | {ok} |"
         )
     return "\n".join(lines)

@@ -81,7 +81,8 @@ def test_every_fp64_kernel_is_covered():
         for name, obj in vars(K).items()
         if name.endswith("_kernel") and type(obj).__module__.startswith("nki")
     }
-    covered = set(K.REDUCE_KERNELS.values()) | set(_PROBE_ARGS)  # incl. the ff_bits kernel
+    # incl. the ff_bits kernel; the column-batched ones: test_fp64_cols_nki.py
+    covered = set(K.REDUCE_KERNELS.values()) | set(K.COLS_KERNELS.values()) | set(_PROBE_ARGS)
     assert kernels == covered
     assert set(K.KERNEL_DTYPES) == covered
 

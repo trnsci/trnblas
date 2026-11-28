@@ -26,7 +26,7 @@ trnblas/
 │   ├── level2.py            # gemv, symv, trmv, ger
 │   ├── level3.py            # gemm, gemm_fp64, batched_gemm, symm, syrk, trsm, trmm, metric_inv_half
 │   ├── ozaki.py             # gemm_fp64 host half: split (+ device-split twin), schedule, plan, combine, bitwise reference
-│   ├── fp64.py              # fp64-class vector ops (trnsci#169): float-float sum/dot/nrm2/axpy/combine, exact int-limb path, CPU reference
+│   ├── fp64.py              # fp64-class vector ops (trnsci#169): float-float sum/dot/nrm2/axpy/combine, dot_cols/nrm2_cols (#142), exact int-limb path, CPU reference
 │   ├── ozaki2.py            # gemm_fp64(scheme="ozaki2") prototype (#132): scaling, residues, CRT (host + device twin), reference
 │   ├── parallel.py          # SPMD multi-core GEMM + DF-MP2 (torchrun)
 │   └── nki/

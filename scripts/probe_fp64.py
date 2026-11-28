@@ -12,6 +12,8 @@ writes JSON and prints a markdown table; each takes well under 20 minutes.
     python scripts/probe_fp64.py lnc --json lnc2.json         # at LNC=2
     NEURON_LOGICAL_NC_CONFIG=1 python scripts/probe_fp64.py lnc --json lnc1.json
     python scripts/probe_fp64.py compare lnc2.json lnc1.json  # digests must agree
+    python scripts/probe_fp64.py cols --json cols.json        # dot_cols / nrm2_cols (#142)
+    python scripts/probe_fp64.py cols --n 100000 --R 33 --free 256 512 1024 2048
 
 `--device cpu` runs the CPU reference as the "device" (dry run, no hardware).
 """
@@ -34,11 +36,17 @@ def main(argv=None) -> int:
     p2.add_argument("--no-reference", action="store_true", help="skip the CPU bitwise check")
     p3 = sub.add_parser("e3", help="gemm_fp64 combine: fp64 bits on the device vs host")
     p3.add_argument("--reps", type=int, default=10)
+    p5 = sub.add_parser("cols", help="column-batched dot / nrm2 vs per-column and pairwise")
+    p5.add_argument("--n", type=int, nargs="*", default=None, help="lengths (with --R)")
+    p5.add_argument("--R", type=int, nargs="*", default=None, help="column counts")
+    p5.add_argument("--free", type=int, nargs="*", default=None, help="group widths to sweep")
+    p5.add_argument("--reps", type=int, default=10)
+    p5.add_argument("--iter-ms", type=float, default=None, help="block-CG ms per iteration")
     pl = sub.add_parser("lnc", help="partials digests (run at LNC=2 and LNC=1)")
     pc = sub.add_parser("compare", help="compare two lnc JSON files")
     pc.add_argument("a")
     pc.add_argument("b")
-    for p in (p0, p2, p3, pl):
+    for p in (p0, p2, p3, p5, pl):
         p.add_argument("--json", default=None)
         p.add_argument("--device", default="neuron", choices=("neuron", "cpu"))
     args = ap.parse_args(argv)
@@ -81,6 +89,16 @@ def main(argv=None) -> int:
         rep = Q.e3(device=args.device, reps=args.reps)
         print(Q.format_e3(rep))
         ok = all(r["bitwise_equal_ozaki_combine"] for r in rep["shapes"].values())
+    elif args.cmd == "cols":
+        shapes = None
+        if args.n or args.R:
+            shapes = [(n, R) for n in (args.n or [100000]) for R in (args.R or [33])]
+        kw = {"frees": tuple(args.free)} if args.free else {}
+        if args.iter_ms:
+            kw["iter_ms"] = args.iter_ms
+        rep = Q.cols_bench(shapes, device=args.device, reps=args.reps, **kw)
+        print(Q.format_cols(rep))
+        ok = all(v for r in rep["shapes"].values() for k, v in r.items() if k.startswith("bitwise"))
     else:
         rep = Q.lnc_digests(device=args.device)
         bad = [k for k, v in rep["equal_ref"].items() if not v]
